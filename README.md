@@ -15,6 +15,11 @@ SPI-HID/QSPI patch queue. The latter passed user-confirmed finger touch in Niri;
 module's conservative default remains `linux-sp11`; the test flake explicitly
 selects `surface.devices.denali.kernel = "surface-next-touch"` and enables iptsd.
 
+For deployments that keep Microsoft firmware outside the Nix store, set
+`surface.devices.denali.privateFirmwareDirectory = "/var/lib/surface-firmware";`.
+The hardware module exposes that directory alongside stock firmware at runtime;
+it does not download private firmware or embed it in store outputs.
+
 Graphics requires privately provisioned Microsoft GPU firmware and the current
 `FD_MESA_DEBUG=noubwc,notile` workaround. This is not a claim of a fully
 reproducible desktop or complete hardware support. See
