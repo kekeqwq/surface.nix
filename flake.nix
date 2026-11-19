@@ -2,7 +2,7 @@
   description = "Minimal NixOS hardware support and Live ISO for Surface Pro 11 Denali OLED";
 
   inputs = {
-    nixpkgs.url = "github:NixOS/nixpkgs/085af13c1607f4f73ab1e7a51071faf6577a7e87";
+    nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable-small";
     localFiles = {
       url = "path:./local-files";
       flake = false;

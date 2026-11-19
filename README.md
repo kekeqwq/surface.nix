@@ -4,6 +4,8 @@ Minimal NixOS support for the non-5G OLED Surface Pro 11 (Denali). No desktop, f
 
 Import `surface.nixosModules.surface-pro-11` and set `surface.devices.denali.enable = true;` to opt in. The module provides the pinned downstream kernel, OLED device tree, early USB drivers and Wi-Fi firmware. For a Type #2 UKI with compressed ARM64 zboot and embedded DTB, import `surface.nixosModules.denali-uki` instead. The host still owns its loader, disks and accounts. See the [independent installation test](https://github.com/kekeqwq/surface.nix.standalone.test.flake).
 
+Nixpkgs tracks `nixos-unstable-small`. Maintainers run `nix flake update nixpkgs` and commit the resulting lock file. The lock records the exact revision used for each build; changing it does not replace an already-built or tested Live USB.
+
 On AArch64 Linux, build the public Live ISO (SSH disabled):
 
 ```sh
