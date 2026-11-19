@@ -24,11 +24,25 @@
       };
       inherit (live) pkgs config;
       kernel = config.boot.kernelPackages.kernel;
+      kernelShell = target: localVersion: pkgs.mkShell {
+        inputsFrom = [ target ];
+        nativeBuildInputs = [ pkgs.ccache pkgs.util-linux ];
+        SURFACE_NEXT_SOURCE = target.src;
+        SURFACE_NEXT_CONFIG = target.configfile;
+        SURFACE_NEXT_RELEASE = target.modDirVersion;
+        SURFACE_NEXT_LOCALVERSION = localVersion;
+        SURFACE_NEXT_PATCHES = nixpkgs.lib.concatMapStringsSep " " (p: toString p.patch) target.kernelPatches;
+        inherit (target.env) RUST_LIB_SRC;
+      };
     in {
       overlays.default = import ./overlay.nix;
       nixosModules.surface-pro-11 = ./modules/denali.nix;
       nixosModules.denali-uki = ./modules/denali-uki.nix;
       nixosConfigurations.denali-live = live;
+      devShells.${system} = {
+        surface-next = kernelShell pkgs.surfacePackages.surfaceNext "";
+        surface-next-touch = kernelShell pkgs.surfacePackages.surfaceNextTouch "-surface-touch";
+      };
       packages.${system} = {
         default = config.system.build.denaliIso;
         denali-live-iso = config.system.build.denaliIso;

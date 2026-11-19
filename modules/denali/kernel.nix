@@ -1,7 +1,20 @@
 { config, lib, pkgs, ... }:
+let
+  cfg = config.surface.devices.denali;
+in
 {
-  config = lib.mkIf config.surface.devices.denali.enable {
-    boot.kernelPackages = lib.mkDefault pkgs.surfacePackages.linuxPackages;
+  options.surface.devices.denali.kernel = lib.mkOption {
+    type = lib.types.enum [ "linux-sp11" "surface-next" "surface-next-touch" ];
+    default = "linux-sp11";
+    description = "Denali kernel track. surface-next is an unmodified kernel.org snapshot; surface-next-touch adds the experimental SPI-HID/QSPI digitizer queue.";
+  };
+
+  config = lib.mkIf cfg.enable {
+    boot.kernelPackages = lib.mkDefault (
+      if cfg.kernel == "surface-next-touch" then pkgs.surfacePackages.surfaceNextTouchPackages
+      else if cfg.kernel == "surface-next" then pkgs.surfacePackages.surfaceNextPackages
+      else pkgs.surfacePackages.linuxPackages
+    );
     boot.initrd.availableKernelModules = {
       # Both USB-C PHYs reference the modular TCSR clock provider in the DTB.
       tcsrcc-x1e80100 = true;

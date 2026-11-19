@@ -6,6 +6,38 @@ Import `surface.nixosModules.surface-pro-11` and set `surface.devices.denali.ena
 
 Nixpkgs tracks `nixos-unstable-small`. Maintainers run `nix flake update nixpkgs` and commit the resulting lock file. The lock records the exact revision used for each build; changing it does not replace an already-built or tested Live USB.
 
+## Validated installed candidates
+
+The independent test host has booted kernel.org `next-20261118` with no local
+patches, then a separate `surface-next-touch` candidate with the required
+SPI-HID/QSPI patch queue. The latter passed user-confirmed finger touch in Niri;
+2880×1920 at 120 Hz and Adreno X1-85 acceleration are retained. The hardware
+module's conservative default remains `linux-sp11`; the test flake explicitly
+selects `surface.devices.denali.kernel = "surface-next-touch"` and enables iptsd.
+
+Graphics requires privately provisioned Microsoft GPU firmware and the current
+`FD_MESA_DEBUG=noubwc,notile` workaround. This is not a claim of a fully
+reproducible desktop or complete hardware support. See
+[touch bring-up](docs/touch-bringup.md) and the test host's desktop notes.
+Internal audio is audible but too quiet; [protection work](docs/audio-protection-audit.md)
+is deferred. Pen, detailed multitouch, suspend/resume and external audio still
+need separate acceptance.
+
+### Incremental kernel development
+
+`surface.devices.denali.kernel = "surface-next"` selects the experimental kernel.org snapshot without a local patch queue. The default remains `linux-sp11`.
+
+On AArch64 Linux, use the workbench to iterate without discarding Kbuild outputs:
+
+```sh
+nix develop .#surface-next -c bash scripts/surface-next-workbench.sh config
+nix develop .#surface-next -c bash scripts/surface-next-workbench.sh build
+```
+
+The script prints the writable source and persistent `O=` directory. Apply experimental patches to that source tree and rerun `build` without cleaning it. The directory is keyed by the pinned source archive; `ccache` is shared across snapshots. Changed headers, Kconfig, or compilers can still trigger a broad rebuild. Workbench outputs are local diagnostics, not inputs to the release build. Record any accepted patch in Nix and build the final UKI through the standalone flake.
+
+### Live USB
+
 On AArch64 Linux, build the public Live ISO (SSH disabled):
 
 ```sh
