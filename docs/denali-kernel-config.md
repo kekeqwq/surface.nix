@@ -23,6 +23,14 @@ counts; an `olddefconfig` run on unpatched upstream loses `SPI_HID_OF`.
 | Desktop and firewall | Keep namespaces, BPF LSM and its tracing dependencies, seccomp, cgroups, iptables/netfilter, multicast and filesystem notification. No VM or specialized networking drivers required. |
 | Build speed | Remove DWARF and module/kernel BTF, plus unrelated drivers and optional tracing/test features. Keep debugfs, pstore, kallsyms and embedded config. This build lacks BTF-based debugging. |
 
+Known regression in the pruned `next-20261120` config: both Denali WSA884x
+codecs use LPASS GPIO 12 as a shared reset. Removing `GPIO_SHARED_PROXY=m`
+left the GPIO proxy devices unbound, with `reset_gpio` and both codecs deferred.
+The ALSA card was absent and PipeWire only exposed `Dummy Output`. The
+standalone restore-and-rebuild trial was cancelled before validation in favor of
+evaluating FullIO v19c. If returning to this kernel path, retain both
+`RESET_GPIO` and `GPIO_SHARED_PROXY`.
+
 The test host uses ext4/VFAT only. It no longer requests the default NTFS or
 initrd LVM integrations. Btrfs and disk unlock are **not** deployed or covered
 by this test. Review Kconfig and initrd dependencies again before adopting
