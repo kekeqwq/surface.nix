@@ -32,7 +32,13 @@ shared Ghostty opacity stays 0.95. This validates the route on this device,
 not all suspend/refresh/boot combinations. A clean screenshot alone never
 established scanout correctness. Earlier register candidates did not fix it,
 and those tests did not establish a hardware defect or exclude coherency.
-The cold-link color-depth issue remains separate.
+The cold-link color-depth issue was fixed separately: the eDP RGB stream depth
+is recomputed from the EDID and the negotiated link after successful training,
+without forcing 30 bpp or bypassing link-capacity checks. A first cold boot of
+the candidate selected 30 bpp directly, retained 2880×1920@120 and UBWC, and
+passed the user’s physical color check at the shared 0.95 Ghostty opacity.
+The shared Linux Ghostty default was then changed to 0.70; macOS keeps its
+separate private default. External DP and YCbCr follow the existing code path.
 
 ## Firmware provenance
 

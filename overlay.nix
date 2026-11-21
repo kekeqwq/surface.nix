@@ -1,7 +1,12 @@
 final: prev: {
   surfacePackages = final.lib.makeScope final.newScope (self: {
     surfaceNext = self.callPackage ./pkgs/surface-next.nix {
-      kernelPatches = self.callPackage ./pkgs/touch-patches.nix { };
+      kernelPatches = self.callPackage ./pkgs/touch-patches.nix { } ++ [
+        {
+          name = "edp-stream-depth-after-training";
+          patch = ./pkgs/patches/edp-stream-depth-after-training.patch;
+        }
+      ];
     };
     kernelPackages = final.linuxPackagesFor self.surfaceNext;
     wifiBoard = self.callPackage ./pkgs/wifi-board.nix { };
