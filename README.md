@@ -29,6 +29,17 @@ The Microsoft GPU zap file is required with this option; the two matching ADSP f
 
 On boot the activation script makes the private/public firmware union available **before root coldplug**. The boot installer adds the private zap to the embedded initrd on the local ESP, outside Nix. Treat installed private UKIs as owner-only files; do not redistribute them. Use `nixos-rebuild switch --flake <system-flake>#<host>` and retain an independently verified recovery UKI. Recovery entries must not be named `nixos-*.conf` or store their payload under `/EFI/nixos/`, where the ordinary NixOS boot installer performs cleanup.
 
+## Bluetooth
+
+Some Denali WCN7850 controllers report a placeholder address, so the kernel
+does not expose a configured controller to BlueZ. Set
+`surface.devices.denali.bluetoothAddress` to this device's factory Bluetooth
+address where available. A test host can instead choose a stable, distinct
+locally administered address. On UART controller add, the module waits for
+firmware setup and supplies the address only if the controller needs one.
+BlueZ still owns power policy and pairing. This does not modify Wi-Fi or
+unrelated Bluetooth adapters.
+
 ## Validation and development
 
 The native installation passed 2880×1920 at 120 Hz, finger touch, and Adreno UBWC scanning with no tiling/compression workaround. The early firmware fix and direct scanout evidence are recorded in the [validation notes](docs/gpu-rendering-investigation.md). Pen, suspend, Bluetooth persistence, and full audio acceptance are separate work. No repartitioning, firmware flashing, or speaker gain changes are performed here.

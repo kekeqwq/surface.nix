@@ -9,6 +9,7 @@
     ./denali/kernel.nix
     ./denali/firmware.nix
     ./denali/boot.nix
+    ./denali/bluetooth.nix
   ];
 
   options.surface.devices.denali = {
