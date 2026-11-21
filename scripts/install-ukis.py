@@ -74,6 +74,11 @@ def finish(inspector, boot, current, firmware):
         lines = entry.read_text().splitlines()
         match = re.search(r"^options\s+init=(/nix/store/[^ /]+)/(?:init)(?:\s|$)", "\n".join(lines), re.M)
         if not match:
+            # Remove stale custom entries whose old UKI no longer exists.
+            # Valid rescue entries are not named nixos-* and are preserved.
+            efi = re.search(r"^efi\s+(/\S+)", "\n".join(lines), re.M)
+            if efi and not (boot / efi.group(1).lstrip("/")).is_file():
+                pending.append((entry, None))
             continue
         system = Path(match[1])
         components = system / "surface-boot"
