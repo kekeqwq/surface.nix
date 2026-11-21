@@ -1,16 +1,32 @@
-{ config, lib, pkgs, ... }:
-let
-  cfg = config.surface.devices.denali;
-in
+{
+  config,
+  lib,
+  pkgs,
+  ...
+}:
 {
   imports = [
     ./denali/kernel.nix
     ./denali/firmware.nix
+    ./denali/boot.nix
   ];
 
-  options.surface.devices.denali.enable = lib.mkEnableOption "Microsoft Surface Pro 11 Denali (non-5G OLED) hardware support";
+  options.surface.devices.denali = {
+    enable = lib.mkEnableOption "Microsoft Surface Pro 11 Denali non-5G OLED hardware support";
+    niriOutputs = lib.mkOption {
+      type = lib.types.lines;
+      readOnly = true;
+      default = ''
+        output "eDP-1" {
+            mode "2880x1920@120.000"
+            scale 2
+        }
+      '';
+      description = "Native OLED output declaration for a host's Niri configuration. Does not enable a desktop.";
+    };
+  };
 
-  config = lib.mkIf cfg.enable {
+  config = lib.mkIf config.surface.devices.denali.enable {
     assertions = [
       {
         assertion = pkgs.stdenv.hostPlatform.system == "aarch64-linux";

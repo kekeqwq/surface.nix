@@ -1,4 +1,2 @@
 /result*
-/local-files/*
-!/local-files/README.md
 __pycache__/

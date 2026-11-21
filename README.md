@@ -1,59 +1,42 @@
 # surface.nix
 
-Minimal NixOS support for the non-5G OLED Surface Pro 11 (Denali). No desktop, firmware flashing or disk layout policy is included.
+Opt-in NixOS hardware support for the **Surface Pro 11 Denali non-5G OLED** (Snapdragon X1E80100 / Adreno X1-85). The regular system and desktop live in the consuming flake, not here. This replaces the standalone bring-up flake.
 
-Import `surface.nixosModules.surface-pro-11` and set `surface.devices.denali.enable = true;` to opt in. The module provides the pinned downstream kernel, OLED device tree, early USB drivers and Wi-Fi firmware. For a Type #2 UKI with compressed ARM64 zboot and embedded DTB, import `surface.nixosModules.denali-uki` instead. The host still owns its loader, disks and accounts. See the [independent installation test](https://github.com/kekeqwq/surface.nix.standalone.test.flake).
+```nix
+{
+  imports = [ inputs.surface.nixosModules.default ];
+  surface.devices.denali = {
+    enable = true;
+    privateFirmwareDirectory = "/var/lib/surface-firmware";
+  };
+  boot.loader.systemd-boot.enable = true;
+}
+```
 
-Nixpkgs tracks `nixos-unstable-small`. Maintainers run `nix flake update nixpkgs` and commit the resulting lock file. The lock records the exact revision used for each build; changing it does not replace an already-built or tested Live USB.
+Set `nixpkgs.hostPlatform` to `aarch64-linux`. Follow the consuming flake's `nixpkgs` input. The default and only kernel is kernel.org `next-20261119` with the audited Denali Kconfig and isolated SPI-HID/QSPI touch queue. The module supplies the OLED DTB, native device firmware, touch, and ARM64 zboot UKIs. The host owns its partitions, accounts, and desktop. `surface.devices.denali.niriOutputs` is an optional value to pass into an existing Niri configuration, not a compositor installation.
 
-## Validated installed candidates
+## Private firmware
 
-The independent test host has booted kernel.org `next-20261118` with no local
-patches, then a separate `surface-next-touch` candidate with the required
-SPI-HID/QSPI patch queue. The latter passed user-confirmed finger touch in Niri;
-2880×1920 at 120 Hz and Adreno X1-85 acceleration are retained. The hardware
-module's conservative default remains `linux-sp11`; the test flake explicitly
-selects `surface.devices.denali.kernel = "surface-next-touch"` and enables iptsd.
+Before building a boot entry, provision the owner-held firmware on the **root filesystem** in a root-managed directory, not in the flake, Nix store, or a public cache. Populate the applicable paths under the configured directory:
 
-For deployments that keep Microsoft firmware outside the Nix store, set
-`surface.devices.denali.privateFirmwareDirectory = "/var/lib/surface-firmware";`.
-The hardware module exposes that directory alongside stock firmware at runtime;
-it does not download private firmware or embed it in store outputs.
+```text
+qcom/x1e80100/microsoft/qcdxkmsuc8380.mbn
+qcom/x1e80100/microsoft/Denali/adsp_dtb.mbn
+qcom/x1e80100/microsoft/Denali/qcadsp8380.mbn
+```
 
-Graphics requires privately provisioned Microsoft GPU firmware and the current
-`FD_MESA_DEBUG=noubwc,notile` workaround. This is not a claim of a fully
-reproducible desktop or complete hardware support. See
-[touch bring-up](docs/touch-bringup.md) and the test host's desktop notes.
-Internal audio is audible but too quiet; [protection work](docs/audio-protection-audit.md)
-is deferred. Pen, detailed multitouch, suspend/resume and external audio still
-need separate acceptance.
+The Microsoft GPU zap file is required with this option; the two matching ADSP files enable native audio. They can be extracted offline from the [official Surface Pro 11 Snapdragon driver MSI](https://www.microsoft.com/en-us/download/details.aspx?id=106119), without installing Windows or running the installer. Windows names its ADSP DT file `adsp_dtbs.elf`. Keep the two ADSP files from the same driver package. The tested installation retained its previously extracted WOA zap; Microsoft's `31.0.137.0` zap was extracted and checked structurally, not hardware-accepted in that test. See [graphics validation](docs/gpu-rendering-investigation.md).
 
-### Incremental kernel development
+On boot the activation script makes the private/public firmware union available **before root coldplug**. The boot installer adds the private zap to the embedded initrd on the local ESP, outside Nix. Treat installed private UKIs as owner-only files; do not redistribute them. Use `nixos-rebuild switch --flake <system-flake>#<host>` and retain an independently verified recovery UKI. Recovery entries must not be named `nixos-*.conf` or store their payload under `/EFI/nixos/`, where the ordinary NixOS boot installer performs cleanup.
 
-`surface.devices.denali.kernel = "surface-next"` selects the experimental kernel.org snapshot without a local patch queue. The default remains `linux-sp11`.
+## Validation and development
 
-On AArch64 Linux, use the workbench to iterate without discarding Kbuild outputs:
+The native installation passed 2880×1920 at 120 Hz, finger touch, and Adreno UBWC scanning with no tiling/compression workaround. The early firmware fix and direct scanout evidence are recorded in the [validation notes](docs/gpu-rendering-investigation.md). Pen, suspend, Bluetooth persistence, and full audio acceptance are separate work. No repartitioning, firmware flashing, or speaker gain changes are performed here.
+
+The persistent local Kbuild workbench is for development, not deployment:
 
 ```sh
-nix develop .#surface-next -c bash scripts/surface-next-workbench.sh config
 nix develop .#surface-next -c bash scripts/surface-next-workbench.sh build
 ```
 
-The script prints the writable source and persistent `O=` directory. Apply experimental patches to that source tree and rerun `build` without cleaning it. The directory is keyed by the pinned source archive; `ccache` is shared across snapshots. Changed headers, Kconfig, or compilers can still trigger a broad rebuild. Workbench outputs are local diagnostics, not inputs to the release build. Record any accepted patch in Nix and build the final UKI through the standalone flake.
-
-### Live USB
-
-On AArch64 Linux, build the public Live ISO (SSH disabled):
-
-```sh
-nix build .#denali-live-iso -L
-```
-
-For a private test image with SSH, place **only a public key** in `authorized_keys` in an external directory:
-
-```sh
-nix build .#denali-live-iso-local -L --no-write-lock-file \
-  --override-input localFiles "path:$HOME/.local/share/denali-live"
-```
-
-The result includes `boot-contract.json` and the ISO under `result/iso/`. Raw-write to the test USB only. With Secure Boot disabled, use Surface UEFI **Boot configuration → USB Storage** and swipe left to boot. Use `nmtui` from the Live TTY. The privately keyed variant passed TTY, Wi-Fi and SSH on real hardware; see [the acceptance record](docs/jovian-porting-model.md#live-acceptance-passed).
+This retains writable source, `O=` output and `ccache`. Production rebuilds use the pinned Nix derivation; `scripts/cached-kernel.nix` is an optional local compiler-cache wrapper, not another kernel track. See the [config audit](docs/denali-kernel-config.md).

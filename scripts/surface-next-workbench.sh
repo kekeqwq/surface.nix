@@ -1,7 +1,6 @@
 #!/usr/bin/env bash
 # Run in nix develop .#surface-next on AArch64 Linux.
 set -euo pipefail
-repo=$(cd -- "$(dirname -- "$0")/.." && pwd)
 snapshot=${SURFACE_NEXT_SOURCE:?run in nix develop .#surface-next}
 state=${XDG_STATE_HOME:-$HOME/.local/state}/surface-next
 work=$state/$(basename "$snapshot" .tar.gz)-${SURFACE_NEXT_RELEASE:-upstream}
@@ -22,7 +21,7 @@ if [[ ! -d $work/src ]]; then
   trap - EXIT
 fi
 out=$work/out
-config=${SURFACE_NEXT_CONFIG:-$repo/pkgs/config-sp11-7.3.aarch64}
+config=${SURFACE_NEXT_CONFIG:?run in nix develop .#surface-next}
 if [[ $(<"$work/patch-seed") != "${SURFACE_NEXT_PATCHES:-}" ]]; then
   echo 'Patch queue changed: apply the delta to the printed source tree and review it before rebuilding.' >&2
   echo "Source: $work/src" >&2
