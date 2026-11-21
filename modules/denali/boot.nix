@@ -36,6 +36,7 @@ let
         pkgs.python3
       ]
     }
+    export SURFACE_UKIFY=${pkgs.systemdUkify}/lib/systemd/ukify
     exec python3 ${../../scripts/install-ukis.py} ${../../scripts/inspect-efi-payload.py} "$@"
   '';
 in

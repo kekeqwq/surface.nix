@@ -51,7 +51,7 @@ def private_uki(inspector, components, cmdline, firmware, extra, target, system)
                 output.write(b"\0" * (-output.tell() % 4))
                 output.write(path.read_bytes())
         release = (components / "uname").read_text().strip()
-        run("ukify", "build", "--linux", components / "linux", "--initrd", initrd,
+        run(os.environ.get("SURFACE_UKIFY", "ukify"), "build", "--linux", components / "linux", "--initrd", initrd,
             "--devicetree", components / "dtb", "--cmdline", cmdline,
             "--stub", components / "stub", "--os-release", "@" + str(system / "etc/os-release"),
             "--uname", release, "--output", target)
