@@ -1,77 +1,56 @@
-# Denali linux-next configuration audit
+# Denali OLED kernel configuration audit
 
-Scope: the evaluated native Surface desktop, formerly the integration test
-and now `nixosConfigurations.surface` in the consuming flake. This is not a
-configuration for other Linux hosts. `config-denali-next.aarch64` is the one
-maintained configuration. There is no vendor-keyword pruning script.
+`pkgs/config-denali-next.aarch64` targets the **native Surface test desktop** in
+`nixosConfigurations.surface`. It is not a general arm64 distro configuration.
+The benchmark is a full compile on the Surface, not an incremental Kbuild run.
 
-## Evidence and rules
+## Scope and retained dependencies
 
-Evaluate enabled services, filesystem types, supported filesystems, kernel and
-initrd module lists, system packages and Home Manager packages. Then check the
-Denali OLED DT and Kconfig dependencies. Absence of a service alone does not
-justify deleting infrastructure needed by other programs. An unloaded module
-is not evidence that its device is unnecessary.
+The review used the evaluated host (including initrd requests, filesystem and
+service options), the enabled nodes in the Denali OLED DT, and Kconfig/module
+dependencies. The previous running module list can confirm device bindings but
+is not a keep list. The resolved config **after the touch patch queue** is what
+counts; an `olddefconfig` run on unpatched upstream loses `SPI_HID_OF`.
 
-The actual Denali DT uses X1E80100 MDSS/DPU/Adreno and Samsung ATNA eDP,
-PCIe/NVMe, PCIe WCN7850, Qualcomm UART Bluetooth, Qualcomm SoundWire/WSA884x,
-AudioReach/LPASS, Qualcomm PMIC GLINK, Parade PS8830 Type-C retimers and the
-Surface EC. Preserve these chains, including touch/pen, USB-C display output,
-USB storage and authentication hardware even when currently unloaded.
-
-## Evaluated feature mapping
-
-| Evaluated configuration/use | Kernel decision |
+| Feature | Kernel choice |
 | --- | --- |
-| `/` ext4, `/boot` vfat | Keep ext4/JBD2, FAT/VFAT, NVMe, EFI, partition support |
-| `boot.supportedFilesystems` includes **ntfs** | Keep NTFS support; no assumption that only mounted filesystems matter |
-| No NFS/SMB/network filesystem configuration | Disable network filesystems and unused distributed-storage clients |
-| No Btrfs/XFS/F2FS root or configured mount | Disable those filesystem drivers; installing `f2fs-tools` alone does not require mounting F2FS |
-| No optical/flash/legacy filesystem deployment | Disable ISO/UDF, raw-flash/legacy filesystem drivers; retain pstore and pseudo filesystems |
-| No swap, zram, zswap deployment | Disable swap compression, zram and hibernation; retain suspend |
-| No VM, emulation, Docker/Podman, Waydroid or NixOS containers | Disable KVM, Xen, VFIO, vhost/vDPA and virtual GPU drivers |
-| Chrome, systemd, desktop portals, Nix sandbox | Retain namespaces, seccomp, cgroups, Unix sockets, event notification and required BPF interfaces despite no containers |
-| NetworkManager, Wi-Fi, SSH, firewall; nftables service off | Retain IPv4/IPv6, DHCP/raw sockets, packet sockets, iptables/netfilter and connection tracking; do not delete firewall backend dependencies |
-| No bridges, overlay networking, IPVS, WireGuard or tunnel deployment | Disable unused tunnel/bridge/virtual-link drivers and specialized network protocols |
-| WCN7850, no native wired Ethernet controller | Keep ath12k, MHI/QRTR and QCA UART Bluetooth; remove unrelated native Ethernet and older WLAN hardware; USB networking remains separate |
-| Niri/Ghostty/Waybar/Plymouth | Keep MSM/DPU/Adreno, dma-buf, DRM/KMS, DP AUX, native panel and early display; remove unrelated discrete/virtual GPUs |
-| PipeWire, native sound and USB/DP audio | Preserve Qualcomm card, SoundWire, WSA884x, LPASS/APM dependencies and USB/HDMI audio; remove unrelated PCI/SOF sound platforms |
-| Xremap, iptsd, Surface EC, YubiKey and pcscd/GnuPG | Keep uinput, evdev, HID/HIDRAW, SPI-HID, USB HID/CCID and required transports |
-| fwupd and UDisks2 enabled | Keep firmware update, EFI variables and block-device/USB infrastructure |
-| AppArmor/audit services disabled; runtime LSM list is landlock,yama,bpf | Remove unused alternative policy engines; retain actual LSMs and authentication/security plumbing |
-| Initrd LVM enabled by default, `dm_mod` explicitly requested | **Do not remove device mapper just because the root mount is ext4**; review NixOS initrd defaults before changing this |
-| GPU fault investigation | Keep debugfs, GPU state, CRC support, logging and recovery diagnostics; do not treat them as unused debug code |
+| ARM64 zboot UKI, NVMe, ext4 root, VFAT ESP | Retain EFI, partitions and native storage, and a strict initrd module closure. Generic initrd suggestions are disabled for Denali, not missing-module checks. |
+| Niri, early Plymouth, GPU tests | Keep MSM/DPU/Adreno, eDP, Samsung ATNA panel, DP PHY, simpledrm, console and debugfs/CRC. Remove unrelated DRM controllers and panels. |
+| Denali dependencies | Keep RPMh, SCM, SMMU, GLINK, GPI, PHY, TLMM, QFPROM, SDAM, PMIC power key/RTC, thermal/ADC paths. `SC_LPASSCC_8280XP` and `SM_VIDEOCC_8550` are required by the DT despite their names. |
+| Touch, keyboard, YubiKey | Keep SPI HID/QSPI, serdev, input/uinput, Surface SAM and ACPI (required by the SAM Kconfig), and USB HID. |
+| Wi-Fi, Bluetooth, USB-C | Keep ath12k/WCN7850, UART/QCA Bluetooth, r8152 and common USB Ethernet, DWC3/xHCI, UCSI/GLINK, Type-C mux and DP altmode. |
+| Audio and media | Keep native LPASS/SoundWire/WSA884x, USB and DP audio, Iris video engine and USB UVC; remove unrelated card, codec and capture drivers. Retaining a driver is not proof of working firmware or hardware. |
+| Desktop and firewall | Keep namespaces, BPF LSM and its tracing dependencies, seccomp, cgroups, iptables/netfilter, multicast and filesystem notification. No VM or specialized networking drivers required. |
+| Build speed | Remove DWARF and module/kernel BTF, plus unrelated drivers and optional tracing/test features. Keep debugfs, pstore, kallsyms and embedded config. This build lacks BTF-based debugging. |
 
-## Current status
+The test host uses ext4/VFAT only. It no longer requests the default NTFS or
+initrd LVM integrations. Btrfs and disk unlock are **not** deployed or covered
+by this test. Review Kconfig and initrd dependencies again before adopting
+LUKS2, Btrfs/zstd, and a separately enrolled security key in the formal
+installation. No existing partition is converted.
 
-The flake evaluation and the first direct Kconfig edits are done. The previous
-keyword-generated candidate was discarded and restarted from the original
-seed. The first dependency normalization against next-20261119 and the hardware/flake
-constraint tests passed. Module-valued symbols decreased from 6684 to 4858;
-this is not a count of modules loaded at runtime. Subsequent selector checks
-reduced this to 4858, with all explicit disabled options staying disabled.
-The first pruning pass is frozen at next-20261119, the tested graphics
-baseline. Remaining leaf-driver pruning is not represented as complete.
+## Build and checks
 
-The dependency review caught selectors that would undo a naive parent switch:
-NVMe/TCP and NVMe/FC re-enabled NVME_FABRICS; DM_RAID re-enabled software MD;
-QAT VF crypto drivers re-enabled PCI_IOV; NitroX's device driver re-enabled its
-core. The actual selectors were disabled, then olddefconfig and the constraints
-were rerun. None of the explicitly disabled seed options were re-enabled.
+On the Surface use the proxy for both Nix client and daemon. Preload sources
+and build dependencies, but not the kernel outputs. Run from the audited
+main flake, pointing at the hardware checkout if not yet published:
 
-Device-tree/driver matching also confirmed that X1E80100 requires
-`SC_LPASSCC_8280XP` and `SM_VIDEOCC_8550`. They are not unrelated drivers just
-because their Kconfig names mention other SoCs. Conversely, Qualcomm QAIC
-cloud accelerators and other platforms' clock controllers are not Denali
-hardware. This is why vendor-keyword removal is not an acceptable method.
-
-Regression check:
-
-```
-python3 tests/denali-kernel-config.py pkgs/config-denali-next.aarch64 evaluated-flake-audit.json
+```sh
+bash ~/Repos/surface.nix/scripts/time-full-build.sh ~/Repos/flakes ~/surface-build-timing/new
 ```
 
-Before compiling, run `olddefconfig` against next-20261119 plus the touch queue,
-check all explicitly requested initrd modules and the retained hardware chains,
-and ensure Kconfig has not re-enabled an unwanted backend. The development
-workbench retains Kbuild outputs and a compiler cache.
+The script rejects existing kernel outputs, disables kernel substitutes and
+remote builders, and measures kernel plus desktop closure/boundary check time.
+The acceptance threshold is under **600 seconds** with a prepared dependency
+store; this is hardware-specific, not a promise for a cold Nix store. Then run
+`tests/denali-kernel-config.py` against the built kernel's resolved `.config`
+and an evaluated feature audit, and boot a one-shot UKI to check the real
+screen, GPU, input, networking, and firmware. Build time alone is not boot or
+hardware acceptance.
+
+On the 12-core Surface with prepared dependencies and no compiler cache,
+`next-20261120` completed the full kernel build in **514 s** and the system
+closure and boundary check in **32 s** (total **546 s**). The built Kconfig
+has **1,740** module-valued symbols versus **4,860** in the previous seed.
+The resulting private UKI passed offline assembly and section verification;
+physical boot validation is a separate step.

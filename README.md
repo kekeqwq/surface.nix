@@ -13,7 +13,7 @@ Opt-in NixOS hardware support for the **Surface Pro 11 Denali non-5G OLED** (Sna
 }
 ```
 
-Set `nixpkgs.hostPlatform` to `aarch64-linux`. Follow the consuming flake's `nixpkgs` input. The default and only kernel is kernel.org `next-20261119` with the audited Denali Kconfig and isolated SPI-HID/QSPI touch queue. The module supplies the OLED DTB, native device firmware, touch, and ARM64 zboot UKIs. The host owns its partitions, accounts, and desktop. `surface.devices.denali.niriOutputs` is an optional value to pass into an existing Niri configuration, not a compositor installation.
+Set `nixpkgs.hostPlatform` to `aarch64-linux`. Follow the consuming flake's `nixpkgs` input. The default and only kernel is kernel.org `next-20261120` with the audited Denali Kconfig and isolated SPI-HID/QSPI touch queue. The module supplies the OLED DTB, native device firmware, touch, and ARM64 zboot UKIs. The host owns its partitions, accounts, and desktop. `surface.devices.denali.niriOutputs` is an optional value to pass into an existing Niri configuration, not a compositor installation.
 
 ## Private firmware
 
@@ -39,4 +39,4 @@ The persistent local Kbuild workbench is for development, not deployment:
 nix develop .#surface-next -c bash scripts/surface-next-workbench.sh build
 ```
 
-This retains writable source, `O=` output and `ccache`. Production rebuilds use the pinned Nix derivation; `scripts/cached-kernel.nix` is an optional local compiler-cache wrapper, not another kernel track. See the [config audit](docs/denali-kernel-config.md).
+This retains writable source and Kbuild `O=` outputs for development. Production builds use the pinned Nix derivation without a compiler cache. See the [config audit and full-build timer](docs/denali-kernel-config.md).

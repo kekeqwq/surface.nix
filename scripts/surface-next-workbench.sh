@@ -28,12 +28,8 @@ if [[ $(<"$work/patch-seed") != "${SURFACE_NEXT_PATCHES:-}" ]]; then
   echo 'Keep out/ intact for incremental compilation. Update patch-seed explicitly after reconciling the tree.' >&2
   exit 1
 fi
-export CCACHE_DIR=${CCACHE_DIR:-${XDG_CACHE_HOME:-$HOME/.cache}/surface-next/ccache}
-export CCACHE_BASEDIR=$work
-export CCACHE_COMPILERCHECK=content
-mkdir -p "$CCACHE_DIR"
-kmake() { make -C "$work/src" O="$out" ARCH=arm64 LOCALVERSION="${SURFACE_NEXT_LOCALVERSION:-}" CC='ccache gcc' HOSTCC='ccache gcc' "$@"; }
-printf 'Source: %s\nOutput: %s\nCache:  %s\n' "$work/src" "$out" "$CCACHE_DIR"
+kmake() { make -C "$work/src" O="$out" ARCH=arm64 LOCALVERSION="${SURFACE_NEXT_LOCALVERSION:-}" "$@"; }
+printf 'Source: %s\nOutput: %s\n' "$work/src" "$out"
 case ${1:-build} in
   paths) ;;
   build|config)
@@ -44,7 +40,6 @@ case ${1:-build} in
     kmake olddefconfig
     if [[ ${1:-build} == build ]]; then
       kmake -j"${SURFACE_NEXT_JOBS:-8}" vmlinuz.efi qcom/x1e80100-microsoft-denali-oled.dtb modules
-      ccache --show-stats
     fi
     ;;
   *) echo 'usage: surface-next-workbench.sh [paths|config|build]' >&2; exit 2 ;;

@@ -21,7 +21,6 @@
       devShells.${system}.surface-next = pkgs.mkShell {
         inputsFrom = [ kernel ];
         nativeBuildInputs = [
-          pkgs.ccache
           pkgs.util-linux
         ];
         SURFACE_NEXT_SOURCE = kernel.src;

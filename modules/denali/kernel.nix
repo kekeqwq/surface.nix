@@ -8,33 +8,29 @@
   config = lib.mkIf config.surface.devices.denali.enable {
     # The opted-in Denali device needs its kernel instead of a desktop default.
     boot.kernelPackages = pkgs.surfacePackages.kernelPackages;
+
+    # Explicit Denali initrd drivers for boot, display, input and rescue media.
+    # NVMe, ext4, xHCI, usbhid and hid-generic are built into this kernel.
+    boot.initrd.includeDefaultModules = false;
     boot.initrd.availableKernelModules = {
+      # PCIe/NVMe and USB PHYs + TCSR clock used by both USB-C ports.
       tcsrcc-x1e80100 = true;
       phy-qcom-qmp-pcie = true;
       phy-snps-eusb2 = true;
       phy-qcom-eusb2-repeater = true;
       phy-qcom-qmp-combo = true;
       phy-qcom-edp = true;
-      panel-samsung-atna33xc20 = true;
+      # Early display for Plymouth.
       msm = true;
+      panel-samsung-atna33xc20 = true;
+      # Surface keyboard/HID (Surface Aggregator) and USB storage for rescue.
       surface_hid = true;
-      xhci_pci = true;
       usb_storage = true;
       uas = true;
-      xhci_pci_prom21 = lib.mkOverride 90 false;
-    }
-    // lib.genAttrs [
-      # The device uses NVMe; these generic suggestions are absent from its
-      # audited Kconfig. Keep missing-module checks strict.
-      "ahci"
-      "ata_piix"
-      "mmc_block"
-      "pata_marvell"
-      "sata_nv"
-      "sata_sis"
-      "sata_uli"
-      "sata_via"
-    ] (_: lib.mkOverride 90 false);
+      sr_mod = true;
+      vfat = true;
+    };
+
     boot.kernelParams = [
       "clk_ignore_unused"
       "pd_ignore_unused"
