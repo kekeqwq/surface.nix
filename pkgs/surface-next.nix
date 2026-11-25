@@ -31,7 +31,7 @@ linuxManualConfig {
       test "$(git -C "$out" rev-parse refs/tags/${tag})" = ${tagObject}
       test "$(git -C "$out" rev-parse HEAD)" = ${commit}
     '';
-    hash = "sha256-AoeKCkZJxmGJdBx7yBirtCIXNL5qikdWa2drZAwYYEU=";
+    hash = "sha256-1NXXoLsXnVT2yu9PvWe9zec5hZeJUo/rtrB9UQW63Qs=";
   };
   # One audited Denali configuration and its dependency-ordered touch queue.
   # No alternate downstream kernel, graphics workaround or register experiment.

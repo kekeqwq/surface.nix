@@ -25,7 +25,10 @@ Official kernel.org tag refs checked before building:
 `3dd8c790a7b7027abdd568e36db5e82ffaea7c77`; the fetch hook checks both
 before Git metadata is discarded. The clean checkout is independently
 locked by the recursive SHA-256 hash
-`sha256-AoeKCkZJxmGJdBx7yBirtCIXNL5qikdWa2drZAwYYEU=`. Only the source
+`sha256-1NXXoLsXnVT2yu9PvWe9zec5hZeJUo/rtrB9UQW63Qs=`. The Linux tree contains
+case-only filename pairs, so a macOS checkout cannot represent all paths and
+must not be used to hash it. The hash was measured on the native AArch64
+checkout after its tag object and peeled commit matched. Only the source
 transport changed; the tag, patch stack, config and module release stayed pinned.
 
 ## Deployment boundary
