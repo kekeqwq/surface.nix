@@ -65,3 +65,12 @@ full-ring test does not explain the first trigger of the original PipeWire
 recovery. Neither test establishes actual detach/reattach or long-term
 listening stability. The one-shot also verified SSH, greetd/Niri, FL/FR
 routing and the hardware Adreno renderer (1024 GLES pixel readbacks).
+
+The same closure passed a 20-cycle desktop playback test and a five-minute
+soak (2,880,144–2,880,672 frames per minute on one graph), then became the
+regular Gen22 default through `nixos-rebuild switch`. After a real reboot,
+three further idle/reopen and 192,000-frame duplex rounds passed. A temporally
+matched onboard MicArray spot check found the 997/1499/1997 Hz probe tones
+38.0/34.6/37.7 dB above nonmatching windows and sidebands. This corroborates
+acoustic output at the test level; it is not calibrated SPL, independent L/R
+verification, or listening acceptance. Active volume settings are unchanged.
