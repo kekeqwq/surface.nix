@@ -1,8 +1,8 @@
 diff --git a/drivers/soundwire/qcom.c b/drivers/soundwire/qcom.c
-index a4cb628..5e526f6 100644
+index ad28a0f..f4b6c6e 100644
 --- a/drivers/soundwire/qcom.c
 +++ b/drivers/soundwire/qcom.c
-@@ -213,7 +213,14 @@ struct qcom_swrm_ctrl {
+@@ -239,7 +239,14 @@ struct qcom_swrm_ctrl {
  	int cols_index;
  	int rows_index;
  	unsigned long port_mask;
@@ -17,7 +17,7 @@ index a4cb628..5e526f6 100644
  	u8 rcmd_id;
  	u8 wcmd_id;
  	/* Port numbers are 1 - 14 */
-@@ -532,6 +539,13 @@ static bool swrm_wait_for_wr_fifo_done(struct qcom_swrm_ctrl *ctrl)
+@@ -558,6 +565,13 @@ static bool swrm_wait_for_wr_fifo_done(struct qcom_swrm_ctrl *ctrl)
  	return false;
  }
  
@@ -31,7 +31,7 @@ index a4cb628..5e526f6 100644
  static int qcom_swrm_cmd_fifo_wr_cmd(struct qcom_swrm_ctrl *ctrl, u8 cmd_data,
  				     u8 dev_addr, u16 reg_addr)
  {
-@@ -562,17 +576,28 @@ static int qcom_swrm_cmd_fifo_wr_cmd(struct qcom_swrm_ctrl *ctrl, u8 cmd_data,
+@@ -588,17 +602,28 @@ static int qcom_swrm_cmd_fifo_wr_cmd(struct qcom_swrm_ctrl *ctrl, u8 cmd_data,
  		usleep_range(150, 155);
  
  	if (cmd_id == SWR_BROADCAST_CMD_ID) {
@@ -63,7 +63,7 @@ index a4cb628..5e526f6 100644
  
  	} else {
  		ret = SDW_CMD_OK;
-@@ -633,6 +658,55 @@ static int qcom_swrm_cmd_fifo_rd_cmd(struct qcom_swrm_ctrl *ctrl,
+@@ -659,6 +684,55 @@ static int qcom_swrm_cmd_fifo_rd_cmd(struct qcom_swrm_ctrl *ctrl,
  	return SDW_CMD_IGNORED;
  }
  
@@ -119,7 +119,7 @@ index a4cb628..5e526f6 100644
  static int qcom_swrm_get_alert_slave_dev_num(struct qcom_swrm_ctrl *ctrl)
  {
  	u32 val, status;
-@@ -644,6 +718,9 @@ static int qcom_swrm_get_alert_slave_dev_num(struct qcom_swrm_ctrl *ctrl)
+@@ -670,6 +744,9 @@ static int qcom_swrm_get_alert_slave_dev_num(struct qcom_swrm_ctrl *ctrl)
  		status = (val >> (dev_num * SWRM_MCP_SLV_STATUS_SZ));
  
  		if ((status & SWRM_MCP_SLV_STATUS_MASK) == SDW_SLAVE_ALERT) {
@@ -129,7 +129,7 @@ index a4cb628..5e526f6 100644
  			ctrl->status[dev_num] = status & SWRM_MCP_SLV_STATUS_MASK;
  			return dev_num;
  		}
-@@ -657,7 +734,9 @@ static void qcom_swrm_get_device_status(struct qcom_swrm_ctrl *ctrl)
+@@ -683,7 +760,9 @@ static void qcom_swrm_get_device_status(struct qcom_swrm_ctrl *ctrl)
  	u32 val;
  	int i;
  
@@ -140,7 +140,7 @@ index a4cb628..5e526f6 100644
  	ctrl->slave_status = val;
  
  	for (i = 1; i <= SDW_MAX_DEVICES; i++) {
-@@ -785,6 +864,20 @@ static irqreturn_t qcom_swrm_irq_handler(int irq, void *dev_id)
+@@ -811,6 +890,20 @@ static irqreturn_t qcom_swrm_irq_handler(int irq, void *dev_id)
  	intr_sts_masked = intr_sts & ctrl->intr_mask;
  
  	do {
@@ -161,7 +161,7 @@ index a4cb628..5e526f6 100644
  		for (i = 0; i < SWRM_INTERRUPT_MAX; i++) {
  			value = intr_sts_masked & BIT(i);
  			if (!value)
-@@ -809,12 +902,17 @@ static irqreturn_t qcom_swrm_irq_handler(int irq, void *dev_id)
+@@ -835,12 +928,17 @@ static irqreturn_t qcom_swrm_irq_handler(int irq, void *dev_id)
  					dev_dbg(ctrl->dev, "Slave status not changed %x\n",
  						slave_status);
  				} else {
@@ -179,7 +179,7 @@ index a4cb628..5e526f6 100644
  				dev_err_ratelimited(ctrl->dev,
  						"%s: SWR bus clsh detected\n",
  						__func__);
-@@ -882,6 +980,10 @@ static irqreturn_t qcom_swrm_irq_handler(int irq, void *dev_id)
+@@ -908,6 +1006,10 @@ static irqreturn_t qcom_swrm_irq_handler(int irq, void *dev_id)
  			case SWRM_INTERRUPT_STATUS_BUS_RESET_FINISHED_V2:
  				break;
  			case SWRM_INTERRUPT_STATUS_CLK_STOP_FINISHED_V2:
@@ -190,7 +190,7 @@ index a4cb628..5e526f6 100644
  				break;
  			case SWRM_INTERRUPT_STATUS_EXT_CLK_STOP_WAKEUP:
  				break;
-@@ -915,6 +1017,31 @@ static irqreturn_t qcom_swrm_irq_handler(int irq, void *dev_id)
+@@ -941,6 +1043,31 @@ static irqreturn_t qcom_swrm_irq_handler(int irq, void *dev_id)
  	return ret;
  }
  
@@ -222,7 +222,7 @@ index a4cb628..5e526f6 100644
  static bool swrm_wait_for_frame_gen_enabled(struct qcom_swrm_ctrl *ctrl)
  {
  	int retry = SWRM_LINK_STATUS_RETRY_CNT;
-@@ -1033,6 +1160,11 @@ static enum sdw_command_response qcom_swrm_xfer_msg(struct sdw_bus *bus,
+@@ -1102,6 +1229,11 @@ static enum sdw_command_response qcom_swrm_xfer_msg(struct sdw_bus *bus,
  	struct qcom_swrm_ctrl *ctrl = to_qcom_sdw(bus);
  	int ret, i, len;
  
@@ -234,8 +234,8 @@ index a4cb628..5e526f6 100644
  	if (msg->page) {
  		if (ctrl->page1_cache[msg->dev_num] != msg->addr_page1) {
  			ret = qcom_swrm_cmd_fifo_wr_cmd(ctrl, msg->addr_page1,
-@@ -1105,6 +1237,98 @@ static int qcom_swrm_port_params(struct sdw_bus *bus,
- 				p_params->bps - 1);
+@@ -1214,6 +1346,98 @@ static int qcom_swrm_port_params(struct sdw_bus *bus,
+ 					p_params->bps - 1);
  }
  
 +#define DENALI_CPS_WAKE_ROUTE_REG 0x105c
@@ -333,7 +333,7 @@ index a4cb628..5e526f6 100644
  static int qcom_swrm_transport_params(struct sdw_bus *bus,
  				      struct sdw_transport_params *params,
  				      enum sdw_reg_bank bank)
-@@ -1119,6 +1343,12 @@ static int qcom_swrm_transport_params(struct sdw_bus *bus,
+@@ -1228,6 +1452,12 @@ static int qcom_swrm_transport_params(struct sdw_bus *bus,
  
  	pcfg = &ctrl->pconfig[params->port_num];
  
@@ -346,23 +346,27 @@ index a4cb628..5e526f6 100644
  	value = pcfg->off1 << SWRM_DP_PORT_CTRL_OFFSET1_SHFT;
  	value |= pcfg->off2 << SWRM_DP_PORT_CTRL_OFFSET2_SHFT;
  	value |= pcfg->si & 0xff;
-@@ -1193,6 +1423,28 @@ static int qcom_swrm_port_enable(struct sdw_bus *bus,
+@@ -1304,9 +1534,30 @@ static int qcom_swrm_port_enable(struct sdw_bus *bus,
+ 	u32 val;
+ 	u32 offset = ctrl->reg_layout[SWRM_OFFSET_DP_PORT_CTRL_BANK];
  
++	int ret;
++
  	reg = SWRM_DPn_PORT_CTRL_BANK(offset, enable_ch->port_num, bank);
- 
++	ret = qcom_swrm_port_reg_read(ctrl, enable_ch->port_num, reg, &val);
++	if (ret)
++		return ret;
++
 +	if (enable_ch->enable && qcom_swrm_audit_active_offset2(ctrl, enable_ch->port_num)) {
 +		u32 check;
-+		int ret;
-+
-+		ret = ctrl->reg_read(ctrl, reg, &val);
-+		if (ret)
-+			return ret;
+ 
+-	qcom_swrm_port_reg_read(ctrl, enable_ch->port_num, reg, &val);
 +		val &= ~(0xffU << SWRM_DP_PORT_CTRL_OFFSET2_SHFT);
 +		val |= enable_ch->ch_mask << SWRM_DP_PORT_CTRL_EN_CHAN_SHFT;
-+		ret = ctrl->reg_write(ctrl, reg, val);
++		ret = qcom_swrm_port_reg_write(ctrl, enable_ch->port_num, reg, val);
 +		if (ret)
 +			return ret;
-+		ret = ctrl->reg_read(ctrl, reg, &check);
++		ret = qcom_swrm_port_reg_read(ctrl, enable_ch->port_num, reg, &check);
 +		if (ret)
 +			return ret;
 +		if (check != val)
@@ -371,11 +375,10 @@ index a4cb628..5e526f6 100644
 +				     enable_ch->port_num, bank);
 +		return 0;
 +	}
-+
- 	ctrl->reg_read(ctrl, reg, &val);
  
  	if (enable_ch->enable)
-@@ -1288,6 +1540,9 @@ static void qcom_swrm_stream_free_ports(struct qcom_swrm_ctrl *ctrl,
+ 		val |= (enable_ch->ch_mask << SWRM_DP_PORT_CTRL_EN_CHAN_SHFT);
+@@ -1401,6 +1652,9 @@ static void qcom_swrm_stream_free_ports(struct qcom_swrm_ctrl *ctrl,
  	mutex_lock(&ctrl->port_lock);
  
  	list_for_each_entry(m_rt, &stream->master_list, stream_node) {
@@ -385,7 +388,7 @@ index a4cb628..5e526f6 100644
  		port_mask = &ctrl->port_mask;
  		list_for_each_entry(p_rt, &m_rt->port_list, port_node)
  			clear_bit(p_rt->num, port_mask);
-@@ -1296,6 +1551,20 @@ static void qcom_swrm_stream_free_ports(struct qcom_swrm_ctrl *ctrl,
+@@ -1409,6 +1663,20 @@ static void qcom_swrm_stream_free_ports(struct qcom_swrm_ctrl *ctrl,
  	mutex_unlock(&ctrl->port_lock);
  }
  
@@ -406,7 +409,7 @@ index a4cb628..5e526f6 100644
  static int qcom_swrm_stream_alloc_ports(struct qcom_swrm_ctrl *ctrl,
  					struct sdw_stream_runtime *stream,
  				       struct snd_pcm_hw_params *params,
-@@ -1344,15 +1613,10 @@ static int qcom_swrm_stream_alloc_ports(struct qcom_swrm_ctrl *ctrl,
+@@ -1457,14 +1725,9 @@ static int qcom_swrm_stream_alloc_ports(struct qcom_swrm_ctrl *ctrl,
  			slave = s_rt->slave;
  			list_for_each_entry(p_rt, &s_rt->port_list, port_node) {
  				m_port = slave->m_port_map[p_rt->num];
@@ -416,17 +419,15 @@ index a4cb628..5e526f6 100644
 -				else
 -					pn = find_first_zero_bit(port_mask, maxport);
 -
--				if (pn >= maxport) {
+-				if (pn >= maxport || nports >= maxport) {
 -					dev_err(ctrl->dev, "All ports busy\n");
--					return -EBUSY;
 +				pn = qcom_swrm_select_master_port(port_mask, maxport, m_port);
-+				if (pn < 0) {
++				if (pn < 0 || nports >= maxport) {
 +					dev_err(ctrl->dev, "No usable master port\n");
-+					return pn;
+ 					*port_mask &= ~allocated;
+ 					return -EBUSY;
  				}
- 				set_bit(pn, port_mask);
- 				pconfig[nports].num = pn;
-@@ -1368,6 +1632,113 @@ static int qcom_swrm_stream_alloc_ports(struct qcom_swrm_ctrl *ctrl,
+@@ -1483,6 +1746,113 @@ static int qcom_swrm_stream_alloc_ports(struct qcom_swrm_ctrl *ctrl,
  	return 0;
  }
  
@@ -540,7 +541,7 @@ index a4cb628..5e526f6 100644
  static int qcom_swrm_hw_params(struct snd_pcm_substream *substream,
  			       struct snd_pcm_hw_params *params,
  			      struct snd_soc_dai *dai)
-@@ -1376,6 +1747,28 @@ static int qcom_swrm_hw_params(struct snd_pcm_substream *substream,
+@@ -1491,6 +1861,28 @@ static int qcom_swrm_hw_params(struct snd_pcm_substream *substream,
  	struct sdw_stream_runtime *sruntime = ctrl->sruntime[dai->id];
  	int ret;
  
@@ -569,7 +570,7 @@ index a4cb628..5e526f6 100644
  	ret = qcom_swrm_stream_alloc_ports(ctrl, sruntime, params,
  					   substream->stream);
  	if (ret)
-@@ -1393,6 +1786,8 @@ static int qcom_swrm_hw_free(struct snd_pcm_substream *substream,
+@@ -1508,6 +1900,8 @@ static int qcom_swrm_hw_free(struct snd_pcm_substream *substream,
  	qcom_swrm_stream_free_ports(ctrl, sruntime);
  	sdw_stream_remove_master(&ctrl->bus, sruntime);
  
@@ -578,7 +579,7 @@ index a4cb628..5e526f6 100644
  	return 0;
  }
  
-@@ -1419,6 +1814,9 @@ static int qcom_swrm_startup(struct snd_pcm_substream *substream,
+@@ -1534,6 +1928,9 @@ static int qcom_swrm_startup(struct snd_pcm_substream *substream,
  	struct qcom_swrm_ctrl *ctrl = dev_get_drvdata(dai->dev);
  	int ret;
  
@@ -588,7 +589,7 @@ index a4cb628..5e526f6 100644
  	ret = pm_runtime_get_sync(ctrl->dev);
  	if (ret < 0 && ret != -EACCES) {
  		dev_err_ratelimited(ctrl->dev,
-@@ -1428,7 +1826,10 @@ static int qcom_swrm_startup(struct snd_pcm_substream *substream,
+@@ -1543,7 +1940,10 @@ static int qcom_swrm_startup(struct snd_pcm_substream *substream,
  		return ret;
  	}
  
@@ -600,7 +601,7 @@ index a4cb628..5e526f6 100644
  }
  
  static void qcom_swrm_shutdown(struct snd_pcm_substream *substream,
-@@ -1436,13 +1837,24 @@ static void qcom_swrm_shutdown(struct snd_pcm_substream *substream,
+@@ -1551,13 +1951,24 @@ static void qcom_swrm_shutdown(struct snd_pcm_substream *substream,
  {
  	struct qcom_swrm_ctrl *ctrl = dev_get_drvdata(dai->dev);
  
@@ -625,7 +626,7 @@ index a4cb628..5e526f6 100644
  	.hw_params = qcom_swrm_hw_params,
  	.hw_free = qcom_swrm_hw_free,
  	.startup = qcom_swrm_startup,
-@@ -1487,6 +1899,23 @@ static int qcom_swrm_register_dais(struct qcom_swrm_ctrl *ctrl)
+@@ -1602,6 +2013,23 @@ static int qcom_swrm_register_dais(struct qcom_swrm_ctrl *ctrl)
  		stream->rates = SNDRV_PCM_RATE_48000;
  		stream->formats = SNDRV_PCM_FMTBIT_S16_LE;
  
@@ -649,7 +650,7 @@ index a4cb628..5e526f6 100644
  		dais[i].ops = &qcom_swrm_pdm_dai_ops;
  		dais[i].id = i;
  	}
-@@ -1678,6 +2107,15 @@ static int qcom_swrm_probe(struct platform_device *pdev)
+@@ -1893,6 +2321,15 @@ static int qcom_swrm_probe(struct platform_device *pdev)
  	clk_prepare_enable(ctrl->hclk);
  
  	ctrl->dev = dev;
@@ -665,7 +666,7 @@ index a4cb628..5e526f6 100644
  	dev_set_drvdata(&pdev->dev, ctrl);
  	mutex_init(&ctrl->port_lock);
  	init_completion(&ctrl->broadcast);
-@@ -1790,17 +2228,56 @@ static void qcom_swrm_remove(struct platform_device *pdev)
+@@ -2076,21 +2513,60 @@ static void qcom_swrm_remove(struct platform_device *pdev)
  	clk_disable_unprepare(ctrl->hclk);
  }
  
@@ -704,6 +705,11 @@ index a4cb628..5e526f6 100644
  	struct qcom_swrm_ctrl *ctrl = dev_get_drvdata(dev);
  	int ret;
  
+-	/* no bus of its own; the primary restarts the link */
++	/* No bus of its own; the primary restarts the link. */
+ 	if (ctrl->mm_role == QCOM_SWRM_MM_DEPENDENT)
+ 		return clk_prepare_enable(ctrl->hclk);
+ 
 +	/* On FullIO preserve the suspended IRQ state if iface cannot start. */
 +	if (ctrl->fullio_link_gate) {
 +		ret = clk_prepare_enable(ctrl->hclk);
@@ -723,12 +729,11 @@ index a4cb628..5e526f6 100644
  	enable_irq(ctrl->irq);
  
  	if (ctrl->clock_stop_not_supported) {
-@@ -1820,43 +2297,117 @@ static int __maybe_unused swrm_runtime_resume(struct device *dev)
+@@ -2110,48 +2586,122 @@ static int __maybe_unused swrm_runtime_resume(struct device *dev)
  		qcom_swrm_get_device_status(ctrl);
  		sdw_handle_slave_status(&ctrl->bus, ctrl->status);
  	} else {
 -		reset_control_reset(ctrl->audio_cgcr);
--
 +		int ee_ret = 0, start_ret, mask_ret = 0;
 +
 +		swrm_fullio_pm_snapshot(ctrl, "before-cgcr-reset", 0);
@@ -736,7 +741,13 @@ index a4cb628..5e526f6 100644
 +		swrm_fullio_pm_snapshot(ctrl, "after-cgcr-reset-before-clock-start", ret);
 +		if (ctrl->fullio_link_gate && ret)
 +			goto incomplete;
-+
+ 
+ 		qcom_swrm_program_mm_sync(ctrl);
+-		/* dependent was resumed first via the device link */
++		/* The dependent was resumed first via the device link. */
+ 		if (ctrl->mm_role == QCOM_SWRM_MM_PRIMARY && ctrl->peer_ctrl)
+ 			qcom_swrm_program_mm_sync(ctrl->peer_ctrl);
+ 
 +		if (ctrl->version == SWRM_VERSION_1_7_0 || ctrl->version >= SWRM_VERSION_2_0_0) {
 +			ee_ret = ctrl->reg_write(ctrl, SWRM_LINK_MANAGER_EE, ctrl->ee);
 +			if (ctrl->fullio_link_gate && ee_ret) {
@@ -861,9 +872,16 @@ index a4cb628..5e526f6 100644
  }
  
  static int __maybe_unused swrm_runtime_suspend(struct device *dev)
-@@ -1864,7 +2415,16 @@ static int __maybe_unused swrm_runtime_suspend(struct device *dev)
+@@ -2159,13 +2709,22 @@ static int __maybe_unused swrm_runtime_suspend(struct device *dev)
  	struct qcom_swrm_ctrl *ctrl = dev_get_drvdata(dev);
  	int ret;
+ 
+-	/* the primary has already stopped the bus clock */
++	/* The primary has already stopped the bus clock. */
+ 	if (ctrl->mm_role == QCOM_SWRM_MM_DEPENDENT) {
+ 		clk_disable_unprepare(ctrl->hclk);
+ 		return 0;
+ 	}
  
 -	swrm_wait_for_wr_fifo_done(ctrl);
 +	if (READ_ONCE(ctrl->fullio_pm_incomplete))
@@ -879,7 +897,7 @@ index a4cb628..5e526f6 100644
  	if (!ctrl->clock_stop_not_supported) {
  		/* Mask bus clash interrupt */
  		ctrl->intr_mask &= ~SWRM_INTERRUPT_STATUS_MASTER_CLASH_DET;
-@@ -1875,17 +2435,30 @@ static int __maybe_unused swrm_runtime_suspend(struct device *dev)
+@@ -2176,17 +2735,30 @@ static int __maybe_unused swrm_runtime_suspend(struct device *dev)
  		ctrl->reg_write(ctrl, ctrl->reg_layout[SWRM_REG_INTERRUPT_CPU_EN],
  				ctrl->intr_mask);
  		/* Prepare slaves for clock stop */
@@ -912,7 +930,7 @@ index a4cb628..5e526f6 100644
  
  	disable_irq(ctrl->irq);
 diff --git a/drivers/soundwire/stream.c b/drivers/soundwire/stream.c
-index 31db368..e48ce10 100644
+index eccb279..c24abf3 100644
 --- a/drivers/soundwire/stream.c
 +++ b/drivers/soundwire/stream.c
 @@ -62,6 +62,57 @@ int sdw_find_row_index(int row)
@@ -1015,7 +1033,7 @@ index 31db368..e48ce10 100644
  }
  
 diff --git a/include/linux/soundwire/sdw.h b/include/linux/soundwire/sdw.h
-index f710e59..dcc9d37 100644
+index b8f5ad3..a1ddf32 100644
 --- a/include/linux/soundwire/sdw.h
 +++ b/include/linux/soundwire/sdw.h
 @@ -274,6 +274,11 @@ struct sdw_dp0_prop {

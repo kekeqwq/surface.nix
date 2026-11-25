@@ -7,28 +7,28 @@
 # per graph, retrying while the stream settles. It sends no other DSP
 # writes and never touches PA or protection state.
 set -u
-state=${1:?pass fixture state directory}
-vol=$(ls -d /nix/store/*-sp11-fullio-v19c-volume-transaction-*/ 2>/dev/null | grep -v '\.drv' | head -1)
-amixer=$(ls /nix/store/*-alsa-utils-*/bin/amixer | head -1)
-helper=$(ls "$(dirname "$0")"/fullio-reference-volume-once* | head -1)
-export XDG_RUNTIME_DIR=${XDG_RUNTIME_DIR:-/run/user/$(id -u)}
-export DBUS_SESSION_BUS_ADDRESS=${DBUS_SESSION_BUS_ADDRESS:-unix:path=$XDG_RUNTIME_DIR/bus}
-log="$state/endpoint-keeper.log"
+amixer=${1:?pass the exact amixer path}
+vol=${2:?pass the pinned v19c volume data package}
+helper=${0%/*}/fullio-reference-volume-once
 status=/proc/asound/card0/pcm0p/sub0/status
-last_trigger=none
-echo "$(date -Iseconds) keeper start" >> "$log"
+last_trigger=
+running_trigger() {
+    awk '/^state:/ {running = ($2 == "RUNNING")}
+         /^trigger_time:/ {trigger = $2}
+         END {if (running && trigger + 0 > 0) print trigger}' "$status" 2>/dev/null
+}
 while :; do
-    # A new trigger_time means a fresh stream/graph start (sub-second poll).
-    trigger=$(awk '/^trigger_time/ {print $2}' "$status" 2>/dev/null)
+    # PREPARE can expose trigger_time=0 before the paired PA START.
+    trigger=$(running_trigger)
     if [[ -n $trigger && $trigger != "$last_trigger" ]]; then
-        [[ $last_trigger != none ]] && echo "$(date -Iseconds) new stream trigger_time=$trigger" >> "$log"
         last_trigger=$trigger
         sleep 1
         for _ in 1 2 3 4 5 6; do
+            [[ $(running_trigger) == "$trigger" ]] || break
             if python3 "$helper" --card hw:0 --endpoint-db -3 --mute off \
                 --amixer "$amixer" --tlv-write "$vol/libexec/sp11-fullio/tlv_write" \
-                --delta-table "$vol/share/sp11-fullio/gainstep-runtime-deltas.json" >> "$log" 2>&1; then
-                echo "$(date -Iseconds) endpoint armed for trigger_time=$trigger" >> "$log"
+                --delta-table "$vol/share/sp11-fullio/gainstep-runtime-deltas.json"; then
+                echo "Endpoint armed for trigger_time=$trigger"
                 break
             fi
             sleep 2

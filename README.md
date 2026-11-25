@@ -13,7 +13,7 @@ Opt-in NixOS hardware support for the **Surface Pro 11 Denali non-5G OLED** (Sna
 }
 ```
 
-Set `nixpkgs.hostPlatform` to `aarch64-linux`. Follow the consuming flake's `nixpkgs` input. The default kernel is kernel.org `next-20261120` with the audited Denali Kconfig and isolated SPI-HID/QSPI touch queue. The module supplies the OLED DTB, native device firmware, touch, and ARM64 zboot UKIs. The host owns its partitions, accounts, and desktop. `surface.devices.denali.niriOutputs` is an optional value to pass into an existing Niri configuration, not a compositor installation.
+Set `nixpkgs.hostPlatform` to `aarch64-linux`. Follow the consuming flake's `nixpkgs` input. The default kernel is kernel.org `next-20261124` with the audited Denali Kconfig and isolated SPI-HID/QSPI touch queue. The module supplies the OLED DTB, native device firmware, touch, and ARM64 zboot UKIs. The host owns its partitions, accounts, and desktop. `surface.devices.denali.niriOutputs` is an optional value to pass into an existing Niri configuration, not a compositor installation.
 
 ## Private firmware
 
@@ -48,8 +48,9 @@ Golden v33 protected stereo route, and keeps MicArray available to the
 desktop. The endpoint is set to −3 dB; use the desktop slider for normal
 changes. The profile does not start an acoustic capture service.
 
-This profile is still validated as a private one-shot boot, not a replacement
-for the default kernel or Gen20 recovery entry. On the test host,
+Validate changes first with a private one-shot boot and keep an independent
+recovery entry. The consuming Surface host selects this module explicitly;
+it does not alter the default kernel for other consumers. On the test host,
 `scripts/build-fullio-fixture.sh` builds only, `scripts/prepare-fullio-uki.py`
 stages the reference UKI outside the ESP, and
 `scripts/arm-fullio-reference-once.sh` performs the recovery preflight before

@@ -9,7 +9,7 @@ expected=$(readlink -e "$s/system")
 base=$(readlink -e /nix/var/nix/profiles/system-20-link)
 [[ $(readlink /nix/var/nix/profiles/system) == system-20-link && $expected != "$base" ]]
 [[ $(readlink -e /run/booted-system) == "$expected" && $(readlink -e /run/current-system) == "$expected" ]]
-[[ $(uname -r) == *-surface-fullio-muted-test ]]
+[[ $(uname -r) == *-surface-fullio ]]
 dt=/sys/firmware/devicetree/base
 [[ -e $dt/sound/microsoft,denali-fullio-reference-render &&
    -e $dt/soc@0/soundwire@6b10000/speaker@0,0/qcom,denali-fullio-reference-codec &&

@@ -10,7 +10,7 @@ import subprocess
 import tempfile
 
 
-REFERENCE_RELEASE_SUFFIX = "-surface-fullio-muted-test"
+REFERENCE_RELEASE_SUFFIX = "-surface-fullio"
 ZAP = "qcom/x1e80100/microsoft/qcdxkmsuc8380.mbn"
 
 
@@ -65,8 +65,7 @@ def main():
     version = (pieces / "uname").read_text().strip()
     if not version.endswith(REFERENCE_RELEASE_SUFFIX):
         cli.error("candidate does not have the expected FullIO kernel release")
-    # The suffix is also used by retired experiments. Require the protected
-    # render DTB, not just a matching release string.
+    # Require the protected render DTB, not just a matching release string.
     try:
         verify_reference_dtb(pieces / "dtb", args.fdtget)
     except (OSError, subprocess.CalledProcessError, ValueError) as exc:

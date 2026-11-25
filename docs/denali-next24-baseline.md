@@ -1,0 +1,33 @@
+# Denali Gen21 candidate: `next-20261124`
+
+## Upstream and patch audit (2026-11-25)
+
+Official kernel.org tag refs checked before building:
+
+| Candidate | Tag object | Decision |
+| --- | --- | --- |
+| `v7.3` | `091b06388b117fefdcb63336ac09956a4914b961` | Not a replacement for the tested Next hardware base. |
+| `v7.4-rc4` | `a4d7daea71be591034445c17d4d81132a1785a12` | Compared with the Next candidate; the Denali OLED DTS and GENI SPI source differ. |
+| `next-20261120` | `2c0da72bad5631bda9c70dcfbe3497a0ebd9f936` | Previous test base. |
+| `next-20261123` | `1422acaa190f2daef38ee0b8c50c6ca0fb7f3771` | Intermediate integration tag, not the selected candidate. |
+| `next-20261124` | `ecfab21e114b19a8425356b5b7547c471bd6ebb2` | Candidate: same checked display path, new SoundWire allocation bounds/unwind, and retains the Denali/touch/FullIO source after patch reconciliation. |
+
+- GPU/display: compared `a6xx_catalog.c`, `a7xx_catalog.c`, `dpu_hw_sspp.c` and `dp_display.c` across the old Next, new Next and RC4 snapshots; each of those files is identical across the three. The OLED DTS is identical across the two Next snapshots. Keep the local post-training eDP stream-depth patch: its change is absent in all three. Keep the native GPU path, without a compression debug override. The snapshots do not substitute for a hardware modeset test.
+- SoundWire: `6c067677192f0` (disable IRQ before gating the clock) was already present. The new `soundwire/next` tip `d9ea256ee889f` introduces a separate output-array bound and rollback of ports allocated by the failed attempt. Retain those upstream semantics as well as the local rule that the last explicitly mapped port is legal (the auto allocator's sentinel is not a port). Reconcile register access with the new peer-aware SoundWire helpers, preserving the checked Offset2 readback. Preserve dependent-controller PM handling and the local Denali admission/quarantine on uncertain clock-stop and resume.
+- Touch: the raw HID registration files and GENI SPI source differ. Replayed the ordered SPI-HID/QSPI stack with no fuzz. The added driver, GENI QSPI operations and Denali board wiring are not superseded by these changes. No patch was removed solely because of a matching subject or a line offset.
+- ASoC and Denali: the touched raw AudioReach, codec, LPASS, ASoC core and Denali include sources are unchanged between the Next snapshots. Keep the matched v19c topology, paired WSA and VI/CPS lifecycle, and MicArray. Replayed the consolidated source and reran the offline UCM, UKI, PCM ownership/position, clock, PA, GainStep and port-bound checks.
+
+## Deployment boundary
+
+The hardware flake only exposes the normal Denali module and the protected
+FullIO module. The Surface host selects FullIO explicitly. No experimental
+acoustic monitor, alternate boot fixture, test executable or audio tool is
+installed in the system profile. The two desktop services reference only
+their exact dependencies. The graph holder uses a runtime FIFO and targets
+the internal Speaker sink; the keeper retains the reviewed −3 dB transaction.
+Persistent WirePlumber state is separate from Gen20's state.
+
+Gen21 is still a **test** baseline: the existing host-local credential-free
+SSH and `sudo -n` remain by request. They must be removed before formal use.
+No storage migration, credentials, firmware distribution or change to other
+hosts is included.

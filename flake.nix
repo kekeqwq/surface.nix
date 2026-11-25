@@ -18,8 +18,7 @@
         fullio-reference-topology = pkgs.callPackage ./pkgs/fullio-topology.nix { };
         fullio-reference-volume = pkgs.callPackage ./pkgs/fullio-reference-volume.nix { };
         fullio-reference-kernel = kernel.override {
-          # Preserve the tested module ABI/release and private UKI gate.
-          localVersion = "-surface-fullio-muted-test";
+          localVersion = "-surface-fullio";
           kernelPatches =
             kernel.kernelPatches
             ++

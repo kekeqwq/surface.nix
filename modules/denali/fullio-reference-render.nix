@@ -57,7 +57,6 @@ let
     install -Dm755 ${../../scripts/fullio-endpoint-keeper.sh} "$out/bin/fullio-endpoint-keeper"
     install -Dm755 ${../../scripts/fullio-reference-volume-once.py} "$out/bin/fullio-reference-volume-once"
   '';
-  sessionState = "%h/.local/state/fullio-audio-session";
 in
 {
   assertions = [
@@ -74,11 +73,6 @@ in
     dtbSource = renderDtbs;
   };
   hardware.firmware = [ (lib.hiPrio topology) ];
-  # Endpoint volume/mute arming helper (tlv_write + pinned GainStep table).
-  environment.systemPackages = [
-    packages.fullio-reference-volume
-    audioTools
-  ];
   # Keep the graph across playback gaps and re-arm the reviewed endpoint
   # transaction after graph reopen. Do not open the MicArray at login.
   systemd.user.services =
@@ -98,7 +92,9 @@ in
         wantedBy = [ "default.target" ];
         path = sessionPath;
         serviceConfig = {
-          ExecStart = "${audioTools}/bin/fullio-graph-holder ${sessionState}";
+          ExecStart = "${audioTools}/bin/fullio-graph-holder ${pkgs.pipewire}/bin/pw-cat";
+          RuntimeDirectory = "denali-fullio-holder";
+          RuntimeDirectoryMode = "0700";
           Restart = "on-failure";
           RestartSec = "2";
         };
@@ -108,16 +104,16 @@ in
         wantedBy = [ "default.target" ];
         path = sessionPath;
         serviceConfig = {
-          ExecStart = "${audioTools}/bin/fullio-endpoint-keeper ${sessionState}";
+          ExecStart = "${audioTools}/bin/fullio-endpoint-keeper ${pkgs.alsa-utils}/bin/amixer ${packages.fullio-reference-volume}";
           Restart = "on-failure";
           RestartSec = "2";
         };
       };
-      # One-shot sessions must not persist WirePlumber profile choices into
-      # keke's Gen20 state.
+      # Preserve desktop volume preferences without writing into Gen20's
+      # WirePlumber state.
       wireplumber.environment = {
         ALSA_CONFIG_UCM2 = lib.mkOverride 40 "${renderUcm}/share/alsa/ucm2";
-        XDG_STATE_HOME = lib.mkOverride 40 "%t/fullio-reference-render-state";
+        XDG_STATE_HOME = lib.mkOverride 40 "%h/.local/state/denali-fullio";
       };
     };
   services.pipewire.wireplumber.extraConfig."51-surface-speaker" = lib.mkOverride 40 {

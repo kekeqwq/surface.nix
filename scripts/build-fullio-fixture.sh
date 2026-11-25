@@ -21,8 +21,8 @@ default_before=$(sudo_run bootctl status --no-pager | awk '/^Default Boot Loader
 [[ $default_before == nixos-3aae9950e05724a6f75ac7703476b7b4d3ceb0f8ea5bba8665aace82d3a98a62.conf ]]
 src=$(readlink -e "$s/hardware")
 [[ $src =~ ^/home/keke/\.local/state/fullio-[a-zA-Z0-9-]+/hardware$ ]]
-apply="c: (c.extendModules { modules = [ (builtins.getFlake \"path:$src\").nixosModules.fullio-reference-render ]; }).config.system.build.toplevel.drvPath"
-drv=$(nix eval "path:$HOME/Repos/flakes#nixosConfigurations.surface" --no-write-lock-file --impure --apply "$apply" --raw)
+drv=$(nix eval --no-write-lock-file --override-input surface "path:$src" \
+    "path:$HOME/Repos/flakes#nixosConfigurations.surface.config.system.build.toplevel.drvPath" --raw)
 printf 'Native FullIO reference derivation: %s\n' "$drv"
 [[ $drv =~ ^/nix/store/[a-z0-9]{32}-nixos-system-surface-[a-zA-Z0-9._-]+\.drv$ ]]
 nix build -L -v "$drv^out" --out-link "$s/system"

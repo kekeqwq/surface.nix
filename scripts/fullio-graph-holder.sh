@@ -12,24 +12,17 @@
 # both are recycled if the PCM fails to reach RUNNING, which covers the
 # login race where the sink is not yet ready for linking.
 set -u
-state=${1:?pass fixture state directory}
-pwcat=$(ls /nix/store/*-pipewire-*/bin/pw-cat | head -1)
-export XDG_RUNTIME_DIR=${XDG_RUNTIME_DIR:-/run/user/$(id -u)}
-export DBUS_SESSION_BUS_ADDRESS=${DBUS_SESSION_BUS_ADDRESS:-unix:path=$XDG_RUNTIME_DIR/bus}
-mkdir -p "$state"
-log="$state/graph-holder.log"
-zeros="$state/holder-zeros.raw"
+pwcat=${1:?pass the exact pw-cat path}
+state=${RUNTIME_DIRECTORY:?systemd RuntimeDirectory is required}
 fifo="$state/holder.fifo"
 status=/proc/asound/card0/pcm0p/sub0/status
-[[ -s $zeros ]] || head -c 1048576 /dev/zero > "$zeros"
-[[ -p $fifo ]] || mkfifo "$fifo"
-echo "$(date -Iseconds) holder start" >> "$log"
+[[ -p $fifo ]] || mkfifo "$fifo" || exit 1
 while :; do
-    bash -c "while :; do cat '$zeros'; done" > "$fifo" &
+    cat /dev/zero > "$fifo" &
     feeder=$!
     "$pwcat" --playback --raw --format s16 --rate 48000 --channels 2 \
-             --properties 'node.name=fullio-graph-holder' - \
-             < "$fifo" >> "$log" 2>&1 &
+             --target alsa_output.platform-sound.HiFi__Speaker__sink \
+             --properties 'node.name=fullio-graph-holder' - < "$fifo" &
     stream=$!
     idle=0
     while kill -0 "$stream" 2>/dev/null && kill -0 "$feeder" 2>/dev/null; do
@@ -39,7 +32,7 @@ while :; do
         else
             idle=$((idle + 10))
             if (( idle >= 40 )); then
-                echo "$(date -Iseconds) holder PCM idle ${idle}s; recycling" >> "$log"
+                echo "Holder PCM idle ${idle}s; recycling"
                 break
             fi
         fi
@@ -47,6 +40,6 @@ while :; do
     kill "$stream" "$feeder" 2>/dev/null
     wait "$stream" 2>/dev/null
     wait "$feeder" 2>/dev/null
-    echo "$(date -Iseconds) holder stream cycle ended; restarting" >> "$log"
+    echo 'Holder stream cycle ended; restarting'
     sleep 2
 done
