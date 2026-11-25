@@ -1,5 +1,5 @@
 {
-  runCommandNoCC,
+  runCommand,
   fetchurl,
   python3,
   zstd,
@@ -14,7 +14,7 @@ let
   # Same WCN7850 fallback board as dwhinham/archlinux-repo's sp11-ath12k-board.
   board = "bus=pci,vendor=17cb,device=1107,subsystem-vendor=17cb,subsystem-device=3378,qmi-chip-id=2,qmi-board-id=255";
 in
-runCommandNoCC "denali-wcn7850-board"
+runCommand "denali-wcn7850-board"
   {
     nativeBuildInputs = [
       python3
