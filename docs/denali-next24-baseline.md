@@ -17,6 +17,17 @@ Official kernel.org tag refs checked before building:
 - Touch: the raw HID registration files and GENI SPI source differ. Replayed the ordered SPI-HID/QSPI stack with no fuzz. The added driver, GENI QSPI operations and Denali board wiring are not superseded by these changes. No patch was removed solely because of a matching subject or a line offset.
 - ASoC and Denali: the touched raw AudioReach, codec, LPASS, ASoC core and Denali include sources are unchanged between the Next snapshots. Keep the matched v19c topology, paired WSA and VI/CPS lifecycle, and MicArray. Replayed the consolidated source and reran the offline UCM, UKI, PCM ownership/position, clock, PA, GainStep and port-bound checks.
 
+## Git source pin
+
+`pkgs/surface-next.nix` fetches the official `next-20261124` tag with
+`fetchgit`, not a snapshot archive. The annotated tag object
+`ecfab21e114b19a8425356b5b7547c471bd6ebb2` must peel to commit
+`3dd8c790a7b7027abdd568e36db5e82ffaea7c77`; the fetch hook checks both
+before Git metadata is discarded. The clean checkout is independently
+locked by the recursive SHA-256 hash
+`sha256-AoeKCkZJxmGJdBx7yBirtCIXNL5qikdWa2drZAwYYEU=`. Only the source
+transport changed; the tag, patch stack, config and module release stayed pinned.
+
 ## Deployment boundary
 
 The hardware flake only exposes the normal Denali module and the protected
