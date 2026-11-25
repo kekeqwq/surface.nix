@@ -19,8 +19,8 @@ Set `nixpkgs.hostPlatform` to `aarch64-linux`. Follow the consuming flake's `nix
 
 `nix build .#surface-live-iso` produces a text-only aarch64 ISO. It uses the
 aligned zboot UKI and appended EFI partition that this firmware can boot. It
-includes NetworkManager, Git, and the secret-lab disk tools (`parted`,
-`btrfs-progs`, `cryptsetup`, `libfido2`). The console uses the built-in
+includes NetworkManager, Git, and the install tools (`fdisk` from
+`util-linux`, `btrfs-progs`, `cryptsetup`, `libfido2`). The console uses the built-in
 `TER16x32` font. There is no desktop.
 
 Root SSH accepts an empty password from any source. Boot it only on a trusted

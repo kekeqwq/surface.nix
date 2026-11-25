@@ -64,7 +64,7 @@
         grep -q '"root":"yes"' "$out"
         grep -q '"empty":true' "$out"
         grep -q TER16x32 "$out"
-        for tool in git parted gptfdisk dosfstools btrfs-progs cryptsetup libfido2 python3 iw usbutils; do
+        for tool in git util-linux gptfdisk dosfstools btrfs-progs cryptsetup libfido2 python3 iw usbutils; do
           grep -q "\"$tool\"" "$out"
         done
       '';

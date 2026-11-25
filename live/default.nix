@@ -121,7 +121,7 @@ in
   programs.git.enable = true;
   environment.systemPackages = with pkgs; [
     git
-    parted
+    util-linux
     gptfdisk
     dosfstools
     btrfs-progs
