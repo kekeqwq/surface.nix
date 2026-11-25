@@ -19,7 +19,9 @@ anchors = ('q6apm_fullio_both_pa_off', 'wsa_macro_fullio_clock_off_for_feedback'
            'q6apm_fullio_pcm_buffer', 'q6apm_fullio_pcm_start', 'audioreach_fullio_verify_mute',
            'q6apm_fullio_mute_is_verified', 'snd_pcm_set_runtime_buffer(substream, buffer)')
 assert (indices := [prepare.index(x) for x in anchors]) == sorted(indices)
-assert 'if (!prtd->fullio_reference_prepared)' in prepare
+assert 'if (prtd->fullio_reference_prepared)' in prepare
+assert prepare.index('q6apm_fullio_reference_recycle') < prepare.index('q6apm_fullio_pcm_start')
+assert 'snd_pcm_set_runtime_buffer(substream, NULL)' not in prepare
 assert 'wsa884x_fullio_start_pair' not in prepare
 assert 'SNDRV_PCM_TRIGGER_START' in (trigger := get(dai, 'q6apm_dai_trigger'))
 assert (trigger.index('prtd->fullio_reference_pcm') < trigger.index('q6apm_fullio_reference_start')
@@ -28,6 +30,7 @@ assert re.search(r'else if \(audioreach_fullio_graph\(prtd->graph->info\)\) \{\s
 assert get(dai, 'q6apm_fullio_reference_start').count('wsa884x_fullio_start_pair') == 1
 close = get(dai, 'q6apm_dai_close')
 assert close.index('q6apm_fullio_pcm_stop') < close.index('q6apm_graph_close')
+assert close.index('!prtd->fullio_reference_pcm && prtd->state') < close.index('q6apm_graph_stop')
 assert 'snd_pcm_set_runtime_buffer(substream, NULL)' in get(dai, 'q6apm_dai_hw_free')
 
 state = re.search(r'^enum q6apm_fullio_pull_state \{.*?^\};', apm, re.M | re.S)[0]

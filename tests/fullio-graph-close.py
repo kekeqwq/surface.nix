@@ -24,6 +24,7 @@ source = r'''
 #include <assert.h>
 #include <errno.h>
 #define APM_CMD_GRAPH_CLOSE 1
+#define guard(mutex) (void)
 #define container_of(p, type, member) ((type *)((char *)(p) - offsetof(type, member)))
 #define lockdep_assert_held(lock) assert(*(lock))
 #define dev_err(...) ((void)0)
@@ -61,8 +62,15 @@ static int audioreach_graph_mgmt_transaction(struct audioreach_graph *g, int op,
 static int audioreach_graph_mgmt_cmd(struct audioreach_graph *g, int op)
 { assert(g && op == APM_CMD_GRAPH_CLOSE && g->apm->graph_lock); generic_commands++; return injected_error; }
 static void idr_remove(int *h, int id) { assert(h && id == 0); idr_removed++; }
-''' + extract('q6apm_fullio_close_blocks_open') + '\n' + extract('q6apm_put_audioreach_graph') + r'''
-static void close_graph_with_ring(struct q6apm *apm, struct audioreach_graph_info *info,
+static int kref_put(struct kref *ref, void (*release)(struct kref *))
+{
+    if (--ref->count) return 0;
+    release(ref);
+    return 1;
+}
+''' + '\n'.join(extract(name) for name in ('q6apm_fullio_close_blocks_open',
+    'q6apm_put_audioreach_graph', 'q6apm_release_audioreach_graph')) + r'''
+static int close_graph_with_ring(struct q6apm *apm, struct audioreach_graph_info *info,
                                   struct q6apm_fullio_ring *ring)
 {
     struct audioreach_graph *g = calloc(1, sizeof(*g));
@@ -71,22 +79,28 @@ static void close_graph_with_ring(struct q6apm *apm, struct audioreach_graph_inf
     g->info = info;
     g->fullio_ring = ring;
     g->start_count = external_start_count;
-    q6apm_put_audioreach_graph(&g->refcount);
+    g->refcount.count = 1;
+    return q6apm_release_audioreach_graph(g);
 }
-static void close_graph(struct q6apm *apm, struct audioreach_graph_info *info)
-{ close_graph_with_ring(apm, info, NULL); }
+static int close_graph(struct q6apm *apm, struct audioreach_graph_info *info)
+{ return close_graph_with_ring(apm, info, NULL); }
 int main(void)
 {
     struct q6apm apm = { .graph_lock = 1 }, unrelated = { .graph_lock = 1 };
     struct audioreach_graph_info speaker = {true}, mic = {false};
-    close_graph(&apm, &speaker);
+    struct audioreach_graph *shared = calloc(1, sizeof(*shared));
+    assert(shared);
+    *shared = (struct audioreach_graph){.refcount = {2}, .apm = &apm, .info = &speaker};
+    assert(q6apm_release_audioreach_graph(shared) == -EBUSY);
+    assert(!token_commands && !apm.fullio_close_failed);
+    assert(!q6apm_release_audioreach_graph(shared));
     assert(token_commands == 1 && generic_commands == 0 && idr_removed == 1);
     assert(!q6apm_fullio_close_blocks_open(&apm, &speaker));
     injected_error = -ETIMEDOUT;
     close_graph(&apm, &mic);
     assert(token_commands == 1 && generic_commands == 1 && idr_removed == 2);
     assert(!q6apm_fullio_close_blocks_open(&apm, &speaker));
-    close_graph(&apm, &speaker);
+    assert(close_graph(&apm, &speaker) == -ENOTRECOVERABLE);
     assert(token_commands == 2 && generic_commands == 1 && idr_removed == 3);
     assert(q6apm_fullio_close_blocks_open(&apm, &speaker));
     assert(!q6apm_fullio_close_blocks_open(&apm, &mic));
@@ -103,7 +117,7 @@ int main(void)
     injected_error = 0;
     unmap_error = -EIO;
     struct q6apm third = {.graph_lock = 1};
-    close_graph_with_ring(&third, &speaker, &ring);
+    assert(close_graph_with_ring(&third, &speaker, &ring) == -ENOTRECOVERABLE);
     assert(safe_drop == 1 && quarantined == 2 && third.fullio_close_failed);
     unmap_error = 0;
     for (int state = FULLIO_PULL_RUNNING; state <= FULLIO_PULL_UNCERTAIN; state++) {

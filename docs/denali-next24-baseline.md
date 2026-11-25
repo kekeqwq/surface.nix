@@ -31,3 +31,37 @@ Gen21 is still a **test** baseline: the existing host-local credential-free
 SSH and `sudo -n` remain by request. They must be removed before formal use.
 No storage migration, credentials, firmware distribution or change to other
 hosts is included.
+
+## Gen21 PCM recovery
+
+The idle test closed the playback PCM and reached SoundWire runtime suspend
+with both amplifiers still attached. A fresh PCM reopened and the endpoint
+keeper armed it. During the later playback/MicArray run, a subsequent ALSA
+PREPARE checked the already-unmuted DSP endpoint against the initial mute
+condition. The readback failed, PREPARE detached the runtime DMA buffer, and
+a PipeWire write then hit the ALSA missing-DMA warning. This identifies the
+failed recovery, not the reason PipeWire requested recovery in the first place.
+
+The repair retires a previously started graph before reusing that PCM file.
+It checks both PAs and feedback clocks are off, drains the watermark work,
+and requires scoped STOP, last-reference CLOSE and UNMAP before a fresh
+muted graph can start. It does not retry an unverified transition; the first
+error is latched on that PCM file. The native playback copy and silence
+operations reject a missing or out-of-bounds sample buffer without involving
+capture or the stock PCM. `tests/fullio-pcm-recycle.py` exercises the actual
+replacement and transfer helpers with mocked transport and DMA. The official
+refs were rechecked before the native rebuild; `v7.4-rc4` and `next-20261124`
+remained the latest mainline RC and listed Next tag, so the kernel pin stayed
+unchanged.
+
+The private one-shot (`3v4hgqi9…`) passed three idle-close/reopen rounds with
+both amps remaining attached. Each fresh graph armed before a duplex test
+captured 192,000 MicArray frames while playing through the Speaker sink. A
+separate silent `RW_INTERLEAVED` test filled both periods, used ALSA DROP and
+PREPARE on the same fd, and armed both graph epochs. STOP/CLOSE/UNMAP and
+clock-off logs were clean. An initial direct-test attempt primed just 480
+frames and reported an underrun at START (`hw_ptr=624`, `appl_ptr=480`); the corrected
+full-ring test does not explain the first trigger of the original PipeWire
+recovery. Neither test establishes actual detach/reattach or long-term
+listening stability. The one-shot also verified SSH, greetd/Niri, FL/FR
+routing and the hardware Adreno renderer (1024 GLES pixel readbacks).
