@@ -25,7 +25,9 @@ assert 'snd_pcm_set_runtime_buffer(substream, NULL)' not in prepare
 assert 'wsa884x_fullio_start_pair' not in prepare
 assert 'SNDRV_PCM_TRIGGER_START' in (trigger := get(dai, 'q6apm_dai_trigger'))
 assert (trigger.index('prtd->fullio_reference_pcm') < trigger.index('q6apm_fullio_reference_start')
+        < trigger.index('prtd->fullio_reference_started = true')
         < trigger.index('q6apm_pcm_watermark_enable(prtd, true)'))
+assert 'fullio_reference_reopen = true' not in trigger
 assert re.search(r'else if \(audioreach_fullio_graph\(prtd->graph->info\)\) \{\s*return -EOPNOTSUPP;', trigger)
 assert get(dai, 'q6apm_fullio_reference_start').count('wsa884x_fullio_start_pair') == 1
 close = get(dai, 'q6apm_dai_close')

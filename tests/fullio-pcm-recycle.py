@@ -44,7 +44,7 @@ struct q6apm_dai_rtd {
     struct q6apm_graph *graph;
     struct snd_pcm_substream *substream;
     int watermark_work, last_pos_index, pcm_size, periods, fullio_reference_error;
-    bool fullio_reference_prepared, fullio_reference_reopen;
+    bool fullio_reference_prepared, fullio_reference_reopen, fullio_reference_started;
 };
 struct iov_iter { char *data; size_t limit; };
 static struct q6apm_graph old, fresh;

@@ -915,7 +915,7 @@ index 0a50b93..4212962 100644
  				phys_addr_t pphys, uint32_t mem_map_handle,
  				uint32_t pos_buf_mem_map_handle, uint32_t size);
 diff --git a/sound/soc/qcom/qdsp6/q6apm-dai.c b/sound/soc/qcom/qdsp6/q6apm-dai.c
-index afa4bb0..9f71e60 100644
+index afa4bb0..27f6043 100644
 --- a/sound/soc/qcom/qdsp6/q6apm-dai.c
 +++ b/sound/soc/qcom/qdsp6/q6apm-dai.c
 @@ -3,6 +3,8 @@
@@ -958,7 +958,7 @@ index afa4bb0..9f71e60 100644
  	struct snd_pcm_substream *substream;
  	struct snd_compr_stream *cstream;
  	struct snd_codec codec;
-@@ -95,6 +111,15 @@ struct q6apm_dai_rtd {
+@@ -95,6 +111,16 @@ struct q6apm_dai_rtd {
  	enum stream_state state;
  	struct q6apm_graph *graph;
  	spinlock_t lock;
@@ -970,11 +970,12 @@ index afa4bb0..9f71e60 100644
 +	bool fullio_reference_pcm;
 +	bool fullio_reference_prepared;
 +	bool fullio_reference_reopen;
++	bool fullio_reference_started;
 +	int fullio_reference_error;
  	bool notify_on_drain;
  };
  
-@@ -103,6 +128,8 @@ struct q6apm_dai_data {
+@@ -103,6 +129,8 @@ struct q6apm_dai_data {
  	long long sid;
  	bool use_scm_assign;
  	bool has_reserved_mem;
@@ -983,7 +984,7 @@ index afa4bb0..9f71e60 100644
  	size_t reserved_buf_size;
  	struct mutex scm_lock; /* protects scm_regions and num_scm_regions */
  	struct q6apm_scm_region scm_regions[Q6APM_MAX_SCM_REGIONS];
-@@ -236,6 +263,44 @@ static const struct snd_pcm_hardware q6apm_dai_hardware_playback = {
+@@ -236,6 +264,44 @@ static const struct snd_pcm_hardware q6apm_dai_hardware_playback = {
  	.fifo_size =            0,
  };
  
@@ -1028,7 +1029,7 @@ index afa4bb0..9f71e60 100644
  static void event_handler(uint32_t opcode, uint32_t token, void *payload, void *priv)
  {
  	struct q6apm_dai_rtd *prtd = priv;
-@@ -243,7 +308,7 @@ static void event_handler(uint32_t opcode, uint32_t token, void *payload, void *
+@@ -243,7 +309,7 @@ static void event_handler(uint32_t opcode, uint32_t token, void *payload, void *
  
  	switch (opcode) {
  	case APM_CLIENT_EVENT_WATERMARK_EVENT:
@@ -1037,7 +1038,7 @@ index afa4bb0..9f71e60 100644
  		break;
  	case APM_CLIENT_EVENT_CMD_EOS_DONE:
  		prtd->state = Q6APM_STREAM_STOPPED;
-@@ -320,6 +385,859 @@ static void event_handler_compr(uint32_t opcode, uint32_t token,
+@@ -320,6 +386,860 @@ static void event_handler_compr(uint32_t opcode, uint32_t token,
  	}
  }
  
@@ -1828,6 +1829,7 @@ index afa4bb0..9f71e60 100644
 +	prtd->last_pos_index = 0;
 +	prtd->fullio_reference_prepared = false;
 +	prtd->fullio_reference_reopen = false;
++	prtd->fullio_reference_started = false;
 +	return 0;
 +}
 +
@@ -1897,7 +1899,7 @@ index afa4bb0..9f71e60 100644
  static int q6apm_dai_prepare(struct snd_soc_component *component,
  			     struct snd_pcm_substream *substream)
  {
-@@ -334,17 +1252,78 @@ static int q6apm_dai_prepare(struct snd_soc_component *component,
+@@ -334,17 +1254,78 @@ static int q6apm_dai_prepare(struct snd_soc_component *component,
  	if (!pdata)
  		return -EINVAL;
  
@@ -1976,7 +1978,7 @@ index afa4bb0..9f71e60 100644
  	if (prtd->state) {
  		/* clear the previous setup if any  */
  		q6apm_graph_stop(prtd->graph);
-@@ -381,6 +1360,12 @@ static int q6apm_dai_prepare(struct snd_soc_component *component,
+@@ -381,6 +1362,12 @@ static int q6apm_dai_prepare(struct snd_soc_component *component,
  
  	}
  
@@ -1989,7 +1991,7 @@ index afa4bb0..9f71e60 100644
  	ret = q6apm_graph_media_format_pcm(prtd->graph, &cfg);
  	if (ret < 0) {
  		dev_err(dev, "%s: CMD Format block failed\n", __func__);
-@@ -444,6 +1429,36 @@ static int q6apm_dai_ack(struct snd_soc_component *component, struct snd_pcm_sub
+@@ -444,6 +1431,36 @@ static int q6apm_dai_ack(struct snd_soc_component *component, struct snd_pcm_sub
  	return ret;
  }
  
@@ -2026,7 +2028,7 @@ index afa4bb0..9f71e60 100644
  static int q6apm_dai_trigger(struct snd_soc_component *component,
  			     struct snd_pcm_substream *substream, int cmd)
  {
-@@ -455,15 +1470,32 @@ static int q6apm_dai_trigger(struct snd_soc_component *component,
+@@ -455,15 +1472,38 @@ static int q6apm_dai_trigger(struct snd_soc_component *component,
  	case SNDRV_PCM_TRIGGER_START:
  	case SNDRV_PCM_TRIGGER_RESUME:
  	case SNDRV_PCM_TRIGGER_PAUSE_RELEASE:
@@ -2035,13 +2037,19 @@ index afa4bb0..9f71e60 100644
 +				return prtd->fullio_reference_error;
 +			if (!prtd->fullio_reference_prepared || prtd->fullio_reference_reopen)
 +				return -EBADFD;
-+			ret = q6apm_fullio_reference_start(prtd, component->card,
-+							 snd_soc_component_get_drvdata(component));
-+			if (ret) {
-+				prtd->fullio_reference_error = ret;
-+				return ret;
++			/* PipeWire may release or recover this stream without hw_free.
++			 * The paired PAs are already on; another start_pair would fail
++			 * and force a graph replacement during playback.
++			 */
++			if (!prtd->fullio_reference_started) {
++				ret = q6apm_fullio_reference_start(prtd, component->card,
++								 snd_soc_component_get_drvdata(component));
++				if (ret) {
++					prtd->fullio_reference_error = ret;
++					return ret;
++				}
++				prtd->fullio_reference_started = true;
 +			}
-+			prtd->fullio_reference_reopen = true;
 +		} else if (audioreach_fullio_graph(prtd->graph->info)) {
 +			return -EOPNOTSUPP;
 +		}
@@ -2060,7 +2068,7 @@ index afa4bb0..9f71e60 100644
  		break;
  	default:
  		ret = -EINVAL;
-@@ -473,6 +1505,15 @@ static int q6apm_dai_trigger(struct snd_soc_component *component,
+@@ -473,6 +1513,15 @@ static int q6apm_dai_trigger(struct snd_soc_component *component,
  	return ret;
  }
  
@@ -2076,7 +2084,7 @@ index afa4bb0..9f71e60 100644
  static int q6apm_dai_open(struct snd_soc_component *component,
  			  struct snd_pcm_substream *substream)
  {
-@@ -482,23 +1523,44 @@ static int q6apm_dai_open(struct snd_soc_component *component,
+@@ -482,23 +1531,44 @@ static int q6apm_dai_open(struct snd_soc_component *component,
  	struct device *dev = component->dev;
  	struct q6apm_dai_data *pdata;
  	struct q6apm_dai_rtd *prtd;
@@ -2123,7 +2131,7 @@ index afa4bb0..9f71e60 100644
  	if (IS_ERR(prtd->graph)) {
  		dev_err(dev, "%s: Could not allocate memory\n", __func__);
  		ret = PTR_ERR(prtd->graph);
-@@ -509,6 +1571,35 @@ static int q6apm_dai_open(struct snd_soc_component *component,
+@@ -509,6 +1579,35 @@ static int q6apm_dai_open(struct snd_soc_component *component,
  		runtime->hw = q6apm_dai_hardware_playback;
  	else if (substream->stream == SNDRV_PCM_STREAM_CAPTURE)
  		runtime->hw = q6apm_dai_hardware_capture;
@@ -2159,7 +2167,7 @@ index afa4bb0..9f71e60 100644
  
  	/* Ensure that buffer size is a multiple of period size */
  	ret = snd_pcm_hw_constraint_integer(runtime, SNDRV_PCM_HW_PARAM_PERIODS);
-@@ -543,6 +1634,8 @@ static int q6apm_dai_open(struct snd_soc_component *component,
+@@ -543,6 +1642,8 @@ static int q6apm_dai_open(struct snd_soc_component *component,
  	}
  
  	runtime->private_data = prtd;
@@ -2168,7 +2176,7 @@ index afa4bb0..9f71e60 100644
  	runtime->dma_bytes = pdata->has_reserved_mem ? pdata->reserved_buf_size :
  						       BUFFER_BYTES_MAX;
  	if (pdata->sid < 0)
-@@ -574,19 +1667,35 @@ static int q6apm_dai_close(struct snd_soc_component *component,
+@@ -574,19 +1675,35 @@ static int q6apm_dai_close(struct snd_soc_component *component,
  {
  	struct snd_pcm_runtime *runtime = substream->runtime;
  	struct q6apm_dai_rtd *prtd = runtime->private_data;
@@ -2209,7 +2217,7 @@ index afa4bb0..9f71e60 100644
  }
  
  static snd_pcm_uframes_t q6apm_dai_pointer(struct snd_soc_component *component,
-@@ -596,6 +1705,21 @@ static snd_pcm_uframes_t q6apm_dai_pointer(struct snd_soc_component *component,
+@@ -596,6 +1713,21 @@ static snd_pcm_uframes_t q6apm_dai_pointer(struct snd_soc_component *component,
  	struct q6apm_dai_rtd *prtd = runtime->private_data;
  	snd_pcm_uframes_t ptr;
  
@@ -2231,7 +2239,7 @@ index afa4bb0..9f71e60 100644
  	if (q6apm_is_graph_in_push_pull_mode(prtd->graph)) {
  		int retries = 10;
  		uint32_t index, fc1, fc2;
-@@ -626,6 +1750,19 @@ static snd_pcm_uframes_t q6apm_dai_pointer(struct snd_soc_component *component,
+@@ -626,6 +1758,20 @@ static snd_pcm_uframes_t q6apm_dai_pointer(struct snd_soc_component *component,
  	return ptr * runtime->period_size;
  }
  
@@ -2243,6 +2251,7 @@ index afa4bb0..9f71e60 100644
 +	if (prtd && prtd->fullio_reference_pcm) {
 +		if (prtd->fullio_reference_prepared)
 +			prtd->fullio_reference_reopen = true;
++		prtd->fullio_reference_started = false;
 +		snd_pcm_set_runtime_buffer(substream, NULL);
 +	}
 +	return 0;
@@ -2251,7 +2260,7 @@ index afa4bb0..9f71e60 100644
  static int q6apm_dai_hw_params(struct snd_soc_component *component,
  			       struct snd_pcm_substream *substream,
  			       struct snd_pcm_hw_params *params)
-@@ -635,6 +1772,8 @@ static int q6apm_dai_hw_params(struct snd_soc_component *component,
+@@ -635,6 +1781,8 @@ static int q6apm_dai_hw_params(struct snd_soc_component *component,
  
  	prtd->pcm_size = params_buffer_bytes(params);
  	prtd->periods = params_periods(params);
@@ -2260,7 +2269,7 @@ index afa4bb0..9f71e60 100644
  
  	switch (params_format(params)) {
  	case SNDRV_PCM_FORMAT_S16_LE:
-@@ -643,6 +1782,15 @@ static int q6apm_dai_hw_params(struct snd_soc_component *component,
+@@ -643,6 +1791,15 @@ static int q6apm_dai_hw_params(struct snd_soc_component *component,
  	case SNDRV_PCM_FORMAT_S24_LE:
  		prtd->bits_per_sample = 24;
  		break;
@@ -2276,7 +2285,7 @@ index afa4bb0..9f71e60 100644
  	default:
  		return -EINVAL;
  	}
-@@ -675,8 +1823,8 @@ static int q6apm_dai_memory_map(struct snd_soc_component *component,
+@@ -675,8 +1832,8 @@ static int q6apm_dai_memory_map(struct snd_soc_component *component,
  		phys = substream->dma_buffer.addr | (pdata->sid << 32);
  
  	ret = q6apm_map_memory_fixed_region(dev, graph_id, phys, buf_max);
@@ -2287,7 +2296,7 @@ index afa4bb0..9f71e60 100644
  
  	if (is_push_pull) {
  		if (pdata->sid < 0)
-@@ -685,13 +1833,56 @@ static int q6apm_dai_memory_map(struct snd_soc_component *component,
+@@ -685,13 +1842,56 @@ static int q6apm_dai_memory_map(struct snd_soc_component *component,
  			phys = (substream->dma_buffer.addr + buf_max) | (pdata->sid << 32);
  
  		ret = q6apm_map_pos_buffer(dev, graph_id, phys, POS_BUFFER_BYTES);
@@ -2349,7 +2358,7 @@ index afa4bb0..9f71e60 100644
  }
  
  static int q6apm_dai_pcm_new(struct snd_soc_component *component, struct snd_soc_pcm_runtime *rtd)
-@@ -699,6 +1890,7 @@ static int q6apm_dai_pcm_new(struct snd_soc_component *component, struct snd_soc
+@@ -699,6 +1899,7 @@ static int q6apm_dai_pcm_new(struct snd_soc_component *component, struct snd_soc
  	struct snd_soc_dai *cpu_dai = snd_soc_rtd_to_cpu(rtd, 0);
  	struct q6apm_dai_data *pdata;
  	struct snd_pcm *pcm = rtd->pcm;
@@ -2357,7 +2366,7 @@ index afa4bb0..9f71e60 100644
  	int size = BUFFER_BYTES_MAX + PAGE_SIZE;
  	int graph_id, ret;
  	bool is_push_pull;
-@@ -708,11 +1900,15 @@ static int q6apm_dai_pcm_new(struct snd_soc_component *component, struct snd_soc
+@@ -708,11 +1909,15 @@ static int q6apm_dai_pcm_new(struct snd_soc_component *component, struct snd_soc
  	if (!pdata)
  		return -EINVAL;
  
@@ -2375,7 +2384,7 @@ index afa4bb0..9f71e60 100644
  	if (pcm->streams[SNDRV_PCM_STREAM_PLAYBACK].substream)
  		substream = pcm->streams[SNDRV_PCM_STREAM_PLAYBACK].substream;
  	else  if (pcm->streams[SNDRV_PCM_STREAM_CAPTURE].substream)
-@@ -723,6 +1919,18 @@ static int q6apm_dai_pcm_new(struct snd_soc_component *component, struct snd_soc
+@@ -723,6 +1928,18 @@ static int q6apm_dai_pcm_new(struct snd_soc_component *component, struct snd_soc
  		is_push_pull = q6apm_is_graph_in_push_pull_mode_from_id(component->dev,
  									graph_id,
  									substream->stream);
@@ -2394,7 +2403,7 @@ index afa4bb0..9f71e60 100644
  		if (is_push_pull)
  			size += POS_BUFFER_BYTES;
  
-@@ -792,6 +2000,12 @@ static void q6apm_dai_pcm_free(struct snd_soc_component *component, struct snd_p
+@@ -792,6 +2009,12 @@ static void q6apm_dai_pcm_free(struct snd_soc_component *component, struct snd_p
  
  	substream = pcm->streams[SNDRV_PCM_STREAM_PLAYBACK].substream;
  	if (substream) {
@@ -2407,7 +2416,7 @@ index afa4bb0..9f71e60 100644
  		q6apm_dai_memory_unmap(component, substream);
  		if (pdata && pdata->use_scm_assign && !pdata->has_reserved_mem)
  			q6apm_dai_scm_unassign(pdata,
-@@ -811,10 +2025,18 @@ static int q6apm_dai_compr_open(struct snd_soc_component *component,
+@@ -811,10 +2034,18 @@ static int q6apm_dai_compr_open(struct snd_soc_component *component,
  	int ret, size;
  	int graph_id;
  
@@ -2426,7 +2435,7 @@ index afa4bb0..9f71e60 100644
  
  	prtd = kzalloc_obj(*prtd);
  	if (prtd == NULL)
-@@ -1188,6 +2410,7 @@ static const struct snd_soc_component_driver q6apm_fe_dai_component = {
+@@ -1188,6 +2419,7 @@ static const struct snd_soc_component_driver q6apm_fe_dai_component = {
  	.pcm_new	= q6apm_dai_pcm_new,
  	.pcm_free	= q6apm_dai_pcm_free,
  	.hw_params	= q6apm_dai_hw_params,
