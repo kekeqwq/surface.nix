@@ -10,7 +10,7 @@ import tempfile
 from pathlib import Path
 
 
-patch = Path(__file__).resolve().parents[1] / 'pkgs/patches/sp11-fullio-native-endpoint-controls.patch'
+patch = Path(__file__).resolve().parents[1] / 'pkgs/patches/fullio/audioreach-fullio.patch'
 added = '\n'.join(line[1:] for line in patch.read_text().splitlines() if line.startswith('+'))
 constants = '\n'.join(re.findall(r'^#define FULLIO_GAINSTEP_.*$', added, re.M))
 validator = added[added.index('static int q6apm_fullio_validate_gainstep('):

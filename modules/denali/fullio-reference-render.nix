@@ -1,5 +1,10 @@
 packages:
-{ config, lib, pkgs, ... }:
+{
+  config,
+  lib,
+  pkgs,
+  ...
+}:
 let
   dtb = "x1e80100-microsoft-denali-oled.dtb";
   renderDtbs =
@@ -8,7 +13,7 @@ let
         nativeBuildInputs = [ pkgs.dtc ];
       }
       ''
-        install -Dm644 ${packages.fullio-muted-kernel}/dtbs/qcom/${dtb} "$out/qcom/${dtb}"
+        install -Dm644 ${packages.fullio-reference-kernel}/dtbs/qcom/${dtb} "$out/qcom/${dtb}"
         # The native protected render route replaces the silent fixture marker.
         fdtget "$out/qcom/${dtb}" /sound microsoft,denali-fullio-muted-test
         fdtput -d "$out/qcom/${dtb}" /sound microsoft,denali-fullio-muted-test
@@ -50,7 +55,6 @@ let
   audioTools = pkgs.runCommand "fullio-audio-session-tools" { } ''
     install -Dm755 ${../../scripts/fullio-graph-holder.sh} "$out/bin/fullio-graph-holder"
     install -Dm755 ${../../scripts/fullio-endpoint-keeper.sh} "$out/bin/fullio-endpoint-keeper"
-    install -Dm755 ${../../scripts/fullio-audio-monitor.py} "$out/bin/fullio-audio-monitor"
     install -Dm755 ${../../scripts/fullio-reference-volume-once.py} "$out/bin/fullio-reference-volume-once"
   '';
   sessionState = "%h/.local/state/fullio-audio-session";
@@ -63,7 +67,7 @@ in
       message = "The FullIO reference render fixture requires an enabled ARM64 Denali configuration.";
     }
   ];
-  boot.kernelPackages = lib.mkForce (pkgs.linuxPackagesFor packages.fullio-muted-kernel);
+  boot.kernelPackages = lib.mkForce (pkgs.linuxPackagesFor packages.fullio-reference-kernel);
   hardware.deviceTree = {
     name = lib.mkForce "qcom/${dtb}";
     filter = lib.mkForce dtb;
@@ -71,14 +75,22 @@ in
   };
   hardware.firmware = [ (lib.hiPrio topology) ];
   # Endpoint volume/mute arming helper (tlv_write + pinned GainStep table).
-  environment.systemPackages = [ packages.fullio-reference-volume audioTools ];
-  # Session services: hold the render graph across playback gaps (kills the
-  # PA-enable pop on every play), re-arm the reviewed endpoint transaction
-  # after any graph reopen, and record acoustic emission/pop verdicts.
+  environment.systemPackages = [
+    packages.fullio-reference-volume
+    audioTools
+  ];
+  # Keep the graph across playback gaps and re-arm the reviewed endpoint
+  # transaction after graph reopen. Do not open the MicArray at login.
   systemd.user.services =
     let
       # The scripts shell out to core tools; user units start with a bare PATH.
-      sessionPath = with pkgs; [ bash coreutils gawk gnugrep python3 ];
+      sessionPath = with pkgs; [
+        bash
+        coreutils
+        gawk
+        gnugrep
+        python3
+      ];
     in
     {
       fullio-graph-holder = {
@@ -97,16 +109,6 @@ in
         path = sessionPath;
         serviceConfig = {
           ExecStart = "${audioTools}/bin/fullio-endpoint-keeper ${sessionState}";
-          Restart = "on-failure";
-          RestartSec = "2";
-        };
-      };
-      fullio-audio-monitor = {
-        description = "Acoustic emission and startup-transient monitor";
-        wantedBy = [ "default.target" ];
-        path = sessionPath;
-        serviceConfig = {
-          ExecStart = "${audioTools}/bin/fullio-audio-monitor ${sessionState}";
           Restart = "on-failure";
           RestartSec = "2";
         };

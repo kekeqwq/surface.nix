@@ -4064,3 +4064,27 @@ log `trigger_time`, then rebuilt and verified at login as recorded below.
   or long idle, as distinct from switches with the graph already held.
   The tests above do not establish that this first-engagement transient
   has been eliminated.
+
+### Repository cleanup after the listening checkpoint
+
+- The earlier fixture commands and patch names in this audit are historical;
+  their source is available at `1cd6151`. The current flake exposes only the
+  normal Denali module and `fullio-reference-render`. The one-shot build and
+  UKI staging scripts only accept the latter. The acoustic monitor no longer
+  starts with the desktop; the holder, endpoint keeper and MicArray routing
+  remain available.
+- On the pinned `next-20261120` source, the 138 patches previously applied
+  after the 19 stock patches produce the same tree as the six subsystem
+  patches in `pkgs/patches/fullio` (comparison of all affected paths,
+  replay tree `cf1dc5068200bbb77c501b0dec35c47faf04dcf6`). Three extra patches
+  for the retired feedback-probe kernel are gone. The stock kernel derivation
+  and the reference module release are unchanged. This is a consolidation of
+  the tested source, not a removal of dormant in-kernel diagnostic branches.
+- Validation: flake no-build check, native Surface host evaluation of the
+  opt-in module, offline UKI DTB gate, UCM, PCM/graph/DMA regressions, and
+  paired speaker/clock and GainStep tests. The cleaned closure was not built
+  or booted; the earlier listening evidence refers to `5vbfg7c4`.
+- Removed the retired stock-audio ESP pair and 119 old private test UKIs
+  (4,912,441,344 bytes outside the ESP). Kept Gen20 and its private recovery
+  archive, the active reference boot entry and its private build state, and
+  the test reports. No reboot or system switch.

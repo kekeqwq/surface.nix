@@ -1,0 +1,5031 @@
+diff --git a/include/uapi/sound/snd_ar_tokens.h b/include/uapi/sound/snd_ar_tokens.h
+index cf8ab6b..19360c5 100644
+--- a/include/uapi/sound/snd_ar_tokens.h
++++ b/include/uapi/sound/snd_ar_tokens.h
+@@ -240,6 +240,8 @@ enum ar_event_types {
+ #define AR_TKN_U32_CONTAINER_STACK_SIZE		102
+ #define AR_TKN_U32_CONTAINER_GRAPH_POS		103
+ #define AR_TKN_U32_CONTAINER_PROC_DOMAIN	104
++#define AR_TKN_U32_CONTAINER_PARENT_ID		105
++#define AR_TKN_U32_CONTAINER_HEAP_ID		106
+ 
+ /* Module Tokens */
+ #define AR_TKN_U32_MODULE_ID			200
+@@ -333,6 +335,9 @@ enum ar_event_types {
+ #define AR_AUDIO_IF_CLK_NORMAL			0
+ #define AR_AUDIO_IF_CLK_INVERTED		1
+ 
++/* Backend DAI implemented inside the owning frontend graph. */
++#define AR_TKN_U32_MODULE_INTEGRATED_BACKEND_ID	263
++
+ #define SND_SOC_AR_TPLG_MODULE_CFG_TYPE 0x01001006
+ struct audioreach_module_priv_data {
+ 	__le32 size;	/* size in bytes of the array, including all elements */
+diff --git a/sound/soc/qcom/qdsp6/audioreach.c b/sound/soc/qcom/qdsp6/audioreach.c
+index aa1f4e2..826ce65 100644
+--- a/sound/soc/qcom/qdsp6/audioreach.c
++++ b/sound/soc/qcom/qdsp6/audioreach.c
+@@ -2,7 +2,11 @@
+ // Copyright (c) 2020, Linaro Limited
+ 
+ #include <linux/kernel.h>
++#include <linux/overflow.h>
++#include <linux/unaligned.h>
++#include <uapi/sound/snd_ar_tokens.h>
+ #include <linux/slab.h>
++#include <linux/sizes.h>
+ #include <linux/soc/qcom/apr.h>
+ #include <sound/soc.h>
+ #include <sound/soc-dai.h>
+@@ -55,14 +59,22 @@ struct apm_container_obj  {
+ 	struct apm_cont_prop_id_domain domain;
+ } __packed;
+ 
++struct apm_container_extended_obj {
++	struct apm_container_obj common;
++
++	struct apm_prop_data parent_data;
++	struct apm_cont_prop_id_parent_container parent;
++
++	struct apm_prop_data heap_data;
++	struct apm_cont_prop_id_headp_id heap;
++} __packed;
++
+ struct apm_container_params  {
+ 	struct apm_module_param_data param_data;
+ 	uint32_t num_containers;
+-	struct apm_container_obj cont_obj[];
++	u8 cont_obj[];
+ } __packed;
+ 
+-#define APM_CONTAINER_PSIZE(p, n) ALIGN(struct_size(p, cont_obj, n), 8)
+-
+ /* Module List config */
+ struct apm_mod_list_obj {
+ 	/* Modules list cfg */
+@@ -109,6 +121,15 @@ struct apm_mod_conn_list_params {
+ 
+ #define APM_MOD_CONN_PSIZE(p, n) ALIGN(struct_size(p, conn_obj, n), 8)
+ 
++#define APM_PARAM_ID_MODULE_CTRL_LINK_CFG 0x08001061
++#define APM_FULLIO_CTRL_CAP SZ_64K
++
++struct apm_fullio_ctrl_links {
++	struct apm_module_param_data param_data;
++	u32 num_ctrl_links;
++	u8 payload[];
++} __packed;
++
+ struct apm_graph_open_params {
+ 	struct apm_cmd_header *cmd_header;
+ 	struct apm_sub_graph_params *sg_data;
+@@ -116,8 +137,383 @@ struct apm_graph_open_params {
+ 	struct apm_module_list_params *mod_list_data;
+ 	struct apm_prop_list_params *mod_prop_data;
+ 	struct apm_mod_conn_list_params *mod_conn_list_data;
++	struct apm_fullio_ctrl_links *fullio_links;
+ } __packed;
+ 
++static const struct {
++	u32 instance;
++	u32 bytes;
++} fullio_stage_contract[AR_FULLIO_STAGE_COUNT] = {
++	[AR_FULLIO_BOOTSTRAP] = { 0x4660, 10464 },
++	[AR_FULLIO_RENDER_EP] = { 0x4660, 64 },
++	[AR_FULLIO_SP_TAG] = { 0x4027, 1888 },
++	[AR_FULLIO_SPVI_TAG] = { 0x4024, 1328 },
++	[AR_FULLIO_VI_EP] = { 0x4024, 64 },
++	[AR_FULLIO_DYNAMIC] = { 0x4027, 128 },
++	[AR_FULLIO_GAIN] = { 0x4a63, 120 },
++	[AR_FULLIO_FILTER] = { 0x4a63, 216 },
++	[AR_FULLIO_MUTE] = { 0x4a63, 120 },
++	[AR_FULLIO_MIXER] = { 0x4a63, 40 },
++};
++
++/* Called by the frontend while it owns the graph; no DSP commands here. */
++int audioreach_fullio_collect_stages(const struct audioreach_graph_info *info,
++				    struct audioreach_fullio_stages *stages)
++{
++	struct audioreach_fullio_stages complete = {};
++	const struct audioreach_module_priv_data *blob;
++	struct audioreach_sub_graph *sg;
++	struct audioreach_container *container;
++	struct audioreach_module *module;
++	int i;
++
++	list_for_each_entry(sg, &info->sg_list, node) {
++		list_for_each_entry(container, &sg->container_list, node) {
++			list_for_each_entry(module, &container->modules_list, node) {
++				for (i = 0; i < AR_FULLIO_STAGE_COUNT; i++) {
++					blob = module->fullio_stages[i];
++					if (!blob)
++						continue;
++					if (complete.stage[i])
++						return -EEXIST;
++					if (module->instance_id != fullio_stage_contract[i].instance ||
++					    le32_to_cpu(blob->size) != fullio_stage_contract[i].bytes)
++						return -EINVAL;
++					complete.stage[i] = blob;
++				}
++			}
++		}
++	}
++
++	for (i = 0; i < AR_FULLIO_STAGE_COUNT; i++)
++		if (!complete.stage[i])
++			return -ENOENT;
++	*stages = complete;
++	return 0;
++}
++EXPORT_SYMBOL_GPL(audioreach_fullio_collect_stages);
++
++int audioreach_fullio_verify_tag(struct q6apm_graph *graph,
++				const struct audioreach_fullio_stages *stages,
++				enum ar_fullio_stage_id stage)
++{
++	const struct audioreach_module_priv_data *tag;
++	const u8 *expected;
++	u32 instance, param, bytes;
++	u8 actual[68];
++	int ret;
++
++	switch (stage) {
++	case AR_FULLIO_SP_TAG:
++		instance = 0x4027;
++		param = 0x080011e8;
++		bytes = 68;
++		break;
++	case AR_FULLIO_SPVI_TAG:
++		instance = 0x4024;
++		param = 0x080011f6;
++		bytes = 44;
++		break;
++	default:
++		return -EINVAL;
++	}
++
++	tag = stages->stage[stage];
++	if (!tag || le32_to_cpu(tag->size) < APM_MODULE_PARAM_DATA_SIZE + bytes ||
++	    get_unaligned_le32(tag->data) != instance ||
++	    get_unaligned_le32(tag->data + 1) != param ||
++	    get_unaligned_le32(tag->data + 2) != bytes ||
++	    get_unaligned_le32(tag->data + 3))
++		return -EINVAL;
++
++	expected = (const u8 *)tag->data + APM_MODULE_PARAM_DATA_SIZE;
++	ret = q6apm_fullio_get_cfg(graph, instance, param, actual, bytes);
++	if (ret)
++		return ret;
++	return memcmp(expected, actual, bytes) ? -EILSEQ : 0;
++}
++EXPORT_SYMBOL_GPL(audioreach_fullio_verify_tag);
++
++bool audioreach_fullio_graph(const struct audioreach_graph_info *info)
++{
++	struct audioreach_sub_graph *sg;
++	struct audioreach_container *container;
++	struct audioreach_module *module;
++
++	list_for_each_entry(sg, &info->sg_list, node) {
++		list_for_each_entry(container, &sg->container_list, node) {
++			list_for_each_entry(module, &container->modules_list, node) {
++				if (module->integrated_backend_id || module->fullio_ctrl_links)
++					return true;
++				for (int i = 0; i < AR_FULLIO_STAGE_COUNT; i++)
++					if (module->fullio_stages[i])
++						return true;
++			}
++		}
++	}
++	return false;
++}
++EXPORT_SYMBOL_GPL(audioreach_fullio_graph);
++
++static int audioreach_fullio_dynamic_frame(const struct audioreach_module_priv_data *blob,
++					   unsigned int wanted, const u8 **frame, size_t *bytes)
++{
++	static const struct { u32 instance, param, size; } expected[] = {
++		{ 0x4027, 0x080011e9, 8 },
++		{ 0x4024, 0x080011f5, 24 },
++		{ 0x4024, 0x080011f4, 24 },
++		{ 0x4024, 0x080011ff, 8 },
++	};
++	const u8 *cursor = (const u8 *)blob->data;
++	size_t left = le32_to_cpu(blob->size), span;
++	unsigned int i;
++
++	if (wanted >= ARRAY_SIZE(expected))
++		return -EINVAL;
++	for (i = 0; i < ARRAY_SIZE(expected); i++) {
++		span = ALIGN(APM_MODULE_PARAM_DATA_SIZE + expected[i].size, 8);
++		if (left < span || get_unaligned_le32(cursor) != expected[i].instance ||
++		    get_unaligned_le32(cursor + 4) != expected[i].param ||
++		    get_unaligned_le32(cursor + 8) != expected[i].size ||
++		    get_unaligned_le32(cursor + 12))
++			return -EINVAL;
++		if (i == wanted) {
++			*frame = cursor;
++			*bytes = span;
++		}
++		left -= span;
++		cursor += span;
++	}
++	return left ? -EINVAL : 0;
++}
++
++static int audioreach_fullio_bootstrap(struct q6apm_graph *graph,
++				      struct q6apm_fullio_oob_region *region,
++				      void *buffer,
++				      const struct audioreach_module_priv_data *blob)
++{
++	enum { input_bytes = 10464, query_offset = 8352, query_span = 48 };
++	const u8 *raw = (const u8 *)blob->data;
++	const u8 *query;
++	u8 *writes __free(kfree) = NULL;
++	if (le32_to_cpu(blob->size) != input_bytes)
++		return -EINVAL;
++	query = raw + query_offset;
++
++	/* SPR_SESSION_TIME is GET-only, not a calibration write. */
++	if (get_unaligned_le32(query) != 0x412b ||
++	    get_unaligned_le32(query + 4) != 0x0800113d ||
++	    get_unaligned_le32(query + 8) != 28 ||
++	    memchr_inv(query + 12, 0, query_span - 12))
++		return -EINVAL;
++
++	writes = kmalloc(input_bytes - query_span, GFP_KERNEL);
++	if (!writes)
++		return -ENOMEM;
++	memcpy(writes, raw, query_offset);
++	memcpy(writes + query_offset, query + query_span,
++	       input_bytes - query_offset - query_span);
++
++	return q6apm_fullio_set_cfg_oob(graph, region, buffer, writes,
++				      input_bytes - query_span, false);
++}
++
++static bool audioreach_fullio_compact_stereo_mute(const u8 *data)
++{
++	return get_unaligned_le32(data) == 1 && /* one entry */
++	       get_unaligned_le32(data + 4) == (BIT(1) | BIT(2)) && /* FL + FR */
++	       get_unaligned_le32(data + 8) == 0 && /* no high mask bits */
++	       get_unaligned_le32(data + 12) == 1; /* muted */
++}
++
++/* The pinned endpoint ABI has eight slots, but only FL and FR are
++ * selected. Unlike the reference stage, this packet has no unmute
++ * variant, and it never writes a gain parameter.
++ */
++static const __le32 fullio_stereo_mute[30] = {
++	[0] = cpu_to_le32(0x4a63),
++	[1] = cpu_to_le32(0x08001039),
++	[2] = cpu_to_le32(104),
++	[4] = cpu_to_le32(8),
++	[5] = cpu_to_le32(0x2),
++	[7] = cpu_to_le32(1),
++	[8] = cpu_to_le32(0x4),
++	[10] = cpu_to_le32(1),
++};
++
++int audioreach_fullio_verify_mute(struct q6apm_graph *graph)
++{
++	u8 actual[sizeof(fullio_stereo_mute) - APM_MODULE_PARAM_DATA_SIZE];
++	int ret;
++
++	ret = q6apm_fullio_get_cfg(graph, 0x4a63, 0x08001039, actual, sizeof(actual));
++	if (ret < 0)
++		return dev_err_probe(graph->dev, ret, "FullIO endpoint stereo mute not readable\n");
++	if (ret == 16) {
++		if (!audioreach_fullio_compact_stereo_mute(actual)) {
++			dev_warn_ratelimited(graph->dev,
++				"FullIO compact mute mismatch: count=%u mask=%#x/%#x value=%u\n",
++				get_unaligned_le32(actual), get_unaligned_le32(actual + 4),
++				get_unaligned_le32(actual + 8), get_unaligned_le32(actual + 12));
++			return -EILSEQ;
++		}
++	} else if (ret || memcmp((const u8 *)fullio_stereo_mute + APM_MODULE_PARAM_DATA_SIZE,
++				 actual, sizeof(actual))) {
++		return dev_err_probe(graph->dev, -EILSEQ, "FullIO endpoint stereo mute mismatch\n");
++	}
++	dev_info(graph->dev, "FullIO endpoint stereo mute readback verified\n");
++	return 0;
++}
++EXPORT_SYMBOL_GPL(audioreach_fullio_verify_mute);
++
++/* Format only: callers must acquire and validate the protected graph. */
++static int audioreach_fullio_final_gain_frame(__le32 frame[30],
++							    u32 left, u32 right, u32 cap)
++{
++	if (cap > 0x10000000 || left > cap || right > cap)
++		return -ERANGE;
++
++	memset(frame, 0, sizeof(__le32) * 30);
++	frame[0] = cpu_to_le32(0x4a63);
++	frame[1] = cpu_to_le32(0x08001038);
++	frame[2] = cpu_to_le32(104);
++	frame[4] = cpu_to_le32(8);
++	frame[5] = cpu_to_le32(0x2);
++	frame[7] = cpu_to_le32(left);
++	frame[8] = cpu_to_le32(0x4);
++	frame[10] = cpu_to_le32(right);
++	return 0;
++}
++
++static struct gpr_pkt *audioreach_alloc_fullio_endpoint_pkt(const __le32 frame[30])
++{
++	const size_t bytes = sizeof(fullio_stereo_mute);
++	struct gpr_pkt *pkt = audioreach_alloc_apm_cmd_pkt(bytes, APM_CMD_SET_CFG, 0);
++
++	if (!IS_ERR(pkt))
++		memcpy((void *)pkt + GPR_HDR_SIZE + APM_CMD_HDR_SIZE, frame, bytes);
++	return pkt;
++}
++
++struct gpr_pkt *audioreach_alloc_fullio_final_volume(u32 left, u32 right)
++{
++	__le32 frame[ARRAY_SIZE(fullio_stereo_mute)];
++	int ret;
++
++	ret = audioreach_fullio_final_gain_frame(frame, left, right, 0x10000000);
++	if (ret)
++		return ERR_PTR(ret);
++	return audioreach_alloc_fullio_endpoint_pkt(frame);
++}
++
++struct gpr_pkt *audioreach_alloc_fullio_final_mute(bool mute)
++{
++	__le32 frame[ARRAY_SIZE(fullio_stereo_mute)];
++
++	memcpy(frame, fullio_stereo_mute, sizeof(frame));
++	frame[7] = frame[10] = cpu_to_le32(mute);
++	return audioreach_alloc_fullio_endpoint_pkt(frame);
++}
++
++static int audioreach_fullio_acknowledge_mute(struct q6apm_graph *graph,
++					     const struct audioreach_fullio_stages *stages)
++{
++	const struct audioreach_module_priv_data *stage = stages->stage[AR_FULLIO_MUTE];
++	int ret;
++
++	if (!stage || le32_to_cpu(stage->size) != sizeof(fullio_stereo_mute) ||
++	    get_unaligned_le32(stage->data) != 0x4a63 ||
++	    get_unaligned_le32(stage->data + 1) != 0x08001039)
++		return -EINVAL;
++	ret = q6apm_fullio_set_cfg_inband(graph, fullio_stereo_mute, sizeof(fullio_stereo_mute));
++	if (ret)
++		return dev_err_probe(graph->dev, ret, "FullIO endpoint stereo mute rejected\n");
++	dev_info(graph->dev, "FullIO endpoint stereo mute acknowledged\n");
++
++	return audioreach_fullio_verify_mute(graph);
++}
++
++/* Bootstrap includes reference VOL_CTRL defaults; no final-volume stage or
++ * GRAPH_START here. Validate hardware PA-off and conservative caps first.
++ */
++int audioreach_fullio_calibrate(struct q6apm_graph *graph,
++			       const struct audioreach_fullio_stages *stages,
++			       struct q6apm_fullio_oob_region *region, void *buffer,
++			       int (*assert_pa_off)(void *ctx), void *ctx)
++{
++	enum fullio_op { OOB, SINGLE, READBACK };
++	static const struct {
++		enum fullio_op op;
++		enum ar_fullio_stage_id stage;
++		unsigned int index;
++	} steps[] = {
++		{ OOB, AR_FULLIO_BOOTSTRAP },
++		{ SINGLE, AR_FULLIO_DYNAMIC, 0 },
++		{ OOB, AR_FULLIO_SP_TAG },
++		{ READBACK, AR_FULLIO_SP_TAG },
++		{ READBACK, AR_FULLIO_SPVI_TAG },
++		{ SINGLE, AR_FULLIO_DYNAMIC, 1 },
++		{ SINGLE, AR_FULLIO_DYNAMIC, 2 },
++		{ SINGLE, AR_FULLIO_DYNAMIC, 3 },
++		{ OOB, AR_FULLIO_SPVI_TAG },
++		{ OOB, AR_FULLIO_RENDER_EP },
++		{ OOB, AR_FULLIO_VI_EP },
++	};
++	const struct audioreach_module_priv_data *blob;
++	const u8 *dynamic[4];
++	size_t dynamic_bytes[4];
++	int i, ret;
++
++	if (!assert_pa_off || !graph->ar_graph || READ_ONCE(graph->ar_graph->start_count) ||
++	    !audioreach_fullio_graph(graph->info))
++		return -EINVAL;
++	for (i = 0; i < ARRAY_SIZE(steps); i++)
++		if (!stages->stage[steps[i].stage])
++			return -EINVAL;
++	for (i = 0; i < ARRAY_SIZE(dynamic); i++) {
++		ret = audioreach_fullio_dynamic_frame(stages->stage[AR_FULLIO_DYNAMIC],
++						      i, &dynamic[i], &dynamic_bytes[i]);
++		if (ret)
++			return ret;
++	}
++
++	for (i = 0; i < ARRAY_SIZE(steps); i++) {
++		if (!q6apm_fullio_transport_enabled(graph->apm))
++			return -EAGAIN;
++		ret = assert_pa_off(ctx);
++		if (ret)
++			return ret;
++		blob = stages->stage[steps[i].stage];
++		switch (steps[i].op) {
++		case OOB:
++			if (steps[i].stage == AR_FULLIO_BOOTSTRAP)
++				ret = audioreach_fullio_bootstrap(graph, region, buffer, blob);
++			else
++				ret = q6apm_fullio_set_cfg_oob(graph, region, buffer, blob->data,
++							     le32_to_cpu(blob->size), true);
++			break;
++		case SINGLE:
++			ret = q6apm_fullio_set_cfg_inband(graph, dynamic[steps[i].index],
++							dynamic_bytes[steps[i].index]);
++			break;
++		case READBACK:
++			ret = audioreach_fullio_verify_tag(graph, stages, steps[i].stage);
++			break;
++		}
++		if (ret)
++			return dev_err_probe(graph->dev, ret,
++					     "FullIO calibration step %d (stage %d, op %d) failed\n",
++					     i + 1, steps[i].stage, steps[i].op);
++	}
++	ret = assert_pa_off(ctx);
++	if (!ret)
++		ret = audioreach_fullio_acknowledge_mute(graph, stages);
++	if (ret)
++		return ret;
++	return assert_pa_off(ctx);
++}
++EXPORT_SYMBOL_GPL(audioreach_fullio_calibrate);
++
+ struct apm_pcm_module_media_fmt_cmd {
+ 	struct apm_module_param_data param_data;
+ 	struct param_id_pcm_output_format_cfg header;
+@@ -322,13 +718,21 @@ void audioreach_set_default_channel_mapping(u8 *ch_map, int num_channels)
+ }
+ EXPORT_SYMBOL_GPL(audioreach_set_default_channel_mapping);
+ 
+-static void apm_populate_container_config(struct apm_container_obj *cfg,
++static size_t apm_container_obj_size(const struct audioreach_container *cont)
++{
++	return cont->has_extended_properties ?
++		sizeof(struct apm_container_extended_obj) :
++		sizeof(struct apm_container_obj);
++}
++
++static void apm_populate_container_config(void *data,
+ 					  const struct audioreach_container *cont)
+ {
++	struct apm_container_obj *cfg = data;
+ 
+ 	/* Container Config */
+ 	cfg->container_cfg.container_id = cont->container_id;
+-	cfg->container_cfg.num_prop = 4;
++	cfg->container_cfg.num_prop = cont->has_extended_properties ? 6 : 4;
+ 
+ 	/* Capability list */
+ 	cfg->cap_data.prop_id = APM_CONTAINER_PROP_ID_CAPABILITY_LIST;
+@@ -350,6 +754,21 @@ static void apm_populate_container_config(struct apm_container_obj *cfg,
+ 	cfg->domain_data.prop_id = APM_CONTAINER_PROP_ID_PROC_DOMAIN;
+ 	cfg->domain_data.prop_size = sizeof(struct apm_cont_prop_id_domain);
+ 	cfg->domain.proc_domain = cont->proc_domain;
++
++	if (cont->has_extended_properties) {
++		struct apm_container_extended_obj *ext = data;
++
++		ext->parent_data.prop_id =
++			APM_CONTAINER_PROP_ID_PARENT_CONTAINER_ID;
++		ext->parent_data.prop_size =
++			sizeof(struct apm_cont_prop_id_parent_container);
++		ext->parent.parent_container_id = cont->parent_container_id;
++
++		ext->heap_data.prop_id = APM_CONTAINER_PROP_ID_HEAP_ID;
++		ext->heap_data.prop_size =
++			sizeof(struct apm_cont_prop_id_headp_id);
++		ext->heap.heap_id = cont->heap_id;
++	}
+ }
+ 
+ static void apm_populate_sub_graph_config(struct apm_sub_graph_data *cfg,
+@@ -404,31 +823,62 @@ static void apm_populate_module_list_obj(struct apm_mod_list_obj *obj,
+ 	}
+ }
+ 
++/* A topology edge and its DPCM mixer route can describe the same DSP edge. */
++static bool audioreach_needs_mixer_edge(const struct audioreach_graph_info *info)
++{
++	struct audioreach_sub_graph *sg;
++	struct audioreach_container *container;
++	struct audioreach_module *module;
++	int port;
++
++	if (!info->src_mod_inst_id || !info->dst_mod_inst_id)
++		return false;
++	if (!audioreach_fullio_graph(info))
++		return true;
++
++	list_for_each_entry(sg, &info->sg_list, node) {
++		list_for_each_entry(container, &sg->container_list, node) {
++			list_for_each_entry(module, &container->modules_list, node) {
++				if (module->instance_id != info->src_mod_inst_id)
++					continue;
++				for (port = 0; port < module->max_op_port; port++) {
++					if (module->src_mod_op_port_id[port] == info->src_mod_op_port_id &&
++					    module->dst_mod_inst_id[port] == info->dst_mod_inst_id &&
++					    module->dst_mod_ip_port_id[port] == info->dst_mod_ip_port_id)
++						return false;
++				}
++			}
++		}
++	}
++	return true;
++}
++
+ static void audioreach_populate_graph(struct q6apm *apm,
+ 				      const struct audioreach_graph_info *info,
+ 				      struct apm_graph_open_params *open,
+ 				      const struct list_head *sg_list,
+-				      int num_sub_graphs)
++				      bool needs_mixer_edge)
+ {
+ 	struct apm_mod_conn_list_params *mc_data = open->mod_conn_list_data;
+ 	struct apm_module_list_params *ml_data = open->mod_list_data;
+ 	struct apm_prop_list_params *mp_data = open->mod_prop_data;
+ 	struct apm_container_params *c_data = open->cont_data;
+ 	struct apm_sub_graph_params *sg_data = open->sg_data;
+-	int ncontainer = 0, nmodule = 0, nconn = 0;
++	int nmodule = 0, nconn = 0;
+ 	struct apm_mod_prop_obj *module_prop_obj;
+ 	struct audioreach_container *container;
+ 	struct apm_module_conn_obj *conn_obj;
+ 	struct audioreach_module *module;
+ 	struct audioreach_sub_graph *sg;
+-	struct apm_container_obj *cobj;
++	u8 *next_container = c_data->cont_obj;
+ 	struct apm_mod_list_obj *mlobj;
++	u8 *links = open->fullio_links ? open->fullio_links->payload : NULL;
+ 	int i = 0;
+ 
+ 	mlobj = &ml_data->mod_list_obj[0];
+ 
+ 
+-	if (info->dst_mod_inst_id && info->src_mod_inst_id) {
++	if (needs_mixer_edge) {
+ 		conn_obj = &mc_data->conn_obj[nconn];
+ 		conn_obj->src_mod_inst_id = info->src_mod_inst_id;
+ 		conn_obj->src_mod_op_port_id = info->src_mod_op_port_id;
+@@ -443,9 +893,8 @@ static void audioreach_populate_graph(struct q6apm *apm,
+ 		apm_populate_sub_graph_config(sg_cfg, sg);
+ 
+ 		list_for_each_entry(container, &sg->container_list, node) {
+-			cobj = &c_data->cont_obj[ncontainer];
+-
+-			apm_populate_container_config(cobj, container);
++			apm_populate_container_config(next_container, container);
++			next_container += apm_container_obj_size(container);
+ 			apm_populate_module_list_obj(mlobj, container, sg->sub_graph_id);
+ 
+ 			list_for_each_entry(module, &container->modules_list, node) {
+@@ -454,6 +903,15 @@ static void audioreach_populate_graph(struct q6apm *apm,
+ 				module_prop_obj = &mp_data->mod_prop_obj[nmodule++];
+ 				apm_populate_module_prop_obj(module_prop_obj, module);
+ 
++				if (links && module->fullio_ctrl_links) {
++					const struct audioreach_module_priv_data *blob =
++						module->fullio_ctrl_links;
++					size_t bytes = le32_to_cpu(blob->size) - sizeof(u32);
++
++					memcpy(links, blob->data + 1, bytes);
++					links += bytes;
++				}
++
+ 				if (!module->max_op_port)
+ 					continue;
+ 
+@@ -474,7 +932,6 @@ static void audioreach_populate_graph(struct q6apm *apm,
+ 			mlobj = (void *) mlobj + APM_MOD_LIST_OBJ_PSIZE(mlobj,
+ 									container->num_modules);
+ 
+-			ncontainer++;
+ 		}
+ 	}
+ }
+@@ -494,11 +951,14 @@ void *audioreach_alloc_graph_pkt(struct q6apm *apm,
+ 	struct audioreach_sub_graph *sgs;
+ 	struct apm_mod_list_obj *mlobj;
+ 	const struct list_head *sg_list;
++	u32 num_ctrl_links = 0;
++	size_t ctrl_bytes = 0, ctrl_sz = 0, cont_bytes = sizeof(*cont_params);
+ 	int num_connections = 0;
+ 	int num_containers = 0;
+ 	int num_sub_graphs = 0;
+ 	int num_modules = 0;
+ 	int num_modules_list;
++	bool needs_mixer_edge = audioreach_needs_mixer_edge(info);
+ 	struct gpr_pkt *pkt;
+ 	void *p;
+ 
+@@ -506,12 +966,15 @@ void *audioreach_alloc_graph_pkt(struct q6apm *apm,
+ 	ml_sz = 0;
+ 
+ 	/* add FE-BE connections */
+-	if (info->dst_mod_inst_id && info->src_mod_inst_id)
++	if (needs_mixer_edge)
+ 		num_connections++;
+ 
+ 	list_for_each_entry(sgs, sg_list, node) {
+ 		num_sub_graphs++;
+ 		list_for_each_entry(container, &sgs->container_list, node) {
++			if (check_add_overflow(cont_bytes, apm_container_obj_size(container),
++					       &cont_bytes) || cont_bytes > INT_MAX - 7)
++				return ERR_PTR(-EOVERFLOW);
+ 			num_containers++;
+ 			num_modules += container->num_modules;
+ 			ml_sz = ml_sz + sizeof(struct apm_module_list_params) +
+@@ -519,20 +982,43 @@ void *audioreach_alloc_graph_pkt(struct q6apm *apm,
+ 
+ 			list_for_each_entry(module, &container->modules_list, node) {
+ 				num_connections += module->num_connections;
++				if (module->fullio_ctrl_links) {
++					const struct audioreach_module_priv_data *blob =
++						module->fullio_ctrl_links;
++					size_t bytes = le32_to_cpu(blob->size);
++					u32 count;
++
++					if (bytes <= sizeof(u32) || bytes > APM_FULLIO_CTRL_CAP)
++						return ERR_PTR(-EINVAL);
++					count = get_unaligned_le32(blob->data);
++					if (!count || check_add_overflow(num_ctrl_links, count,
++									  &num_ctrl_links) ||
++					    check_add_overflow(ctrl_bytes, bytes - sizeof(u32),
++							       &ctrl_bytes) || ctrl_bytes > APM_FULLIO_CTRL_CAP)
++						return ERR_PTR(-EINVAL);
++				}
+ 			}
+ 		}
+ 	}
+ 
+ 	num_modules_list = num_containers;
+ 	sg_sz = APM_SUB_GRAPH_PSIZE(sg_params, num_sub_graphs);
+-	cont_sz = APM_CONTAINER_PSIZE(cont_params, num_containers);
++	cont_sz = ALIGN(cont_bytes, 8);
+ 
+ 	ml_sz = ALIGN(ml_sz, 8);
+ 
+ 	mp_sz = APM_MOD_PROP_PSIZE(mprop, num_modules);
+ 	mc_sz =	APM_MOD_CONN_PSIZE(mcon, num_connections);
+ 
+-	payload_size = sg_sz + cont_sz + ml_sz + mp_sz + mc_sz;
++	if (num_ctrl_links)
++		ctrl_sz = ALIGN(sizeof(struct apm_fullio_ctrl_links) + ctrl_bytes, 8);
++	if (check_add_overflow(sg_sz, cont_sz, &payload_size) ||
++	    check_add_overflow(payload_size, ml_sz, &payload_size) ||
++	    check_add_overflow(payload_size, mp_sz, &payload_size) ||
++	    check_add_overflow(payload_size, mc_sz, &payload_size))
++		return ERR_PTR(-EOVERFLOW);
++	if (check_add_overflow(payload_size, (int)ctrl_sz, &payload_size))
++		return ERR_PTR(-EOVERFLOW);
+ 	pkt = audioreach_alloc_apm_cmd_pkt(payload_size, APM_CMD_GRAPH_OPEN, 0);
+ 	if (IS_ERR(pkt))
+ 		return pkt;
+@@ -584,7 +1070,17 @@ void *audioreach_alloc_graph_pkt(struct q6apm *apm,
+ 	params.mod_conn_list_data->num_connections = num_connections;
+ 	p += mc_sz;
+ 
+-	audioreach_populate_graph(apm, info, &params, sg_list, num_sub_graphs);
++	params.fullio_links = NULL;
++	if (num_ctrl_links) {
++		params.fullio_links = p;
++		param_data = &params.fullio_links->param_data;
++		param_data->module_instance_id = APM_MODULE_INSTANCE_ID;
++		param_data->param_id = APM_PARAM_ID_MODULE_CTRL_LINK_CFG;
++		param_data->param_size = sizeof(u32) + ctrl_bytes;
++		params.fullio_links->num_ctrl_links = num_ctrl_links;
++	}
++
++	audioreach_populate_graph(apm, info, &params, sg_list, needs_mixer_edge);
+ 
+ 	return pkt;
+ }
+@@ -889,6 +1385,9 @@ static int audioreach_mfc_set_media_format(struct q6apm_graph *graph,
+ 		media_format->channel_mapping[j++] = cfg->channel_map[i];
+ 	}
+ 
++	if (audioreach_fullio_graph(graph->info))
++		return q6apm_fullio_set_cfg_inband(graph, param_data, payload_size);
++
+ 	return q6apm_send_cmd_sync(graph->apm, pkt, 0);
+ }
+ 
+@@ -1229,9 +1728,51 @@ static int audioreach_pcm_set_media_format(struct q6apm_graph *graph,
+ 		media_cfg->channel_mapping[j++] = mcfg->channel_map[i];
+ 	}
+ 
++	if (audioreach_fullio_graph(graph->info))
++		return q6apm_fullio_set_cfg_inband(graph, param_data, payload_size);
++
+ 	return q6apm_send_cmd_sync(graph->apm, pkt, 0);
+ }
+ 
++/* Only these two modules receive the playback-format prelude on FullIO. */
++int audioreach_fullio_media_prelude(struct q6apm_graph *graph,
++				  const struct audioreach_module_config *cfg)
++{
++	const struct audioreach_module *pcm = NULL, *mfc = NULL;
++	struct audioreach_sub_graph *sg;
++	struct audioreach_container *container;
++	struct audioreach_module *module;
++	int ret;
++
++	if (!audioreach_fullio_graph(graph->info) ||
++	    cfg->direction != SNDRV_PCM_STREAM_PLAYBACK || cfg->sample_rate != 48000 ||
++	    cfg->bit_width != 16 || cfg->num_channels != 2)
++		return -EINVAL;
++
++	list_for_each_entry(sg, &graph->info->sg_list, node) {
++		list_for_each_entry(container, &sg->container_list, node) {
++			list_for_each_entry(module, &container->modules_list, node) {
++				if (module->instance_id == 0x465f)
++					pcm = module;
++				else if (module->instance_id == 0x466a)
++					mfc = module;
++			}
++		}
++	}
++	if (!pcm || pcm->module_id != MODULE_ID_PCM_CNV ||
++	    !mfc || mfc->module_id != MODULE_ID_MFC)
++		return -ENODEV;
++
++	ret = audioreach_pcm_set_media_format(graph, pcm, cfg);
++	if (ret)
++		return dev_err_probe(graph->dev, ret, "FullIO PCM_CNV media format rejected\n");
++	ret = audioreach_mfc_set_media_format(graph, mfc, cfg);
++	if (ret)
++		return dev_err_probe(graph->dev, ret, "FullIO MFC media format rejected\n");
++	return 0;
++}
++EXPORT_SYMBOL_GPL(audioreach_fullio_media_prelude);
++
+ int audioreach_shmem_register_event(struct q6apm_graph *graph, int bytes, int num_levels)
+ {
+ 	struct apm_module_register_events *event;
+@@ -1568,20 +2109,25 @@ void audioreach_graph_free_buf(struct q6apm_graph *graph)
+ }
+ EXPORT_SYMBOL_GPL(audioreach_graph_free_buf);
+ 
+-int audioreach_setup_push_pull(struct q6apm_graph *graph, phys_addr_t bphys,
+-				phys_addr_t pphys, uint32_t mem_map_handle,
+-				uint32_t pos_buf_mem_map_handle, uint32_t size)
++struct gpr_pkt *audioreach_alloc_push_pull_pkt(struct q6apm_graph *graph, phys_addr_t bphys,
++					       phys_addr_t pphys, u32 mem_map_handle,
++					       u32 pos_buf_mem_map_handle, u32 size,
++					       bool direct)
+ {
+ 	struct param_id_sh_mem_pull_push_mode_cfg *cfg;
+ 	struct apm_module_param_data *param_data;
+ 	int payload_size;
+-	struct gpr_pkt *pkt __free(kfree) = NULL;
++	struct gpr_pkt *pkt;
+ 	void *p;
+ 
+ 	payload_size = sizeof(*cfg) + APM_MODULE_PARAM_DATA_SIZE;
+-	pkt = audioreach_alloc_apm_cmd_pkt(payload_size, APM_CMD_SET_CFG, 0);
++	if (direct)
++		pkt = audioreach_alloc_cmd_pkt(ALIGN(payload_size, 8), APM_CMD_SET_CFG, 0,
++					       graph->port->id, graph->shm_iid);
++	else
++		pkt = audioreach_alloc_apm_cmd_pkt(payload_size, APM_CMD_SET_CFG, 0);
+ 	if (IS_ERR(pkt))
+-		return PTR_ERR(pkt);
++		return pkt;
+ 
+ 	p = (void *)pkt + GPR_HDR_SIZE + APM_CMD_HDR_SIZE;
+ 
+@@ -1589,7 +2135,7 @@ int audioreach_setup_push_pull(struct q6apm_graph *graph, phys_addr_t bphys,
+ 	param_data->module_instance_id = graph->shm_iid;
+ 	param_data->error_code = 0;
+ 	param_data->param_id = PARAM_ID_SH_MEM_PULL_PUSH_MODE_CFG;
+-	param_data->param_size = payload_size - APM_MODULE_PARAM_DATA_SIZE;
++	param_data->param_size = sizeof(*cfg);
+ 
+ 	p = p + APM_MODULE_PARAM_DATA_SIZE;
+ 	cfg = p;
+@@ -1602,6 +2148,19 @@ int audioreach_setup_push_pull(struct q6apm_graph *graph, phys_addr_t bphys,
+ 	cfg->shared_pos_buf_addr_msw = upper_32_bits(pphys);
+ 	cfg->pos_buf_mem_map_handle = pos_buf_mem_map_handle;
+ 
++	return pkt;
++}
++
++int audioreach_setup_push_pull(struct q6apm_graph *graph, phys_addr_t bphys,
++				phys_addr_t pphys, uint32_t mem_map_handle,
++				uint32_t pos_buf_mem_map_handle, uint32_t size)
++{
++	struct gpr_pkt *pkt __free(kfree) =
++		audioreach_alloc_push_pull_pkt(graph, bphys, pphys, mem_map_handle,
++					      pos_buf_mem_map_handle, size, false);
++
++	if (IS_ERR(pkt))
++		return PTR_ERR(pkt);
+ 	return q6apm_send_cmd_sync(graph->apm, pkt, 0);
+ }
+ EXPORT_SYMBOL_GPL(audioreach_setup_push_pull);
+diff --git a/sound/soc/qcom/qdsp6/audioreach.h b/sound/soc/qcom/qdsp6/audioreach.h
+index 0a50b93..4212962 100644
+--- a/sound/soc/qcom/qdsp6/audioreach.h
++++ b/sound/soc/qcom/qdsp6/audioreach.h
+@@ -911,6 +911,9 @@ struct audioreach_container {
+ 	uint32_t graph_pos;
+ 	uint32_t stack_size;
+ 	uint32_t proc_domain;
++	u32 parent_container_id;
++	u32 heap_id;
++	bool has_extended_properties;
+ 	struct list_head node;
+ 
+ 	uint32_t num_modules;
+@@ -920,6 +923,26 @@ struct audioreach_container {
+ 
+ #define AR_MAX_MOD_LINKS	8
+ 
++#define AR_FULLIO_STAGE_BASE 0x53503101
++
++enum ar_fullio_stage_id {
++	AR_FULLIO_BOOTSTRAP,
++	AR_FULLIO_RENDER_EP,
++	AR_FULLIO_SP_TAG,
++	AR_FULLIO_SPVI_TAG,
++	AR_FULLIO_VI_EP,
++	AR_FULLIO_DYNAMIC,
++	AR_FULLIO_GAIN,
++	AR_FULLIO_FILTER,
++	AR_FULLIO_MUTE,
++	AR_FULLIO_MIXER,
++	AR_FULLIO_STAGE_COUNT,
++};
++
++struct audioreach_fullio_stages {
++	const struct audioreach_module_priv_data *stage[AR_FULLIO_STAGE_COUNT];
++};
++
+ struct audioreach_module {
+ 	uint32_t module_id;
+ 	uint32_t instance_id;
+@@ -980,6 +1003,9 @@ struct audioreach_module {
+ 	struct audioreach_container *container;
+ 	struct snd_soc_dapm_widget *widget;
+ 	struct audioreach_module_priv_data *data;
++	u32 integrated_backend_id;
++	struct audioreach_module_priv_data *fullio_ctrl_links;
++	struct audioreach_module_priv_data *fullio_stages[AR_FULLIO_STAGE_COUNT];
+ };
+ 
+ struct audioreach_module_config {
+@@ -1020,6 +1046,20 @@ void *audioreach_alloc_pkt(int payload_size, uint32_t opcode,
+ 			   uint32_t dest_port);
+ void *audioreach_alloc_graph_pkt(struct q6apm *apm,
+ 				 const struct audioreach_graph_info *info);
++int audioreach_fullio_collect_stages(const struct audioreach_graph_info *info,
++				    struct audioreach_fullio_stages *stages);
++int audioreach_fullio_verify_tag(struct q6apm_graph *graph,
++				const struct audioreach_fullio_stages *stages,
++				enum ar_fullio_stage_id stage);
++bool audioreach_fullio_graph(const struct audioreach_graph_info *info);
++int audioreach_fullio_media_prelude(struct q6apm_graph *graph,
++				  const struct audioreach_module_config *cfg);
++struct q6apm_fullio_oob_region;
++int audioreach_fullio_verify_mute(struct q6apm_graph *graph);
++int audioreach_fullio_calibrate(struct q6apm_graph *graph,
++			       const struct audioreach_fullio_stages *stages,
++			       struct q6apm_fullio_oob_region *region, void *buffer,
++			       int (*assert_pa_off)(void *ctx), void *ctx);
+ /* Topology specific */
+ int audioreach_tplg_init(struct snd_soc_component *component);
+ 
+@@ -1044,6 +1084,9 @@ int audioreach_send_u32_param(struct q6apm_graph *graph,
+ 			      uint32_t param_id, uint32_t param_val);
+ int audioreach_compr_set_param(struct q6apm_graph *graph,
+ 			       const struct audioreach_module_config *mcfg);
++struct gpr_pkt *audioreach_alloc_push_pull_pkt(struct q6apm_graph *graph, phys_addr_t bphys,
++					       phys_addr_t pphys, u32 mem_map_handle,
++					       u32 pos_buf_mem_map_handle, u32 size, bool direct);
+ int audioreach_setup_push_pull(struct q6apm_graph *graph, phys_addr_t bphys,
+ 				phys_addr_t pphys, uint32_t mem_map_handle,
+ 				uint32_t pos_buf_mem_map_handle, uint32_t size);
+diff --git a/sound/soc/qcom/qdsp6/q6apm-dai.c b/sound/soc/qcom/qdsp6/q6apm-dai.c
+index afa4bb0..d29329e 100644
+--- a/sound/soc/qcom/qdsp6/q6apm-dai.c
++++ b/sound/soc/qcom/qdsp6/q6apm-dai.c
+@@ -3,6 +3,8 @@
+ 
+ #include <dt-bindings/firmware/qcom,scm.h>
+ #include <dt-bindings/soc/qcom,gpr.h>
++#include <dt-bindings/sound/qcom,q6afe.h>
++#include <linux/delay.h>
+ #include <linux/dma-mapping.h>
+ #include <linux/err.h>
+ #include <linux/firmware/qcom/qcom_scm.h>
+@@ -12,8 +14,10 @@
+ #include <linux/of.h>
+ #include <linux/of_reserved_mem.h>
+ #include <linux/platform_device.h>
++#include <linux/sizes.h>
+ #include <linux/slab.h>
+ #include <linux/spinlock.h>
++#include <linux/workqueue.h>
+ #include <sound/pcm.h>
+ #include <sound/pcm_params.h>
+ #include <sound/soc.h>
+@@ -72,7 +76,18 @@ enum stream_state {
+ 	Q6APM_STREAM_RUNNING,
+ };
+ 
++/* Larger than the longest pinned v19c OOB stage. */
++#define FULLIO_CAL_DMA_SIZE SZ_16K
++
++struct q6apm_fullio_cal_buffer {
++	struct q6apm_fullio_oob_region region;
++	struct device *dma_dev;
++	dma_addr_t dma;
++	void *cpu;
++};
++
+ struct q6apm_dai_rtd {
++	struct q6apm_fullio_cal_buffer *fullio_cal;
+ 	struct snd_pcm_substream *substream;
+ 	struct snd_compr_stream *cstream;
+ 	struct snd_codec codec;
+@@ -95,6 +110,13 @@ struct q6apm_dai_rtd {
+ 	enum stream_state state;
+ 	struct q6apm_graph *graph;
+ 	spinlock_t lock;
++	struct work_struct watermark_work;
++	/* Protected by lock. STOP revokes queued progress notifications. */
++	bool watermark_enabled;
++	bool watermark_pending;
++	bool independent_pcm;
++	bool fullio_reference_pcm;
++	bool fullio_reference_prepared;
+ 	bool notify_on_drain;
+ };
+ 
+@@ -103,6 +125,8 @@ struct q6apm_dai_data {
+ 	long long sid;
+ 	bool use_scm_assign;
+ 	bool has_reserved_mem;
++	/* Set only by the opt-in Denali paired stop audit, never reset on close. */
++	bool fullio_render_locked;
+ 	size_t reserved_buf_size;
+ 	struct mutex scm_lock; /* protects scm_regions and num_scm_regions */
+ 	struct q6apm_scm_region scm_regions[Q6APM_MAX_SCM_REGIONS];
+@@ -236,6 +260,44 @@ static const struct snd_pcm_hardware q6apm_dai_hardware_playback = {
+ 	.fifo_size =            0,
+ };
+ 
++static void q6apm_pcm_watermark_work(struct work_struct *work)
++{
++	struct q6apm_dai_rtd *prtd = container_of(work, struct q6apm_dai_rtd, watermark_work);
++	struct snd_pcm_substream *substream = prtd->substream;
++	unsigned long flags;
++	bool notify;
++
++	snd_pcm_stream_lock_irqsave(substream, flags);
++	scoped_guard(spinlock_irqsave, &prtd->lock) {
++		notify = prtd->watermark_enabled && prtd->watermark_pending;
++		prtd->watermark_pending = false;
++	}
++	if (notify)
++		snd_pcm_period_elapsed_under_stream_lock(substream);
++	snd_pcm_stream_unlock_irqrestore(substream, flags);
++}
++
++static void q6apm_pcm_watermark_queue(struct q6apm_dai_rtd *prtd)
++{
++	guard(spinlock_irqsave)(&prtd->lock);
++	if (!prtd->watermark_enabled)
++		return;
++
++	/* The cursor reports progress, not the number of wakeups. Never take
++	 * the PCM group lock on the shared GPR receive queue.
++	 */
++	prtd->watermark_pending = true;
++	schedule_work(&prtd->watermark_work);
++}
++
++static void q6apm_pcm_watermark_enable(struct q6apm_dai_rtd *prtd, bool enable)
++{
++	guard(spinlock_irqsave)(&prtd->lock);
++	prtd->watermark_enabled = enable;
++	if (!enable)
++		prtd->watermark_pending = false;
++}
++
+ static void event_handler(uint32_t opcode, uint32_t token, void *payload, void *priv)
+ {
+ 	struct q6apm_dai_rtd *prtd = priv;
+@@ -243,7 +305,7 @@ static void event_handler(uint32_t opcode, uint32_t token, void *payload, void *
+ 
+ 	switch (opcode) {
+ 	case APM_CLIENT_EVENT_WATERMARK_EVENT:
+-		snd_pcm_period_elapsed(substream);
++		q6apm_pcm_watermark_queue(prtd);
+ 		break;
+ 	case APM_CLIENT_EVENT_CMD_EOS_DONE:
+ 		prtd->state = Q6APM_STREAM_STOPPED;
+@@ -320,6 +382,804 @@ static void event_handler_compr(uint32_t opcode, uint32_t token,
+ 	}
+ }
+ 
++static int q6apm_fullio_release_cal(struct q6apm_dai_rtd *prtd)
++{
++	struct q6apm_fullio_cal_buffer *buf = prtd->fullio_cal;
++	struct q6apm *apm = prtd->graph->apm;
++	int ret = 0;
++
++	if (!buf)
++		return 0;
++	prtd->fullio_cal = NULL;
++	if (buf->region.handle && !buf->region.poisoned)
++		ret = q6apm_fullio_oob_unmap(apm, &buf->region);
++	if (ret || buf->region.poisoned) {
++		/* DSP ownership is uncertain. Retain memory AND the DMA device
++		 * reference, and never hand out a new slot for this APM instance.
++		 * The experimental path has no DSP reset/reclaim hook yet.
++		 */
++		apm->fullio_oob_quarantine = buf;
++		dev_err(buf->dma_dev, "FullIO calibration buffer quarantined; reboot to reclaim\n");
++		return ret ?: -EIO;
++	}
++
++	dma_free_coherent(buf->dma_dev, FULLIO_CAL_DMA_SIZE, buf->cpu, buf->dma);
++	put_device(buf->dma_dev);
++	kfree(buf);
++	atomic_set(&apm->fullio_oob_claimed, 0);
++	return 0;
++}
++
++/* Only the two known Denali WSA codecs on the playback link count. */
++#if IS_REACHABLE(CONFIG_SND_SOC_WSA884X)
++int wsa884x_fullio_pa_off(struct snd_soc_component *component);
++int wsa884x_fullio_stop_audit(struct snd_soc_component *component);
++int wsa884x_fullio_fault_watch(struct snd_soc_component *component,
++			      struct work_struct *work, bool arm);
++int wsa884x_fullio_fault_inject(struct snd_soc_component *component);
++int wsa884x_fullio_pa_ready(struct snd_soc_component *component, s64 *epoch);
++int wsa884x_fullio_start_pair(struct snd_soc_component *left,
++			     struct snd_soc_component *right,
++			     int (*verify_graph)(void *), void *context, int *stop_error);
++#else
++static int wsa884x_fullio_pa_off(struct snd_soc_component *component)
++{
++	return -EOPNOTSUPP;
++}
++
++static int wsa884x_fullio_stop_audit(struct snd_soc_component *component)
++{
++	return -EOPNOTSUPP;
++}
++
++static int wsa884x_fullio_fault_watch(struct snd_soc_component *component,
++				    struct work_struct *work, bool arm)
++{
++	return -EOPNOTSUPP;
++}
++
++static int wsa884x_fullio_fault_inject(struct snd_soc_component *component)
++{
++	return -EOPNOTSUPP;
++}
++
++static int wsa884x_fullio_pa_ready(struct snd_soc_component *component, s64 *epoch)
++{
++	return -EOPNOTSUPP;
++}
++
++static int wsa884x_fullio_start_pair(struct snd_soc_component *left,
++				    struct snd_soc_component *right,
++				    int (*verify_graph)(void *), void *context, int *stop_error)
++{
++	return -EOPNOTSUPP;
++}
++#endif
++
++static int q6apm_feedback_probe_rate(struct snd_soc_card *card)
++{
++	struct device_node *node = card->dev->of_node;
++	const char *probe;
++	const char *property = "microsoft,denali-fullio-feedback-probe";
++
++	if (!of_property_present(node, property))
++		return 0;
++	if (!of_machine_is_compatible("microsoft,denali") ||
++	    !of_property_read_bool(node, "microsoft,denali-fullio-muted-test") ||
++	    of_property_read_string(node, property, &probe))
++		return -EINVAL;
++	if (!strcmp(probe, "vi"))
++		return 8000;
++	if (!strcmp(probe, "cps"))
++		return 24000;
++	return -EINVAL;
++}
++
++struct q6apm_fullio_amp_pair {
++	struct snd_soc_component *left;
++	struct snd_soc_component *right;
++};
++
++/* Resolve both roles on the same runtime before reading either amplifier.
++ * The caller owns the card's PCM/runtime lifetime; do not cache these pointers.
++ */
++static int q6apm_fullio_amp_pair(struct snd_soc_card *card, const char *link,
++				struct q6apm_fullio_amp_pair *pair)
++{
++	struct snd_soc_pcm_runtime *rtd, *target = NULL;
++	struct snd_soc_dai *codec;
++	int i;
++
++	for_each_card_rtds(card, rtd) {
++		if (strcmp(rtd->dai_link->name, link))
++			continue;
++		if (target)
++			return -EEXIST;
++		target = rtd;
++	}
++	if (!target)
++		return -ENODEV;
++
++	for_each_rtd_codec_dais(target, i, codec) {
++		struct snd_soc_component *component = codec->component;
++		const char *prefix = component->name_prefix;
++		struct snd_soc_component **slot;
++
++		if (prefix && !strcmp(prefix, "SpkrLeft"))
++			slot = &pair->left;
++		else if (prefix && !strcmp(prefix, "SpkrRight"))
++			slot = &pair->right;
++		else
++			continue;
++		if (component->card != card || !component->dev)
++			return -ENODEV;
++		if (*slot)
++			return -EEXIST;
++		*slot = component;
++	}
++
++	if (!pair->left || !pair->right)
++		return -ENODEV;
++	if (pair->left->dev == pair->right->dev)
++		return -EEXIST;
++	return 0;
++}
++
++/* One synchronous clock transaction, under the caller's PCM lifetime lock.
++ * This predicate does not enable clocks, change a PA or retain device refs.
++ */
++struct q6apm_fullio_pa_check {
++	struct snd_pcm_substream *substream;
++	s64 left_epoch, right_epoch;
++	bool sampled;
++};
++
++static int __maybe_unused q6apm_fullio_verify_post_pa(void *arg)
++{
++	struct q6apm_fullio_pa_check *check = arg;
++	struct snd_pcm_substream *substream = check->substream;
++	struct snd_soc_card *card = snd_soc_substream_to_rtd(substream)->card;
++	struct q6apm_dai_rtd *prtd = substream->runtime->private_data;
++	struct q6apm_fullio_amp_pair pair = {};
++	s64 left, right, again;
++	int ret;
++
++	if (substream->stream != SNDRV_PCM_STREAM_PLAYBACK || !prtd || !prtd->graph ||
++	    !of_machine_is_compatible("microsoft,denali") ||
++	    !of_property_read_bool(card->dev->of_node, "microsoft,denali-fullio-post-pa-test") ||
++	    !q6apm_fullio_mute_is_verified(prtd->graph))
++		return -EPERM;
++
++	ret = q6apm_fullio_amp_pair(card, "WSA Playback", &pair);
++	if (ret)
++		return ret;
++	/* Overlap the two PA observation intervals (L, R, L, R). */
++	ret = wsa884x_fullio_pa_ready(pair.left, &left);
++	if (ret)
++		return ret;
++	ret = wsa884x_fullio_pa_ready(pair.right, &right);
++	if (ret)
++		return ret;
++	ret = wsa884x_fullio_pa_ready(pair.left, &again);
++	if (ret)
++		return ret;
++	if (again != left)
++		return -ESTALE;
++	ret = wsa884x_fullio_pa_ready(pair.right, &again);
++	if (ret)
++		return ret;
++	if (again != right || !q6apm_fullio_mute_is_verified(prtd->graph))
++		return -ESTALE;
++	/* The post-write callback must see the same codec epochs as pre-write. */
++	if (check->sampled && (check->left_epoch != left || check->right_epoch != right))
++		return -ESTALE;
++	check->left_epoch = left;
++	check->right_epoch = right;
++	check->sampled = true;
++	return 0;
++}
++
++static int q6apm_fullio_both_pa_off(void *ctx)
++{
++	struct snd_soc_card *card = ctx;
++	struct q6apm_fullio_amp_pair pair = {};
++	const char *link = "WSA Playback";
++	int ret, probe_rate = q6apm_feedback_probe_rate(card);
++
++	if (probe_rate < 0)
++		return probe_rate;
++	if (probe_rate)
++		link = probe_rate == 8000 ? "WSA VI Protection" : "WSA CPS Protection";
++
++	ret = q6apm_fullio_amp_pair(card, link, &pair);
++	if (ret)
++		return ret;
++	ret = wsa884x_fullio_pa_off(pair.left);
++	if (ret)
++		return ret;
++	return wsa884x_fullio_pa_off(pair.right);
++}
++
++static int q6apm_fullio_stop_pair_audit(struct snd_soc_card *card)
++{
++	struct q6apm_fullio_amp_pair pair = {};
++	int left, right;
++
++	left = q6apm_fullio_amp_pair(card, "WSA Playback", &pair);
++	if (left)
++		return left;
++	left = wsa884x_fullio_stop_audit(pair.left);
++	right = wsa884x_fullio_stop_audit(pair.right);
++	if (left || right) {
++		dev_err(card->dev, "FullIO PA-off teardown failed: left=%d right=%d\n", left, right);
++		return left ?: right;
++	}
++	/* Exercise rejection of missing proof, never fake the PA/clock state. */
++	if (of_property_read_bool(card->dev->of_node,
++				  "microsoft,denali-fullio-pa-off-missing-stop-proof")) {
++		dev_info(card->dev, "FullIO injected missing PA-off proof after both hardware checks\n");
++		return -ENODATA;
++	}
++	return 0;
++}
++
++static int q6apm_fullio_check_render(struct q6apm_dai_data *pdata, int stream)
++{
++	if (stream == SNDRV_PCM_STREAM_PLAYBACK && READ_ONCE(pdata->fullio_render_locked))
++		return -ENOTRECOVERABLE;
++	return 0;
++}
++
++/* A DSP STOP acknowledgement is not evidence about the physical PAs. */
++static int q6apm_fullio_finish_audit(struct q6apm_dai_data *pdata, struct snd_soc_card *card,
++				    int dsp_result, int dsp_stop_error, bool worker_verified)
++{
++	int pa_error = 0;
++
++	if (!worker_verified &&
++	    of_property_read_bool(card->dev->of_node, "microsoft,denali-fullio-pa-stop-audit"))
++		pa_error = q6apm_fullio_stop_pair_audit(card);
++	if (!pa_error && !dsp_stop_error && dsp_result <= 0)
++		return dsp_result;
++
++	WRITE_ONCE(pdata->fullio_render_locked, true);
++	if (pa_error)
++		dev_err(card->dev, "FullIO paired PA shutdown unverified: PA=%d, graph audit=%d; render locked\n",
++			pa_error, dsp_result);
++	if (dsp_stop_error)
++		dev_err(card->dev, "FullIO DSP shutdown unverified: GRAPH_STOP=%d; render locked\n",
++			dsp_stop_error);
++	if (dsp_result > 0)
++		dev_err(card->dev, "FullIO invalid audit result %d; render locked\n",
++			dsp_result);
++	return -ENOTRECOVERABLE;
++}
++
++struct q6apm_fullio_fault_work {
++	struct work_struct work;
++	struct snd_soc_card *card;
++	atomic_t fired;
++	int result;
++};
++
++static void q6apm_fullio_fault_worker(struct work_struct *work)
++{
++	struct q6apm_fullio_fault_work *audit = container_of(work, typeof(*audit), work);
++
++	/* A pair of status notices can requeue one work item across execution. */
++	if (atomic_cmpxchg(&audit->fired, 0, 1))
++		return;
++	/* No PCM, graph or DSP lock/transaction in the worker. */
++	audit->result = q6apm_fullio_stop_pair_audit(audit->card);
++}
++
++static int q6apm_fullio_fault_worker_audit(struct snd_soc_card *card, bool *verified)
++{
++	struct q6apm_fullio_fault_work audit = { .card = card, .fired = ATOMIC_INIT(0) };
++	struct q6apm_fullio_amp_pair pair = {};
++	int ret, cleanup;
++
++	ret = q6apm_fullio_amp_pair(card, "WSA Playback", &pair);
++	if (ret)
++		return ret;
++	INIT_WORK_ONSTACK(&audit.work, q6apm_fullio_fault_worker);
++	ret = wsa884x_fullio_fault_watch(pair.left, &audit.work, true);
++	if (ret)
++		goto join;
++	ret = wsa884x_fullio_fault_watch(pair.right, &audit.work, true);
++	if (!ret) {
++		ret = wsa884x_fullio_fault_inject(pair.left);
++		cleanup = wsa884x_fullio_fault_watch(pair.right, &audit.work, false);
++		ret = ret ?: cleanup;
++	}
++	cleanup = wsa884x_fullio_fault_watch(pair.left, &audit.work, false);
++	ret = ret ?: cleanup;
++join:
++	/* All device slots are revoked under their notifier locks before join. */
++	flush_work(&audit.work);
++	destroy_work_on_stack(&audit.work);
++	if (ret || audit.result || !atomic_read(&audit.fired))
++		return ret ?: audit.result ?: -ENODATA;
++	*verified = true;
++	dev_info(card->dev, "FullIO synthetic fault notice: paired PA-off worker verified before DSP STOP\n");
++	return -ECANCELED;
++}
++
++static int q6apm_fullio_verify_sink(struct q6apm_graph *graph)
++{
++	static const struct {
++		u32 param;
++		__le32 expected[3];
++	} rows[] = {
++		/* rate, packed bits/channels, fixed-point PCM */
++		{ PARAM_ID_HW_EP_MF_CFG,
++		  { cpu_to_le32(48000), cpu_to_le32((2 << 16) | 16), cpu_to_le32(1) } },
++		/* WSA type, interface 1, both DMA slots */
++		{ PARAM_ID_CODEC_DMA_INTF_CFG, { cpu_to_le32(2), cpu_to_le32(1), cpu_to_le32(3) } },
++	};
++	unsigned int i;
++	int ret;
++
++	for (i = 0; i < ARRAY_SIZE(rows); i++) {
++		__le32 actual[3];
++
++		ret = q6apm_fullio_get_cfg(graph, 0x4157, rows[i].param, actual, sizeof(actual));
++		if (ret)
++			return dev_err_probe(graph->dev, ret < 0 ? ret : -EPROTO,
++					     "FullIO sink GET_CFG %#x unverified\n", rows[i].param);
++		if (memcmp(actual, rows[i].expected, sizeof(actual)))
++			return dev_err_probe(graph->dev, -EILSEQ,
++					     "FullIO sink %#x differs from Golden\n", rows[i].param);
++	}
++	return 0;
++}
++
++static int q6apm_fullio_dsp_prepare(struct q6apm_graph *graph, struct snd_soc_card *card,
++				       const struct audioreach_fullio_stages *stages)
++{
++	struct device_node *node = card->dev->of_node;
++	bool sink_readback = of_property_read_bool(node, "microsoft,denali-fullio-sink-readback-audit");
++	bool reference = q6apm_fullio_reference_render(card);
++	bool prepare = reference || of_property_read_bool(node, "microsoft,denali-fullio-dsp-prepare-audit");
++	int ret;
++
++	if (sink_readback && (!prepare ||
++			      of_property_read_bool(node, "microsoft,denali-fullio-dsp-start-audit")))
++		return -EPERM;
++	if (!prepare)
++		return 0;
++	if ((!reference && !of_property_read_bool(node, "microsoft,denali-fullio-clock-off-audit")) ||
++	    of_property_read_bool(node, "microsoft,denali-fullio-post-pa-test") ||
++	    !graph->ar_graph || READ_ONCE(graph->ar_graph->start_count) ||
++	    !q6apm_fullio_transport_enabled(graph->apm))
++		return -EPERM;
++	ret = q6apm_fullio_both_pa_off(card);
++	if (ret)
++		return ret;
++	/* This step only prepares; it does not start or queue data. */
++	ret = q6apm_graph_prepare(graph);
++	if (ret)
++		return dev_err_probe(graph->dev, ret, "FullIO muted GRAPH_PREPARE rejected\n");
++	ret = audioreach_fullio_verify_tag(graph, stages, AR_FULLIO_SP_TAG);
++	if (!ret)
++		ret = audioreach_fullio_verify_tag(graph, stages, AR_FULLIO_SPVI_TAG);
++	if (ret)
++		return dev_err_probe(graph->dev, ret, "FullIO protection tag mismatch after GRAPH_PREPARE\n");
++	if (sink_readback) {
++		ret = q6apm_fullio_verify_sink(graph);
++		if (ret)
++			return ret;
++	}
++	ret = audioreach_fullio_verify_mute(graph);
++	if (ret)
++		return ret;
++	ret = q6apm_fullio_both_pa_off(card);
++	if (!ret) {
++		dev_info(graph->dev, "FullIO mute survived GRAPH_PREPARE\n");
++		dev_info(graph->dev, "FullIO SP/SPVI tags survived GRAPH_PREPARE byte-for-byte\n");
++		if (sink_readback)
++			dev_info(graph->dev, "FullIO Golden RX0 endpoint read back after GRAPH_PREPARE\n");
++	}
++	return ret;
++}
++
++#if IS_REACHABLE(CONFIG_SND_SOC_LPASS_WSA_MACRO)
++int wsa_macro_fullio_clock_off_for_feedback(struct snd_soc_card *card);
++#else
++static int wsa_macro_fullio_clock_off_for_feedback(struct snd_soc_card *card)
++{
++	return -EOPNOTSUPP;
++}
++#endif
++
++struct q6apm_fullio_start_audit {
++	struct snd_soc_card *card;
++	struct snd_pcm_substream *substream;
++	struct q6apm_graph *graph;
++	size_t ring_bytes;
++	bool stop_worker_done;
++};
++
++static bool q6apm_fullio_silent_ring_valid(struct q6apm_fullio_start_audit *audit)
++{
++	struct snd_pcm_substream *s = audit->substream;
++	struct snd_pcm_runtime *runtime = s->runtime;
++
++	return s->stream == SNDRV_PCM_STREAM_PLAYBACK &&
++	       runtime->access == SNDRV_PCM_ACCESS_RW_INTERLEAVED &&
++	       !(runtime->info & SNDRV_PCM_INFO_MMAP) && !atomic_read(&s->mmap_count) &&
++	       s->dma_buffer.area && audit->ring_bytes && audit->ring_bytes <= s->dma_buffer.bytes;
++}
++
++#define Q6APM_FULLIO_DIAG_LOG_CODE 0x1586
++
++static int q6apm_fullio_audit_configure_taps(struct q6apm_graph *graph, u32 feedback_log_off)
++{
++	/* AudioReach data_logging_api.h: mode 1 is immediate logging;
++	 * 0x08001313 with value 1 allows the logger to exit island.
++	 * Never retarget the render or microphone loggers.
++	 */
++	static const u32 iid[] = {0x4025, 0x402a};
++
++	for (unsigned int i = 0; i < ARRAY_SIZE(iid); i++) {
++		__le32 config[8] = {
++			cpu_to_le32(iid[i]), cpu_to_le32(Q6APM_FULLIO_LOG_CFG), cpu_to_le32(12), 0,
++			cpu_to_le32(feedback_log_off & BIT(i) ? 0 : Q6APM_FULLIO_DIAG_LOG_CODE),
++			cpu_to_le32(i + 2), cpu_to_le32(1), 0,
++		};
++		__le32 island[6] = {
++			cpu_to_le32(iid[i]), cpu_to_le32(0x08001313), cpu_to_le32(4), 0,
++			cpu_to_le32(1), 0,
++		};
++		int ret = q6apm_fullio_set_cfg_inband(graph, config, sizeof(config));
++
++		if (!ret)
++			ret = q6apm_fullio_set_cfg_inband(graph, island, sizeof(island));
++		if (ret)
++			return dev_err_probe(graph->dev, ret, "FullIO immediate tap %u rejected\n", i + 2);
++	}
++	dev_info(graph->dev, "FullIO immediate VI/CPS taps configured\n");
++	return 0;
++}
++
++static int q6apm_fullio_verify_logger_tags(struct q6apm_graph *graph, bool started,
++					   bool rx0_log_off, u32 feedback_log_off)
++{
++	static const struct { u32 iid, tag; } rows[] = {
++		{ 0x4003, 4 }, { 0x4025, 2 }, { 0x402a, 3 },
++	};
++	const char *phase = started ? "post-START" : "pre-START";
++
++	for (unsigned int i = 0; i < ARRAY_SIZE(rows); i++) {
++		bool off = i ? feedback_log_off & BIT(i - 1) : rx0_log_off;
++		u32 code = off ? 0 : Q6APM_FULLIO_DIAG_LOG_CODE;
++		__le32 cfg[3];
++		int ret = q6apm_fullio_get_cfg(graph, rows[i].iid, Q6APM_FULLIO_LOG_CFG,
++					      cfg, sizeof(cfg));
++
++		if (ret)
++			return dev_err_probe(graph->dev, ret < 0 ? ret : -EPROTO,
++					     "FullIO %s logger %#x GET_CFG unverified\n", phase, rows[i].iid);
++		if (le32_to_cpu(cfg[0]) != code || le32_to_cpu(cfg[1]) != rows[i].tag ||
++		    le32_to_cpu(cfg[2]) != 1)
++			return dev_err_probe(graph->dev, -EILSEQ,
++					     "FullIO %s logger %#x config mismatch: code=%#x tap=%u mode=%u\n",
++					     phase, rows[i].iid, le32_to_cpu(cfg[0]), le32_to_cpu(cfg[1]),
++					     le32_to_cpu(cfg[2]));
++		dev_info(graph->dev, "FullIO %s logger %#x GET_CFG verified: code=0x%x tap=%u mode=1\n",
++			 phase, rows[i].iid, code, rows[i].tag);
++	}
++	return 0;
++}
++
++/* PA-off readback of the bootstrap-set master gain.  Q13 unity is
++ * 0x2000.  Anything above it would amplify and is rejected; the value
++ * is logged so a lower user volume is visible in the audit trail.
++ */
++static int q6apm_fullio_verify_gain_bounds(struct q6apm_graph *graph, bool started)
++{
++	const char *phase = started ? "post-START" : "pre-START";
++	__le16 words[2];
++	int ret = q6apm_fullio_get_cfg(graph, 0x4a63, 0x08001035, words, sizeof(words));
++
++	if (ret)
++		return dev_err_probe(graph->dev, ret < 0 ? ret : -EPROTO,
++				     "FullIO %s master gain GET unverified\n", phase);
++	if (le16_to_cpu(words[0]) > 0x2000 || words[1])
++		return dev_err_probe(graph->dev, -EILSEQ,
++				     "FullIO %s master gain out of bounds: gain=%#x reserved=%#x\n",
++				     phase, le16_to_cpu(words[0]), le16_to_cpu(words[1]));
++	dev_info(graph->dev,
++		 "FullIO %s master gain verified: %#x (Q13 unity=0x2000)\n",
++		 phase, le16_to_cpu(words[0]));
++	return 0;
++}
++
++static int q6apm_fullio_verify_silent_audit(void *arg, bool started)
++{
++	struct q6apm_fullio_start_audit *audit = arg;
++	struct device_node *node = audit->card->dev->of_node;
++	bool taps = of_property_read_bool(node, "microsoft,denali-fullio-immediate-taps-audit");
++	bool ring = of_property_read_bool(node, "microsoft,denali-fullio-ring-dma-audit");
++	bool logger_tags = of_property_read_bool(node, "microsoft,denali-fullio-rx0-tag-audit");
++	bool rx0_log_off = of_property_read_bool(node, "microsoft,denali-fullio-rx0-log-off-audit");
++	bool feedback_off = of_property_read_bool(node, "microsoft,denali-fullio-feedback-log-off-audit");
++	bool keep_cps_log = of_property_read_bool(node, "microsoft,denali-fullio-keep-cps-log-audit");
++	bool gain_audit = of_property_read_bool(node, "microsoft,denali-fullio-pa-off-gain-audit");
++	u32 feedback_log_off = 0;
++	int ret;
++
++	if ((logger_tags && (!ring || !taps)) || (rx0_log_off && !logger_tags) ||
++	    (feedback_off && !rx0_log_off) || (keep_cps_log && !feedback_off))
++		return -EPERM;
++	if (feedback_off)
++		feedback_log_off = keep_cps_log ? BIT(0) : BIT(0) | BIT(1);
++	ret = q6apm_fullio_both_pa_off(audit->card);
++	if (ret)
++		return ret;
++	if (started) {
++		if (taps)
++			msleep(150); /* PA-off, clocks-off observation only. */
++		ret = audioreach_fullio_verify_mute(audit->graph);
++		if (ret)
++			return ret;
++		ret = q6apm_fullio_both_pa_off(audit->card);
++		if (ret)
++			return ret;
++	}
++	/* The required clock-off audit marker makes this a read-only query. */
++	ret = wsa_macro_fullio_clock_off_for_feedback(audit->card);
++	if (ret)
++		return ret;
++	if (gain_audit) {
++		ret = q6apm_fullio_verify_gain_bounds(audit->graph, started);
++		if (ret)
++			return ret;
++	}
++	if (ring) {
++		ret = q6apm_fullio_ring_position_audit(audit->graph, started);
++		if (ret || (!started && !taps))
++			return ret;
++		if (!started) {
++			ret = q6apm_fullio_audit_configure_taps(audit->graph, feedback_log_off);
++			if (!ret && logger_tags)
++				ret = q6apm_fullio_verify_logger_tags(audit->graph, false,
++							     rx0_log_off, feedback_log_off);
++			if (ret)
++				return ret;
++		}
++		ret = q6apm_fullio_both_pa_off(audit->card);
++		if (!ret)
++			ret = wsa_macro_fullio_clock_off_for_feedback(audit->card);
++		if (!ret && started && logger_tags)
++			ret = q6apm_fullio_verify_logger_tags(audit->graph, true,
++						     rx0_log_off, feedback_log_off);
++		if (ret || !started || !of_property_read_bool(node, "microsoft,denali-fullio-soft-cycle-audit"))
++			return ret;
++		ret = q6apm_fullio_soft_cycle_audit(audit->graph);
++		if (!ret)
++			ret = audioreach_fullio_verify_mute(audit->graph);
++		if (!ret)
++			ret = q6apm_fullio_both_pa_off(audit->card);
++		if (!ret)
++			ret = wsa_macro_fullio_clock_off_for_feedback(audit->card);
++		return ret ?: q6apm_fullio_ring_position_audit(audit->graph, true);
++	}
++	if (!q6apm_fullio_silent_ring_valid(audit))
++		return -EPERM;
++	if (!started) {
++		/* ALSA is still in prepare; no trigger or data mmap is allowed.
++		 * Clear the actual DSP ring, without touching the position buffer.
++		 */
++		memset(audit->substream->dma_buffer.area, 0, audit->ring_bytes);
++		dma_wmb();
++		if (taps) {
++			ret = q6apm_fullio_audit_configure_taps(audit->graph, 0);
++			if (!ret)
++				ret = q6apm_fullio_both_pa_off(audit->card);
++			return ret ?: wsa_macro_fullio_clock_off_for_feedback(audit->card);
++		}
++	} else if (memchr_inv(audit->substream->dma_buffer.area, 0, audit->ring_bytes)) {
++		return -EILSEQ;
++	} else if (of_property_read_bool(audit->card->dev->of_node,
++					 "microsoft,denali-fullio-pa-off-fault-worker")) {
++		return q6apm_fullio_fault_worker_audit(audit->card, &audit->stop_worker_done);
++	}
++	return 0;
++}
++
++static int q6apm_fullio_prepare_cal(struct q6apm_dai_data *pdata,
++				   struct q6apm_dai_rtd *prtd, struct snd_soc_card *card,
++				   const struct audioreach_module_config *cfg)
++{
++	struct q6apm_fullio_cal_buffer *buf;
++	struct audioreach_fullio_stages stages;
++	struct q6apm_fullio_mute_ticket ticket;
++	struct q6apm *apm = prtd->graph->apm;
++	struct device *dev = pdata->dev;
++	int owner, ret, unmap_ret;
++
++	if (!of_machine_is_compatible("microsoft,denali"))
++		return 0;
++	ret = q6apm_find_integrated_backend(dev, WSA_CODEC_DMA_RX_0, &owner);
++	if (ret == -ENOENT || (!ret && prtd->graph->id != owner))
++		return 0;
++	if (ret)
++		return ret;
++	if (!q6apm_is_graph_in_push_pull_mode(prtd->graph) || pdata->use_scm_assign)
++		return -EOPNOTSUPP;
++	ret = q6apm_find_integrated_backend(dev, WSA_CODEC_DMA_TX_0, &owner);
++	if (ret || owner != prtd->graph->id)
++		return ret ?: -EINVAL;
++	ret = q6apm_find_integrated_backend(dev, WSA_CODEC_DMA_TX_1, &owner);
++	if (ret || owner != prtd->graph->id)
++		return ret ?: -EINVAL;
++
++	/* Never claim or map a buffer for an incomplete or inconsistent graph. */
++	ret = audioreach_fullio_collect_stages(prtd->graph->info, &stages);
++	if (ret)
++		return ret;
++	ret = q6apm_fullio_mute_begin(prtd->graph, &ticket);
++	if (ret)
++		return ret;
++	ret = q6apm_fullio_both_pa_off(card);
++	if (ret)
++		return ret;
++	if (atomic_cmpxchg(&apm->fullio_oob_claimed, 0, 1))
++		return -EBUSY;
++
++	buf = kzalloc_obj(*buf);
++	if (!buf) {
++		ret = -ENOMEM;
++		goto release_claim;
++	}
++	buf->cpu = dma_alloc_coherent(dev, FULLIO_CAL_DMA_SIZE, &buf->dma, GFP_KERNEL);
++	if (!buf->cpu) {
++		kfree(buf);
++		ret = -ENOMEM;
++		goto release_claim;
++	}
++	buf->dma_dev = get_device(dev);
++	buf->region.size = FULLIO_CAL_DMA_SIZE;
++	buf->region.dsp_addr = buf->dma;
++	if (pdata->sid >= 0)
++		buf->region.dsp_addr |= (u64)pdata->sid << 32;
++	prtd->fullio_cal = buf;
++	ret = audioreach_fullio_media_prelude(prtd->graph, cfg);
++	if (!ret) {
++		dev_info(dev, "FullIO PCM_CNV and MFC media accepted\n");
++		ret = q6apm_fullio_oob_map(apm, &buf->region);
++		if (ret)
++			dev_err(dev, "FullIO calibration DMA map failed: %d\n", ret);
++	}
++	if (!ret)
++		ret = audioreach_fullio_calibrate(prtd->graph, &stages, &buf->region,
++						 buf->cpu, q6apm_fullio_both_pa_off, card);
++	unmap_ret = q6apm_fullio_release_cal(prtd);
++	if (ret || unmap_ret)
++		return ret ?: unmap_ret;
++	ret = q6apm_fullio_dsp_prepare(prtd->graph, card, &stages);
++	if (ret)
++		return ret;
++	if (prtd->fullio_reference_pcm)
++		return q6apm_fullio_mute_commit(prtd->graph, &ticket);
++	if (of_property_read_bool(card->dev->of_node, "microsoft,denali-fullio-dsp-start-audit")) {
++		struct q6apm_fullio_start_audit audit = {
++			.card = card,
++			.substream = prtd->substream,
++			.graph = prtd->graph,
++			.ring_bytes = pdata->has_reserved_mem ? pdata->reserved_buf_size :
++							       BUFFER_BYTES_MAX,
++		};
++		int dsp_stop_error;
++
++		ret = q6apm_fullio_mute_commit(prtd->graph, &ticket);
++		if (ret)
++			return ret;
++		ret = q6apm_fullio_audit_start_stop(prtd->graph, card, q6apm_fullio_verify_silent_audit,
++						   &audit, &dsp_stop_error);
++		/* Clear any ticket left by a rejection before START. A real
++		 * attempt already revokes it before sending STOP.
++		 */
++		if (q6apm_fullio_mute_is_verified(prtd->graph))
++			q6apm_fullio_mute_invalidate(prtd->graph);
++		ret = q6apm_fullio_finish_audit(pdata, card, ret, dsp_stop_error, audit.stop_worker_done);
++		if (ret)
++			return ret;
++	} else {
++		dev_info(prtd->graph->dev, "FullIO prepare-only audit: no mute ticket published; render stays disabled\n");
++	}
++	return -EOPNOTSUPP;
++
++release_claim:
++	atomic_set(&apm->fullio_oob_claimed, 0);
++	return ret;
++}
++
++static bool q6apm_fullio_independent_pcm(struct snd_soc_component *component,
++					 unsigned int graph_id, int stream)
++{
++	/* MultiMedia1 is graph 0 in the pinned Denali FullIO topology. */
++	return stream == SNDRV_PCM_STREAM_PLAYBACK && graph_id == 0 && component->card &&
++	       of_machine_is_compatible("microsoft,denali") &&
++	       (q6apm_fullio_reference_render(component->card) ||
++		of_property_read_bool(component->card->dev->of_node,
++				      "microsoft,denali-fullio-ring-map-audit"));
++}
++
++/* Keep the pull producer's registration and media order together. It is
++ * valid only on a fresh attached ring; a failed write leaves the owner
++ * attached for CLOSE, never reissues configuration on this graph.
++ */
++static int q6apm_fullio_prepare_pull_media(struct q6apm_graph *graph,
++					   struct audioreach_module_config *cfg,
++					   unsigned int period_bytes)
++{
++	int ret;
++
++	ret = q6apm_fullio_register_pull_events(graph, period_bytes);
++	if (ret)
++		return dev_err_probe(graph->dev, ret, "FullIO independent ring event registration rejected\n");
++	dev_info(graph->dev, "FullIO independent ring pull watermarks and SOFT_PAUSE events acknowledged\n");
++	ret = q6apm_graph_media_format_shmem(graph, cfg);
++	if (ret)
++		return dev_err_probe(graph->dev, ret, "FullIO independent ring SHMEM media rejected\n");
++	dev_info(graph->dev, "FullIO independent ring SHMEM media accepted\n");
++	return 0;
++}
++
++static int q6apm_fullio_reference_prepare(struct q6apm_dai_data *pdata,
++					 struct q6apm_dai_rtd *prtd, struct snd_soc_card *card,
++					 struct audioreach_module_config *cfg)
++{
++	struct snd_pcm_substream *substream = prtd->substream;
++	struct snd_pcm_runtime *runtime = substream->runtime;
++	struct snd_dma_buffer *buffer;
++	int ret;
++
++	if (pdata->has_reserved_mem || pdata->use_scm_assign ||
++	    runtime->format != SNDRV_PCM_FORMAT_S16_LE || runtime->rate != 48000 ||
++	    runtime->channels != 2 || prtd->pcm_size != 3840 ||
++	    snd_pcm_lib_period_bytes(substream) != 1920 || prtd->periods != 2)
++		return -EINVAL;
++
++	if (!prtd->fullio_reference_prepared) {
++		ret = q6apm_fullio_both_pa_off(card);
++		if (!ret)
++			ret = wsa_macro_fullio_clock_off_for_feedback(card);
++		if (!ret)
++			ret = q6apm_fullio_pcm_configure(prtd->graph, card, pdata->sid);
++		if (!ret)
++			ret = q6apm_fullio_prepare_pull_media(prtd->graph, cfg, 1920);
++		if (!ret)
++			ret = q6apm_fullio_prepare_cal(pdata, prtd, card, cfg);
++		if (ret)
++			return ret;
++	}
++
++	buffer = q6apm_fullio_pcm_buffer(prtd->graph, prtd->pcm_size);
++	if (!buffer)
++		return -ENODATA;
++	ret = q6apm_fullio_pcm_start(prtd->graph);
++	if (!ret)
++		ret = audioreach_fullio_verify_mute(prtd->graph);
++	if (!ret && !q6apm_fullio_mute_is_verified(prtd->graph))
++		ret = -ESTALE;
++	if (ret) {
++		int stop;
++
++		snd_pcm_set_runtime_buffer(substream, NULL);
++		stop = q6apm_fullio_pcm_stop(prtd->graph);
++
++		if (stop)
++			WRITE_ONCE(pdata->fullio_render_locked, true);
++		return ret;
++	}
++	snd_pcm_set_runtime_buffer(substream, buffer);
++	prtd->fullio_reference_prepared = true;
++	return 0;
++}
++
+ static int q6apm_dai_prepare(struct snd_soc_component *component,
+ 			     struct snd_pcm_substream *substream)
+ {
+@@ -339,12 +1199,70 @@ static int q6apm_dai_prepare(struct snd_soc_component *component,
+ 		return -EINVAL;
+ 	}
+ 
++	ret = q6apm_fullio_check_render(pdata, substream->stream);
++	if (ret)
++		return ret;
++	if (audioreach_fullio_graph(prtd->graph->info) && !prtd->fullio_reference_prepared)
++		q6apm_fullio_mute_invalidate(prtd->graph);
+ 	cfg.direction = substream->stream;
+ 	cfg.sample_rate = runtime->rate;
+ 	cfg.num_channels = runtime->channels;
+ 	cfg.bit_width = prtd->bits_per_sample;
+ 	cfg.fmt = SND_AUDIOCODEC_PCM;
+ 	audioreach_set_default_channel_mapping(cfg.channel_map, runtime->channels);
++	ret = q6apm_feedback_probe_rate(component->card);
++	if (ret < 0)
++		return ret;
++	if (ret) {
++		if (substream->stream != SNDRV_PCM_STREAM_CAPTURE ||
++		    cfg.sample_rate != ret || cfg.bit_width != 32 || cfg.num_channels != 2)
++			return -EINVAL;
++		ret = q6apm_fullio_both_pa_off(component->card);
++		if (ret)
++			return dev_err_probe(dev, ret, "FullIO feedback probe requires both PAs off\n");
++	}
++	if (prtd->fullio_reference_pcm)
++		return q6apm_fullio_reference_prepare(pdata, prtd, component->card, &cfg);
++	if (q6apm_fullio_independent_pcm(component, prtd->graph->id, substream->stream)) {
++		const unsigned int audit_period = 1920; /* Golden: 10 ms stereo S16_LE. */
++		struct snd_dma_buffer *buffer;
++		struct device_node *node = component->card->dev->of_node;
++		bool prepare_ring = of_property_read_bool(node, "microsoft,denali-fullio-ring-dma-audit") ||
++				    of_property_read_bool(node, "microsoft,denali-fullio-sink-readback-audit");
++
++		if (!audioreach_fullio_graph(prtd->graph->info) || prtd->state ||
++		    pdata->has_reserved_mem || pdata->use_scm_assign ||
++		    pdata->sid < -1 || pdata->sid > SID_MASK_DEFAULT)
++			return -EPERM;
++		ret = q6apm_fullio_both_pa_off(component->card);
++		if (ret)
++			return ret;
++		if (prepare_ring && (runtime->format != SNDRV_PCM_FORMAT_S16_LE ||
++				  runtime->rate != 48000 || runtime->channels != 2))
++			return -EINVAL;
++		ret = q6apm_fullio_ring_map_audit(prtd->graph, component->card, BUFFER_BYTES_MAX,
++						 pdata->sid, prepare_ring ? 2 * audit_period : prtd->pcm_size);
++		if (ret)
++			return ret;
++		ret = q6apm_fullio_both_pa_off(component->card);
++		if (ret)
++			return ret;
++		if (!prepare_ring)
++			return -EOPNOTSUPP;
++		ret = q6apm_fullio_prepare_pull_media(prtd->graph, &cfg, audit_period);
++		if (ret)
++			return ret;
++		/* Some audit clients intentionally negotiate a different ALSA
++		 * size. They still exercise the fixed DSP ring, but only exact
++		 * PCM geometry can borrow its samples for direct writes.
++		 */
++		buffer = q6apm_fullio_pcm_buffer(prtd->graph, prtd->pcm_size);
++		if (buffer)
++			snd_pcm_set_runtime_buffer(substream, buffer);
++		ret = q6apm_fullio_prepare_cal(pdata, prtd, component->card, &cfg);
++		snd_pcm_set_runtime_buffer(substream, NULL);
++		return ret ?: -EOPNOTSUPP;
++	}
+ 	if (prtd->state) {
+ 		/* clear the previous setup if any  */
+ 		q6apm_graph_stop(prtd->graph);
+@@ -381,6 +1299,12 @@ static int q6apm_dai_prepare(struct snd_soc_component *component,
+ 
+ 	}
+ 
++	if (audioreach_fullio_graph(prtd->graph->info)) {
++		ret = q6apm_fullio_prepare_cal(pdata, prtd, component->card, &cfg);
++		/* FullIO remains diagnostic-only, even for an unexpected no-op. */
++		return ret ?: -EOPNOTSUPP;
++	}
++
+ 	ret = q6apm_graph_media_format_pcm(prtd->graph, &cfg);
+ 	if (ret < 0) {
+ 		dev_err(dev, "%s: CMD Format block failed\n", __func__);
+@@ -444,6 +1368,32 @@ static int q6apm_dai_ack(struct snd_soc_component *component, struct snd_pcm_sub
+ 	return ret;
+ }
+ 
++static int q6apm_fullio_verify_start(void *arg)
++{
++	struct q6apm_graph *graph = arg;
++
++	if (!q6apm_fullio_mute_is_verified(graph))
++		return -ESTALE;
++	return 0;
++}
++
++/* The DSP graph is already running muted from PREPARE. Trigger START only
++ * coordinates the two PA transitions and the protection clocks, and never
++ * sends a second DSP transaction.
++ */
++static int q6apm_fullio_reference_start(struct q6apm_dai_rtd *prtd,
++					struct snd_soc_card *card)
++{
++	struct q6apm_fullio_amp_pair pair = {};
++	int ret, stop_error = 0;
++
++	ret = q6apm_fullio_amp_pair(card, "WSA Playback", &pair);
++	if (ret)
++		return ret;
++	return wsa884x_fullio_start_pair(pair.left, pair.right, q6apm_fullio_verify_start,
++					 prtd->graph, &stop_error);
++}
++
+ static int q6apm_dai_trigger(struct snd_soc_component *component,
+ 			     struct snd_pcm_substream *substream, int cmd)
+ {
+@@ -455,15 +1405,26 @@ static int q6apm_dai_trigger(struct snd_soc_component *component,
+ 	case SNDRV_PCM_TRIGGER_START:
+ 	case SNDRV_PCM_TRIGGER_RESUME:
+ 	case SNDRV_PCM_TRIGGER_PAUSE_RELEASE:
++		if (prtd->fullio_reference_pcm) {
++			if (!prtd->fullio_reference_prepared)
++				return -EINVAL;
++			ret = q6apm_fullio_reference_start(prtd, component->card);
++			if (ret)
++				return ret;
++		} else if (audioreach_fullio_graph(prtd->graph->info)) {
++			return -EOPNOTSUPP;
++		}
++		q6apm_pcm_watermark_enable(prtd, true);
+ 		break;
+ 	case SNDRV_PCM_TRIGGER_STOP:
+-		/* TODO support be handled via SoftPause Module */
++		q6apm_pcm_watermark_enable(prtd, false);
+ 		prtd->state = Q6APM_STREAM_STOPPED;
+ 		prtd->queue_ptr = 0;
+ 		prtd->last_pos_index = 0;
+ 		break;
+ 	case SNDRV_PCM_TRIGGER_SUSPEND:
+ 	case SNDRV_PCM_TRIGGER_PAUSE_PUSH:
++		q6apm_pcm_watermark_enable(prtd, false);
+ 		break;
+ 	default:
+ 		ret = -EINVAL;
+@@ -473,6 +1434,15 @@ static int q6apm_dai_trigger(struct snd_soc_component *component,
+ 	return ret;
+ }
+ 
++static bool q6apm_fullio_capture_only(struct snd_soc_component *component)
++{
++	struct snd_soc_card *card = component->card;
++
++	return card && of_machine_is_compatible("microsoft,denali") &&
++	       of_property_read_bool(card->dev->of_node,
++				     "microsoft,denali-fullio-capture-only");
++}
++
+ static int q6apm_dai_open(struct snd_soc_component *component,
+ 			  struct snd_pcm_substream *substream)
+ {
+@@ -482,23 +1452,44 @@ static int q6apm_dai_open(struct snd_soc_component *component,
+ 	struct device *dev = component->dev;
+ 	struct q6apm_dai_data *pdata;
+ 	struct q6apm_dai_rtd *prtd;
+-	int graph_id, ret;
++	bool independent;
++	int graph_id, probe_rate, ret;
++
++	/* Desktop device probes must not allocate or open a render graph. */
++	if (substream->stream == SNDRV_PCM_STREAM_PLAYBACK && q6apm_fullio_capture_only(component))
++		return -EOPNOTSUPP;
+ 
+ 	graph_id = cpu_dai->driver->id;
++	probe_rate = q6apm_feedback_probe_rate(component->card);
++	if (probe_rate < 0)
++		return probe_rate;
++	if (probe_rate && (substream->stream != SNDRV_PCM_STREAM_CAPTURE || graph_id != 2))
++		return -EOPNOTSUPP;
+ 
+ 	pdata = snd_soc_component_get_drvdata(component);
+ 	if (!pdata) {
+ 		dev_err(dev, "Drv data not found ..\n");
+ 		return -EINVAL;
+ 	}
++	ret = q6apm_fullio_check_render(pdata, substream->stream);
++	if (ret)
++		return ret;
+ 
+ 	prtd = kzalloc_obj(*prtd);
+ 	if (prtd == NULL)
+ 		return -ENOMEM;
+ 
+ 	spin_lock_init(&prtd->lock);
++	INIT_WORK(&prtd->watermark_work, q6apm_pcm_watermark_work);
+ 	prtd->substream = substream;
+-	prtd->graph = q6apm_graph_open(dev, event_handler, prtd, graph_id, substream->stream);
++	independent = q6apm_fullio_independent_pcm(component, graph_id, substream->stream);
++	prtd->independent_pcm = independent;
++	prtd->fullio_reference_pcm = independent && q6apm_fullio_reference_render(component->card);
++	/* No asynchronous ALSA period delivery for the diagnostic ring. */
++	prtd->graph = q6apm_graph_open(dev,
++				     independent && !prtd->fullio_reference_pcm ? NULL : event_handler,
++				     independent && !prtd->fullio_reference_pcm ? NULL : prtd,
++				     graph_id, substream->stream);
+ 	if (IS_ERR(prtd->graph)) {
+ 		dev_err(dev, "%s: Could not allocate memory\n", __func__);
+ 		ret = PTR_ERR(prtd->graph);
+@@ -509,6 +1500,35 @@ static int q6apm_dai_open(struct snd_soc_component *component,
+ 		runtime->hw = q6apm_dai_hardware_playback;
+ 	else if (substream->stream == SNDRV_PCM_STREAM_CAPTURE)
+ 		runtime->hw = q6apm_dai_hardware_capture;
++	if (independent)
++		runtime->hw.info &= ~(SNDRV_PCM_INFO_PAUSE | SNDRV_PCM_INFO_RESUME);
++	if (independent || (substream->stream == SNDRV_PCM_STREAM_PLAYBACK &&
++	    audioreach_fullio_graph(prtd->graph->info) &&
++	    of_property_read_bool(component->card->dev->of_node, "microsoft,denali-fullio-dsp-start-audit"))) {
++		runtime->hw.info &= ~(SNDRV_PCM_INFO_MMAP | SNDRV_PCM_INFO_MMAP_VALID);
++		ret = snd_pcm_hw_constraint_mask64(runtime, SNDRV_PCM_HW_PARAM_ACCESS,
++						  BIT_ULL(SNDRV_PCM_ACCESS_RW_INTERLEAVED));
++		if (ret)
++			goto err;
++	}
++	if (prtd->fullio_reference_pcm) {
++		runtime->hw.formats = SNDRV_PCM_FMTBIT_S16_LE;
++		runtime->hw.rates = SNDRV_PCM_RATE_48000;
++		runtime->hw.rate_min = runtime->hw.rate_max = 48000;
++		runtime->hw.channels_min = runtime->hw.channels_max = 2;
++		ret = snd_pcm_hw_constraint_single(runtime, SNDRV_PCM_HW_PARAM_PERIOD_BYTES, 1920);
++		if (ret < 0)
++			goto err;
++		ret = snd_pcm_hw_constraint_single(runtime, SNDRV_PCM_HW_PARAM_BUFFER_BYTES, 3840);
++		if (ret < 0)
++			goto err;
++	}
++	if (probe_rate) {
++		runtime->hw.formats = SNDRV_PCM_FMTBIT_S32_LE;
++		runtime->hw.rates = probe_rate == 8000 ? SNDRV_PCM_RATE_8000 : SNDRV_PCM_RATE_24000;
++		runtime->hw.rate_min = runtime->hw.rate_max = probe_rate;
++		runtime->hw.channels_min = runtime->hw.channels_max = 2;
++	}
+ 
+ 	/* Ensure that buffer size is a multiple of period size */
+ 	ret = snd_pcm_hw_constraint_integer(runtime, SNDRV_PCM_HW_PARAM_PERIODS);
+@@ -543,6 +1563,8 @@ static int q6apm_dai_open(struct snd_soc_component *component,
+ 	}
+ 
+ 	runtime->private_data = prtd;
++	if (independent)
++		return 0;
+ 	runtime->dma_bytes = pdata->has_reserved_mem ? pdata->reserved_buf_size :
+ 						       BUFFER_BYTES_MAX;
+ 	if (pdata->sid < 0)
+@@ -574,19 +1596,34 @@ static int q6apm_dai_close(struct snd_soc_component *component,
+ {
+ 	struct snd_pcm_runtime *runtime = substream->runtime;
+ 	struct q6apm_dai_rtd *prtd = runtime->private_data;
++	struct q6apm_dai_data *pdata = snd_soc_component_get_drvdata(component);
++	int ret = 0;
+ 
++	/* Close is outside the PCM group lock. Revoke before draining so
++	 * concurrent GPR callbacks cannot queue new work against this graph.
++	 */
++	q6apm_pcm_watermark_enable(prtd, false);
++	cancel_work_sync(&prtd->watermark_work);
+ 	if (prtd->state) {
+ 		/* only stop graph that is started */
+ 		q6apm_graph_stop(prtd->graph);
+ 		q6apm_free_fragments(prtd->graph, substream->stream);
+ 	}
+ 
++	if (prtd->independent_pcm)
++		snd_pcm_set_runtime_buffer(substream, NULL);
++	if (prtd->fullio_reference_pcm) {
++		ret = q6apm_fullio_pcm_stop(prtd->graph);
++		if (ret)
++			WRITE_ONCE(pdata->fullio_render_locked, true);
++	}
++	q6apm_fullio_release_cal(prtd);
+ 	q6apm_graph_close(prtd->graph);
+ 	prtd->graph = NULL;
+ 	kfree(prtd);
+ 	runtime->private_data = NULL;
+ 
+-	return 0;
++	return ret;
+ }
+ 
+ static snd_pcm_uframes_t q6apm_dai_pointer(struct snd_soc_component *component,
+@@ -596,6 +1633,19 @@ static snd_pcm_uframes_t q6apm_dai_pointer(struct snd_soc_component *component,
+ 	struct q6apm_dai_rtd *prtd = runtime->private_data;
+ 	snd_pcm_uframes_t ptr;
+ 
++	if (prtd->independent_pcm) {
++		u32 index;
++		int ret;
++
++		ret = q6apm_fullio_pcm_cursor(prtd->graph, frames_to_bytes(runtime, 1), &index);
++		if (!ret)
++			prtd->last_pos_index = index;
++		else if (ret != -EAGAIN)
++			return SNDRV_PCM_POS_XRUN;
++		ptr = bytes_to_frames(runtime, prtd->last_pos_index);
++		return ptr < runtime->buffer_size ? ptr : SNDRV_PCM_POS_XRUN;
++	}
++
+ 	if (q6apm_is_graph_in_push_pull_mode(prtd->graph)) {
+ 		int retries = 10;
+ 		uint32_t index, fc1, fc2;
+@@ -626,6 +1676,16 @@ static snd_pcm_uframes_t q6apm_dai_pointer(struct snd_soc_component *component,
+ 	return ptr * runtime->period_size;
+ }
+ 
++static int q6apm_dai_hw_free(struct snd_soc_component *component,
++			     struct snd_pcm_substream *substream)
++{
++	struct q6apm_dai_rtd *prtd = substream->runtime->private_data;
++
++	if (prtd && prtd->fullio_reference_pcm)
++		snd_pcm_set_runtime_buffer(substream, NULL);
++	return 0;
++}
++
+ static int q6apm_dai_hw_params(struct snd_soc_component *component,
+ 			       struct snd_pcm_substream *substream,
+ 			       struct snd_pcm_hw_params *params)
+@@ -635,6 +1695,8 @@ static int q6apm_dai_hw_params(struct snd_soc_component *component,
+ 
+ 	prtd->pcm_size = params_buffer_bytes(params);
+ 	prtd->periods = params_periods(params);
++	if (prtd->independent_pcm)
++		prtd->last_pos_index = 0;
+ 
+ 	switch (params_format(params)) {
+ 	case SNDRV_PCM_FORMAT_S16_LE:
+@@ -643,6 +1705,15 @@ static int q6apm_dai_hw_params(struct snd_soc_component *component,
+ 	case SNDRV_PCM_FORMAT_S24_LE:
+ 		prtd->bits_per_sample = 24;
+ 		break;
++	case SNDRV_PCM_FORMAT_S32_LE: {
++		int rate = q6apm_feedback_probe_rate(component->card);
++
++		if (rate <= 0 || params_rate(params) != rate || params_channels(params) != 2 ||
++		    substream->stream != SNDRV_PCM_STREAM_CAPTURE)
++			return -EINVAL;
++		prtd->bits_per_sample = 32;
++		break;
++	}
+ 	default:
+ 		return -EINVAL;
+ 	}
+@@ -675,8 +1746,8 @@ static int q6apm_dai_memory_map(struct snd_soc_component *component,
+ 		phys = substream->dma_buffer.addr | (pdata->sid << 32);
+ 
+ 	ret = q6apm_map_memory_fixed_region(dev, graph_id, phys, buf_max);
+-	if (ret < 0)
+-		dev_err(dev, "Audio Start: Buffer Allocation failed rc = %d\n",	ret);
++	if (ret)
++		return dev_err_probe(dev, ret, "PCM data ring mapping failed\n");
+ 
+ 	if (is_push_pull) {
+ 		if (pdata->sid < 0)
+@@ -685,13 +1756,20 @@ static int q6apm_dai_memory_map(struct snd_soc_component *component,
+ 			phys = (substream->dma_buffer.addr + buf_max) | (pdata->sid << 32);
+ 
+ 		ret = q6apm_map_pos_buffer(dev, graph_id, phys, POS_BUFFER_BYTES);
+-		if (ret < 0)
+-			dev_err(dev, "Audio Start: Buffer Allocation failed rc = %d\n",	ret);
+-	} else {
+-
++		if (ret)
++			return dev_err_probe(dev, ret, "PCM position buffer mapping failed\n");
+ 	}
+ 
+-	return ret;
++	return 0;
++}
++
++static bool q6apm_fullio_no_render_backing(struct snd_soc_component *component,
++					   const struct snd_pcm *pcm, int graph_id)
++{
++	/* The capture-only DT suppresses open on the pinned playback FE. */
++	return graph_id == 0 && pcm->streams[SNDRV_PCM_STREAM_PLAYBACK].substream &&
++	       !pcm->streams[SNDRV_PCM_STREAM_CAPTURE].substream &&
++	       q6apm_fullio_capture_only(component);
+ }
+ 
+ static int q6apm_dai_pcm_new(struct snd_soc_component *component, struct snd_soc_pcm_runtime *rtd)
+@@ -699,6 +1777,7 @@ static int q6apm_dai_pcm_new(struct snd_soc_component *component, struct snd_soc
+ 	struct snd_soc_dai *cpu_dai = snd_soc_rtd_to_cpu(rtd, 0);
+ 	struct q6apm_dai_data *pdata;
+ 	struct snd_pcm *pcm = rtd->pcm;
++	struct device *dev = component->dev;
+ 	int size = BUFFER_BYTES_MAX + PAGE_SIZE;
+ 	int graph_id, ret;
+ 	bool is_push_pull;
+@@ -708,11 +1787,15 @@ static int q6apm_dai_pcm_new(struct snd_soc_component *component, struct snd_soc
+ 	if (!pdata)
+ 		return -EINVAL;
+ 
++	graph_id = cpu_dai->driver->id;
++	if (q6apm_fullio_no_render_backing(component, pcm, graph_id)) {
++		dev_info(dev, "FullIO capture-only: render backing not allocated or mapped\n");
++		return 0;
++	}
++
+ 	if (pdata->has_reserved_mem)
+ 		size = pdata->reserved_buf_size + PAGE_SIZE;
+ 
+-	graph_id = cpu_dai->driver->id;
+-
+ 	if (pcm->streams[SNDRV_PCM_STREAM_PLAYBACK].substream)
+ 		substream = pcm->streams[SNDRV_PCM_STREAM_PLAYBACK].substream;
+ 	else  if (pcm->streams[SNDRV_PCM_STREAM_CAPTURE].substream)
+@@ -723,6 +1806,14 @@ static int q6apm_dai_pcm_new(struct snd_soc_component *component, struct snd_soc
+ 		is_push_pull = q6apm_is_graph_in_push_pull_mode_from_id(component->dev,
+ 									graph_id,
+ 									substream->stream);
++		if (q6apm_fullio_independent_pcm(component, graph_id, substream->stream)) {
++			if (!is_push_pull || pdata->has_reserved_mem || pdata->use_scm_assign ||
++			    pcm->streams[SNDRV_PCM_STREAM_CAPTURE].substream)
++				return -EPERM;
++			/* The independent owner supplies ALSA's sample-only view. */
++			dev_info(dev, "FullIO independent PCM: no legacy DSP map\n");
++			return 0;
++		}
+ 		if (is_push_pull)
+ 			size += POS_BUFFER_BYTES;
+ 
+@@ -792,6 +1883,12 @@ static void q6apm_dai_pcm_free(struct snd_soc_component *component, struct snd_p
+ 
+ 	substream = pcm->streams[SNDRV_PCM_STREAM_PLAYBACK].substream;
+ 	if (substream) {
++		struct snd_soc_pcm_runtime *rtd = snd_soc_substream_to_rtd(substream);
++		struct snd_soc_dai *cpu = rtd ? snd_soc_rtd_to_cpu(rtd, 0) : NULL;
++
++		if (cpu && (q6apm_fullio_no_render_backing(component, pcm, cpu->driver->id) ||
++			    q6apm_fullio_independent_pcm(component, cpu->driver->id, substream->stream)))
++			return;
+ 		q6apm_dai_memory_unmap(component, substream);
+ 		if (pdata && pdata->use_scm_assign && !pdata->has_reserved_mem)
+ 			q6apm_dai_scm_unassign(pdata,
+@@ -811,10 +1908,18 @@ static int q6apm_dai_compr_open(struct snd_soc_component *component,
+ 	int ret, size;
+ 	int graph_id;
+ 
++	if (q6apm_fullio_capture_only(component))
++		return -EOPNOTSUPP;
++
+ 	graph_id = cpu_dai->driver->id;
++	if (q6apm_fullio_independent_pcm(component, graph_id, SNDRV_PCM_STREAM_PLAYBACK))
++		return -EOPNOTSUPP;
+ 	pdata = snd_soc_component_get_drvdata(component);
+ 	if (!pdata)
+ 		return -EINVAL;
++	ret = q6apm_fullio_check_render(pdata, SNDRV_PCM_STREAM_PLAYBACK);
++	if (ret)
++		return ret;
+ 
+ 	prtd = kzalloc_obj(*prtd);
+ 	if (prtd == NULL)
+@@ -1188,6 +2293,7 @@ static const struct snd_soc_component_driver q6apm_fe_dai_component = {
+ 	.pcm_new	= q6apm_dai_pcm_new,
+ 	.pcm_free	= q6apm_dai_pcm_free,
+ 	.hw_params	= q6apm_dai_hw_params,
++	.hw_free	= q6apm_dai_hw_free,
+ 	.pointer	= q6apm_dai_pointer,
+ 	.trigger	= q6apm_dai_trigger,
+ 	.ack		= q6apm_dai_ack,
+diff --git a/sound/soc/qcom/qdsp6/q6apm-lpass-dais.c b/sound/soc/qcom/qdsp6/q6apm-lpass-dais.c
+index c636226..067ff53 100644
+--- a/sound/soc/qcom/qdsp6/q6apm-lpass-dais.c
++++ b/sound/soc/qcom/qdsp6/q6apm-lpass-dais.c
+@@ -2,6 +2,7 @@
+ // Copyright (c) 2021, Linaro Limited
+ 
+ #include <dt-bindings/sound/qcom,q6dsp-lpass-ports.h>
++#include <dt-bindings/sound/qcom,q6afe.h>
+ #include <linux/clk.h>
+ #include <linux/err.h>
+ #include <linux/init.h>
+@@ -30,6 +31,7 @@ struct q6apm_dai_priv_data {
+ struct q6apm_lpass_dai_data {
+ 	struct q6apm_graph *graph[APM_PORT_MAX];
+ 	bool is_port_started[APM_PORT_MAX];
++	bool fullio_companion[APM_PORT_MAX];
+ 	struct audioreach_module_config module_config[APM_PORT_MAX];
+ 	struct q6apm_dai_priv_data priv[APM_PORT_MAX];
+ };
+@@ -192,6 +194,11 @@ static void q6apm_lpass_dai_shutdown(struct snd_pcm_substream *substream, struct
+ 	struct q6apm_lpass_dai_data *dai_data = dev_get_drvdata(dai->dev);
+ 	int rc;
+ 
++	if (dai_data->fullio_companion[dai->id]) {
++		dai_data->fullio_companion[dai->id] = false;
++		return;
++	}
++
+ 	if (dai_data->is_port_started[dai->id]) {
+ 		rc = q6apm_graph_stop(dai_data->graph[dai->id]);
+ 		dai_data->is_port_started[dai->id] = false;
+@@ -211,6 +218,9 @@ static int q6apm_lpass_dai_trigger(struct snd_pcm_substream *substream, int cmd,
+ 	struct q6apm_lpass_dai_data *dai_data = dev_get_drvdata(dai->dev);
+ 	int ret = 0;
+ 
++	if (dai_data->fullio_companion[dai->id])
++		return 0;
++
+ 	switch (cmd) {
+ 	case SNDRV_PCM_TRIGGER_START:
+ 	case SNDRV_PCM_TRIGGER_RESUME:
+@@ -230,6 +240,27 @@ static int q6apm_lpass_dai_trigger(struct snd_pcm_substream *substream, int cmd,
+ 	return ret;
+ }
+ 
++static int q6apm_lpass_companion_mode(struct snd_pcm_substream *substream,
++				    struct snd_soc_dai *dai)
++{
++	int owner, ret;
++
++	ret = q6apm_find_integrated_backend(dai->dev, dai->id, &owner);
++	if (ret == -ENOENT)
++		return 0;
++	if (ret)
++		return ret;
++	if (of_machine_is_compatible("microsoft,denali") &&
++	    substream->stream == SNDRV_PCM_STREAM_PLAYBACK &&
++	    (dai->id == WSA_CODEC_DMA_RX_0 || dai->id == WSA_CODEC_DMA_TX_0 ||
++	     dai->id == WSA_CODEC_DMA_TX_1) &&
++	    q6apm_is_graph_in_push_pull_mode_from_id(dai->dev, owner, substream->stream))
++		return 1;
++
++	return dev_err_probe(dai->dev, -EOPNOTSUPP,
++			     "unsupported integrated backend %d on graph %d\n", dai->id, owner);
++}
++
+ static int q6apm_lpass_dai_prepare(struct snd_pcm_substream *substream, struct snd_soc_dai *dai)
+ {
+ 	struct q6apm_lpass_dai_data *dai_data = dev_get_drvdata(dai->dev);
+@@ -238,6 +269,10 @@ static int q6apm_lpass_dai_prepare(struct snd_pcm_substream *substream, struct s
+ 	int graph_id = dai->id;
+ 	int rc;
+ 
++	/* The machine and codecs manage SoundWire; the FE owns DSP commands. */
++	if (dai_data->fullio_companion[dai->id])
++		return 0;
++
+ 	if (dai_data->is_port_started[dai->id]) {
+ 		q6apm_graph_stop(dai_data->graph[dai->id]);
+ 		dai_data->is_port_started[dai->id] = false;
+@@ -284,6 +319,14 @@ static int q6apm_lpass_dai_startup(struct snd_pcm_substream *substream, struct s
+ 	struct q6apm_lpass_dai_data *dai_data = dev_get_drvdata(dai->dev);
+ 	struct q6apm_graph *graph;
+ 	int graph_id = dai->id;
++	int ret;
++
++	ret = q6apm_lpass_companion_mode(substream, dai);
++	if (ret < 0)
++		return ret;
++	dai_data->fullio_companion[dai->id] = ret > 0;
++	if (ret > 0)
++		return 0;
+ 
+ 	if (substream->stream == SNDRV_PCM_STREAM_CAPTURE) {
+ 		graph = q6apm_graph_open(dai->dev, NULL, dai->dev, graph_id, substream->stream);
+diff --git a/sound/soc/qcom/qdsp6/q6apm.c b/sound/soc/qcom/qdsp6/q6apm.c
+index 4cb597d..071b73d 100644
+--- a/sound/soc/qcom/qdsp6/q6apm.c
++++ b/sound/soc/qcom/qdsp6/q6apm.c
+@@ -1,8 +1,12 @@
+ // SPDX-License-Identifier: GPL-2.0
+ // Copyright (c) 2020, Linaro Limited
+ 
++#include <crypto/sha2.h>
+ #include <dt-bindings/soc/qcom,gpr.h>
++#include <linux/cleanup.h>
+ #include <linux/delay.h>
++#include <linux/dma-mapping.h>
++#include <linux/unaligned.h>
+ #include <linux/jiffies.h>
+ #include <linux/kernel.h>
+ #include <linux/module.h>
+@@ -10,7 +14,10 @@
+ #include <linux/of_platform.h>
+ #include <linux/sched.h>
+ #include <linux/slab.h>
++#include <linux/sizes.h>
+ #include <linux/soc/qcom/apr.h>
++#include <linux/timekeeping.h>
++#include <linux/uaccess.h>
+ #include <linux/wait.h>
+ #include <sound/soc.h>
+ #include <sound/soc-dapm.h>
+@@ -18,6 +25,11 @@
+ #include "audioreach.h"
+ #include "q6apm.h"
+ 
++#define FULLIO_SOFT_PAUSE_IID		0x466b
++#define FULLIO_PULL_PERIOD_BYTES	1920U
++#define FULLIO_SOFT_PAUSE_COMPLETE	0x0800103f
++#define FULLIO_SOFT_RESUME_COMPLETE	0x08001043
++
+ /* Graph Management */
+ struct apm_graph_mgmt_cmd {
+ 	struct apm_module_param_data param_data;
+@@ -29,6 +41,111 @@ struct apm_graph_mgmt_cmd {
+ 
+ static struct q6apm *g_apm;
+ 
++void q6apm_fullio_set_transport(struct device *dev, enum q6apm_fullio_feedback path,
++			      bool enabled)
++{
++	struct q6apm *apm = dev_get_drvdata(dev->parent);
++	unsigned long flags;
++
++	if (!apm || (path != Q6APM_FULLIO_VI && path != Q6APM_FULLIO_CPS))
++		return;
++	spin_lock_irqsave(&apm->fullio_oob_lock, flags);
++	if (enabled) {
++		set_bit(path, &apm->fullio_transport);
++	} else {
++		clear_bit(path, &apm->fullio_transport);
++		if (apm->fullio_transport_epoch != U64_MAX)
++			apm->fullio_transport_epoch++;
++	}
++	spin_unlock_irqrestore(&apm->fullio_oob_lock, flags);
++}
++EXPORT_SYMBOL_GPL(q6apm_fullio_set_transport);
++
++bool q6apm_fullio_transport_enabled(struct q6apm *apm)
++{
++	unsigned long required = BIT(Q6APM_FULLIO_VI) | BIT(Q6APM_FULLIO_CPS);
++
++	return (READ_ONCE(apm->fullio_transport) & required) == required;
++}
++EXPORT_SYMBOL_GPL(q6apm_fullio_transport_enabled);
++
++static void q6apm_fullio_mute_invalidate_locked(struct q6apm_graph *graph)
++{
++	graph->fullio_mute_verified = false;
++	if (graph->fullio_mute_epoch != U64_MAX)
++		graph->fullio_mute_epoch++;
++}
++
++void q6apm_fullio_mute_invalidate(struct q6apm_graph *graph)
++{
++	unsigned long flags;
++
++	spin_lock_irqsave(&graph->apm->fullio_oob_lock, flags);
++	q6apm_fullio_mute_invalidate_locked(graph);
++	spin_unlock_irqrestore(&graph->apm->fullio_oob_lock, flags);
++}
++EXPORT_SYMBOL_GPL(q6apm_fullio_mute_invalidate);
++
++int q6apm_fullio_mute_begin(struct q6apm_graph *graph, struct q6apm_fullio_mute_ticket *ticket)
++{
++	struct q6apm *apm = graph->apm;
++	unsigned long flags;
++	int ret = 0;
++
++	spin_lock_irqsave(&apm->fullio_oob_lock, flags);
++	q6apm_fullio_mute_invalidate_locked(graph);
++	if (graph->fullio_mute_epoch == U64_MAX || apm->fullio_transport_epoch == U64_MAX)
++		ret = -EOVERFLOW;
++	else if (!q6apm_fullio_transport_enabled(apm))
++		ret = -EAGAIN;
++	else
++		*ticket = (struct q6apm_fullio_mute_ticket) {
++			.graph = graph,
++			.graph_epoch = graph->fullio_mute_epoch,
++			.transport_epoch = apm->fullio_transport_epoch,
++		};
++	spin_unlock_irqrestore(&apm->fullio_oob_lock, flags);
++	return ret;
++}
++EXPORT_SYMBOL_GPL(q6apm_fullio_mute_begin);
++
++/* Commit only after stereo readback, PA-off checks and successful unmap. */
++int q6apm_fullio_mute_commit(struct q6apm_graph *graph,
++			   const struct q6apm_fullio_mute_ticket *ticket)
++{
++	struct q6apm *apm = graph->apm;
++	unsigned long flags;
++	int ret = -ESTALE;
++
++	spin_lock_irqsave(&apm->fullio_oob_lock, flags);
++	if (ticket->graph == graph && ticket->graph_epoch == graph->fullio_mute_epoch &&
++	    ticket->transport_epoch == apm->fullio_transport_epoch &&
++	    q6apm_fullio_transport_enabled(apm)) {
++		graph->fullio_mute_verified = true;
++		graph->fullio_mute_transport_epoch = ticket->transport_epoch;
++		ret = 0;
++	}
++	spin_unlock_irqrestore(&apm->fullio_oob_lock, flags);
++	return ret;
++}
++EXPORT_SYMBOL_GPL(q6apm_fullio_mute_commit);
++
++/* Evidence only: callers must not treat this as protection clock permission. */
++bool q6apm_fullio_mute_is_verified(struct q6apm_graph *graph)
++{
++	struct q6apm *apm = graph->apm;
++	unsigned long flags;
++	bool verified;
++
++	spin_lock_irqsave(&apm->fullio_oob_lock, flags);
++	verified = graph->fullio_mute_verified &&
++		   graph->fullio_mute_transport_epoch == apm->fullio_transport_epoch &&
++		   q6apm_fullio_transport_enabled(apm);
++	spin_unlock_irqrestore(&apm->fullio_oob_lock, flags);
++	return verified;
++}
++EXPORT_SYMBOL_GPL(q6apm_fullio_mute_is_verified);
++
+ int q6apm_send_cmd_sync(struct q6apm *apm, struct gpr_pkt *pkt,
+ 			uint32_t rsp_opcode)
+ {
+@@ -40,25 +157,747 @@ int q6apm_send_cmd_sync(struct q6apm *apm, struct gpr_pkt *pkt,
+ 					NULL, &apm->wait, pkt, rsp_opcode);
+ }
+ 
++/* The ordinary APM map tokens use the graph ID and a position-buffer flag.
++ * Use a separate token namespace; late replies must never satisfy another map.
++ */
++#define Q6APM_FULLIO_OOB_TOKEN BIT(31)
++/* Keep the namespace across APM reprobe, but not across module reload. */
++static atomic_t fullio_oob_sequence = ATOMIC_INIT(0);
++
++static int q6apm_fullio_next_token(u32 *token)
++{
++	int sequence = atomic_read(&fullio_oob_sequence);
++
++	do {
++		if (sequence == INT_MAX)
++			return -EOVERFLOW;
++	} while (!atomic_try_cmpxchg(&fullio_oob_sequence, &sequence, sequence + 1));
++	*token = Q6APM_FULLIO_OOB_TOKEN | (u32)(sequence + 1);
++	return 0;
++}
++
++struct q6apm_fullio_get {
++	u32 instance;
++	u32 param;
++	size_t bytes;
++	void *data;
++};
++
++static int q6apm_fullio_readback(const struct gpr_resp_pkt *rsp,
++				const struct q6apm_fullio_get *get)
++{
++	const u8 *payload = rsp->payload;
++	size_t header = sizeof(u32) + APM_MODULE_PARAM_DATA_SIZE;
++
++	if (!get || !payload || rsp->payload_size < (int)sizeof(u32))
++		return -EPROTO;
++	if (get_unaligned_le32(payload))
++		return -EIO;
++	if (rsp->payload_size != sizeof(u32) + ALIGN(APM_MODULE_PARAM_DATA_SIZE + get->bytes, 8))
++		return -EPROTO;
++	if (get_unaligned_le32(payload + 4) != get->instance ||
++	    get_unaligned_le32(payload + 8) != get->param ||
++	    get_unaligned_le32(payload + 16))
++		return -EPROTO;
++	/* This VOL_CTRL reply retains the requested outer buffer size but
++	 * declares a compact 16-byte body. Do not parse its unused tail or
++	 * apply variable-size handling to the SP/SPVI readbacks.
++	 */
++	if (get->instance == 0x4a63 && get->param == 0x08001039 && get->bytes == 104 &&
++	    get_unaligned_le32(payload + 12) == 16) {
++		memcpy(get->data, payload + header, 16);
++		return 16;
++	}
++	if (get_unaligned_le32(payload + 12) != get->bytes)
++		return -EPROTO;
++	memcpy(get->data, payload + header, get->bytes);
++	return 0;
++}
++
++static bool q6apm_fullio_oob_reply(struct q6apm *apm, const struct gpr_resp_pkt *data)
++{
++	const struct gpr_ibasic_rsp_result_t *basic;
++	const struct apm_cmd_rsp_shared_mem_map_regions *map;
++	const struct gpr_hdr *hdr = &data->hdr;
++	unsigned long flags;
++	int status = -EPROTO;
++	u32 handle = 0;
++
++	if (!(hdr->token & Q6APM_FULLIO_OOB_TOKEN))
++		return false;
++
++	spin_lock_irqsave(&apm->fullio_oob_lock, flags);
++	if (hdr->token != apm->fullio_oob_token)
++		goto out;
++
++	if (hdr->opcode == APM_CMD_RSP_GET_CFG && apm->fullio_oob_op == APM_CMD_GET_CFG) {
++		status = q6apm_fullio_readback(data, apm->fullio_get);
++		/* Diagnose only the pinned mute query. Do not log parameter data
++		 * or change the protocol validation for any readback.
++		 */
++		if (status == -EPROTO && apm->fullio_get &&
++		    apm->fullio_get->instance == 0x4a63 &&
++		    apm->fullio_get->param == 0x08001039 && data->payload &&
++		    data->payload_size >= (int)(sizeof(u32) + APM_MODULE_PARAM_DATA_SIZE)) {
++			const u8 *p = data->payload;
++
++			dev_warn_ratelimited(&apm->gdev->dev,
++				"FullIO mute reply header: token=%#x bytes=%d status=%#x iid=%#x param=%#x size=%u param_status=%#x\n",
++				hdr->token, data->payload_size, get_unaligned_le32(p),
++				get_unaligned_le32(p + 4), get_unaligned_le32(p + 8),
++				get_unaligned_le32(p + 12), get_unaligned_le32(p + 16));
++		}
++	} else if (hdr->opcode == APM_CMD_RSP_SHARED_MEM_MAP_REGIONS &&
++	    apm->fullio_oob_op == APM_CMD_SHARED_MEM_MAP_REGIONS &&
++	    data->payload && data->payload_size >= (int)sizeof(*map)) {
++		map = data->payload;
++		handle = map->mem_map_handle;
++		if (handle)
++			status = 0;
++	} else if (hdr->opcode == GPR_BASIC_RSP_RESULT && data->payload &&
++		   data->payload_size >= (int)sizeof(*basic)) {
++		basic = data->payload;
++		if (basic->opcode != apm->fullio_oob_op)
++			goto out;
++		if (!basic->status && (apm->fullio_oob_op == APM_CMD_SHARED_MEM_MAP_REGIONS ||
++				       apm->fullio_oob_op == APM_CMD_GET_CFG))
++			goto out; /* Wait for the handle or readback, not just BASIC success. */
++		if (basic->status)
++			dev_err_ratelimited(&apm->gdev->dev,
++					    "FullIO command %#x rejected, DSP status %#x\n",
++					    basic->opcode, basic->status);
++		status = basic->status ? -EIO : 0;
++	}
++
++	apm->fullio_oob_status = status;
++	apm->fullio_oob_handle = handle;
++	apm->fullio_oob_token = 0;
++	complete(&apm->fullio_oob_done);
++out:
++	spin_unlock_irqrestore(&apm->fullio_oob_lock, flags);
++	return true;
++}
++
++static int q6apm_fullio_oob_rpc(struct q6apm *apm, gpr_port_t *port,
++			       struct gpr_pkt *pkt, u32 *handle, struct q6apm_fullio_get *get)
++{
++	gpr_device_t *gdev = apm->gdev;
++	unsigned long flags;
++	u32 token;
++	int ret;
++
++	/* Serialize against legacy APM commands, without using their reply slot. */
++	guard(mutex)(&apm->lock);
++	ret = q6apm_fullio_next_token(&token);
++	if (ret)
++		return ret;
++	pkt->hdr.token = token;
++	pkt->hdr.dest_domain = audioreach_gpr_dest_domain(gdev);
++	reinit_completion(&apm->fullio_oob_done);
++	spin_lock_irqsave(&apm->fullio_oob_lock, flags);
++	apm->fullio_oob_status = -ETIMEDOUT;
++	apm->fullio_oob_op = pkt->hdr.opcode;
++	apm->fullio_oob_token = pkt->hdr.token;
++	apm->fullio_get = get;
++	spin_unlock_irqrestore(&apm->fullio_oob_lock, flags);
++
++	ret = port ? gpr_send_port_pkt(port, pkt) : gpr_send_pkt(gdev, pkt);
++	if (ret >= 0 && !wait_for_completion_timeout(&apm->fullio_oob_done, 5 * HZ))
++		ret = -ETIMEDOUT;
++
++	spin_lock_irqsave(&apm->fullio_oob_lock, flags);
++	apm->fullio_oob_token = 0;
++	apm->fullio_get = NULL;
++	if (ret >= 0) {
++		ret = apm->fullio_oob_status;
++		if (!ret && handle)
++			*handle = apm->fullio_oob_handle;
++	}
++	spin_unlock_irqrestore(&apm->fullio_oob_lock, flags);
++	return ret;
++}
++
++static int q6apm_fullio_oob_map_region(struct q6apm *apm,
++				      struct q6apm_fullio_oob_region *region,
++				      unsigned int max_size, u32 property_flag)
++{
++	struct apm_cmd_shared_mem_map_regions *cmd;
++	struct apm_shared_map_region_payload *map;
++	int ret;
++
++	if (region->handle || region->poisoned || !region->size ||
++	    region->size > max_size || !IS_ALIGNED(region->size, SZ_4K) ||
++	    !IS_ALIGNED(region->dsp_addr, SZ_4K))
++		return -EINVAL;
++
++	struct gpr_pkt *pkt __free(kfree) =
++		audioreach_alloc_apm_cmd_pkt(sizeof(*cmd) + sizeof(*map),
++					    APM_CMD_SHARED_MEM_MAP_REGIONS, 0);
++	if (IS_ERR(pkt))
++		return PTR_ERR(pkt);
++
++	cmd = (void *)pkt + GPR_HDR_SIZE;
++	cmd->mem_pool_id = APM_MEMORY_MAP_SHMEM8_4K_POOL;
++	cmd->num_regions = 1;
++	cmd->property_flag = property_flag;
++	map = (void *)cmd + sizeof(*cmd);
++	map->shm_addr_lsw = lower_32_bits(region->dsp_addr);
++	map->shm_addr_msw = upper_32_bits(region->dsp_addr);
++	map->mem_size_bytes = region->size;
++
++	ret = q6apm_fullio_oob_rpc(apm, NULL, pkt, &region->handle, NULL);
++	if (ret)
++		region->poisoned = true;
++	return ret;
++}
++
++int q6apm_fullio_oob_map(struct q6apm *apm, struct q6apm_fullio_oob_region *region)
++{
++	return q6apm_fullio_oob_map_region(apm, region, SZ_64K, 0);
++}
++EXPORT_SYMBOL_GPL(q6apm_fullio_oob_map);
++
++int q6apm_fullio_oob_unmap(struct q6apm *apm, struct q6apm_fullio_oob_region *region)
++{
++	struct apm_cmd_shared_mem_unmap_regions *cmd;
++	int ret;
++
++	if (region->poisoned || !region->handle)
++		return -EINVAL;
++
++	struct gpr_pkt *pkt __free(kfree) =
++		audioreach_alloc_apm_cmd_pkt(sizeof(*cmd), APM_CMD_SHARED_MEM_UNMAP_REGIONS, 0);
++	if (IS_ERR(pkt))
++		return PTR_ERR(pkt);
++
++	cmd = (void *)pkt + GPR_HDR_SIZE;
++	cmd->mem_map_handle = region->handle;
++	ret = q6apm_fullio_oob_rpc(apm, NULL, pkt, NULL, NULL);
++	if (ret)
++		region->poisoned = true;
++	else
++		region->handle = 0;
++	return ret;
++}
++EXPORT_SYMBOL_GPL(q6apm_fullio_oob_unmap);
++
++enum q6apm_fullio_pull_state {
++	FULLIO_PULL_NEW,
++	FULLIO_PULL_RUNNING,
++	FULLIO_PULL_PAUSED,
++	FULLIO_PULL_UNCERTAIN,
++	FULLIO_PULL_STOPPED,
++	FULLIO_PULL_STOP_UNVERIFIED,
++};
++
++/* Neither ALSA nor devres owns this coherent allocation. Keep one slot
++ * across device reprobes, including an unresolved quarantine.
++ */
++struct q6apm_fullio_ring {
++	struct device *dev;
++	void *cpu;
++	dma_addr_t dma;
++	size_t bytes;
++	u32 config_bytes;
++	struct snd_dma_buffer pcm_buffer;
++	bool pcm_native;
++	int sid;
++	enum q6apm_fullio_pull_state state;
++	struct q6apm_fullio_oob_region data, pos;
++	void *gainstep_cpu;
++	dma_addr_t gainstep_dma;
++	struct q6apm_fullio_oob_region gainstep;
++};
++static atomic_t fullio_ring_claimed = ATOMIC_INIT(0);
++static struct q6apm_fullio_ring *fullio_ring_quarantine;
++
++static int __maybe_unused q6apm_fullio_ring_drop(struct q6apm *apm,
++						struct q6apm_fullio_ring **owner,
++						bool dsp_quiescent)
++{
++	struct q6apm_fullio_ring *ring = *owner;
++	int gainstep = 0, pos = 0, data = 0;
++
++	if (!ring)
++		return 0;
++	*owner = NULL;
++	if (dsp_quiescent) {
++		/* Independently clean up known mappings, in reverse order. */
++		if (ring->gainstep.handle && !ring->gainstep.poisoned)
++			gainstep = q6apm_fullio_oob_unmap(apm, &ring->gainstep);
++		if (ring->pos.handle && !ring->pos.poisoned)
++			pos = q6apm_fullio_oob_unmap(apm, &ring->pos);
++		if (ring->data.handle && !ring->data.poisoned)
++			data = q6apm_fullio_oob_unmap(apm, &ring->data);
++	}
++	if (!dsp_quiescent || gainstep || pos || data || ring->gainstep.poisoned ||
++	    ring->pos.poisoned || ring->data.poisoned || ring->gainstep.handle ||
++	    ring->pos.handle || ring->data.handle) {
++		WRITE_ONCE(fullio_ring_quarantine, ring);
++		dev_err(ring->dev, "FullIO PCM ring quarantined; no reuse or retry\n");
++		return -ENOTRECOVERABLE;
++	}
++
++	if (ring->gainstep_cpu)
++		dma_free_coherent(ring->dev, SZ_4K, ring->gainstep_cpu, ring->gainstep_dma);
++	dma_free_coherent(ring->dev, ring->bytes, ring->cpu, ring->dma);
++	put_device(ring->dev);
++	kfree(ring);
++	atomic_set(&fullio_ring_claimed, 0);
++	module_put(THIS_MODULE);
++	return 0;
++}
++
++static struct q6apm_fullio_ring *__maybe_unused
++q6apm_fullio_ring_alloc(struct q6apm *apm, struct device *dev, size_t bytes, int sid)
++{
++	struct q6apm_fullio_ring *ring;
++	u64 pos_addr, tag;
++	int ret, cleanup;
++
++	if (!of_machine_is_compatible("microsoft,denali") || !bytes || bytes > SZ_512K ||
++	    !IS_ALIGNED(bytes, SZ_4K) || sid < -1 || sid > 0xf)
++		return ERR_PTR(-EINVAL);
++	if (atomic_cmpxchg(&fullio_ring_claimed, 0, 1))
++		return ERR_PTR(-EBUSY);
++	if (!try_module_get(THIS_MODULE)) {
++		ret = -ENODEV;
++		goto release_claim;
++	}
++	ring = kzalloc_obj(*ring);
++	if (!ring) {
++		ret = -ENOMEM;
++		goto release_module;
++	}
++	ring->bytes = bytes + SZ_4K;
++	ring->sid = sid;
++	ring->dev = get_device(dev);
++	ring->cpu = dma_alloc_coherent(dev, ring->bytes, &ring->dma, GFP_KERNEL);
++	if (!ring->cpu) {
++		put_device(ring->dev);
++		kfree(ring);
++		ret = -ENOMEM;
++		goto release_module;
++	}
++	/* Preserve the fixed push/pull layout and the position mapping flag.
++	 * Reject a SID-tagged address that overlaps the address bits.
++	 */
++	ret = -ERANGE;
++	pos_addr = (u64)ring->dma + bytes;
++	if (pos_addr < (u64)ring->dma || (sid >= 0 && upper_32_bits(pos_addr)))
++		goto rollback;
++	tag = sid < 0 ? 0 : (u64)sid << 32;
++	ring->data.dsp_addr = (u64)ring->dma | tag;
++	ring->data.size = bytes;
++	ring->pos.dsp_addr = pos_addr | tag;
++	ring->pos.size = SZ_4K;
++	memset(ring->cpu, 0, ring->bytes);
++	dma_wmb();
++	ret = q6apm_fullio_oob_map_region(apm, &ring->data, SZ_512K, 0);
++	if (ret)
++		goto rollback;
++	ret = q6apm_fullio_oob_map_region(apm, &ring->pos, SZ_4K, 2);
++	if (!ret) {
++		if (ring->data.handle != ring->pos.handle)
++			return ring;
++		/* Two distinct regions cannot safely share an ambiguous handle. */
++		ring->data.poisoned = true;
++		ring->pos.poisoned = true;
++		ret = -EPROTO;
++	}
++rollback:
++	/* No graph has been given the backing yet. */
++	cleanup = q6apm_fullio_ring_drop(apm, &ring, true);
++	return ERR_PTR(cleanup ?: ret);
++release_module:
++	module_put(THIS_MODULE);
++release_claim:
++	atomic_set(&fullio_ring_claimed, 0);
++	return ERR_PTR(ret);
++}
++
++/* Attach only to the never-started audit graph under graph_lock. */
++static int q6apm_fullio_ring_attach(struct q6apm_graph *graph,
++				     struct q6apm_fullio_ring *ring, u32 config_bytes, bool direct)
++{
++	struct gpr_pkt *pkt __free(kfree) =
++		audioreach_alloc_push_pull_pkt(graph, ring->data.dsp_addr, ring->pos.dsp_addr,
++					      ring->data.handle, ring->pos.handle, config_bytes, direct);
++	int ret;
++
++	/* Any failed SET_CFG may still have reached the DSP. Bind the lifetime
++	 * to the last graph reference before sending and even on failure.
++	 */
++	ring->config_bytes = config_bytes;
++	smp_store_release(&graph->ar_graph->fullio_ring, ring);
++	if (IS_ERR(pkt))
++		return PTR_ERR(pkt);
++	ret = q6apm_fullio_oob_rpc(graph->apm, direct ? graph->port : NULL, pkt, NULL, NULL);
++	if (ret)
++		return ret;
++
++	ring->pcm_buffer.dev.type = SNDRV_DMA_TYPE_DEV;
++	ring->pcm_buffer.dev.dev = ring->dev;
++	ring->pcm_buffer.area = ring->cpu;
++	ring->pcm_buffer.addr = ring->dma;
++	smp_store_release(&ring->pcm_buffer.bytes, config_bytes);
++	return 0;
++}
++
++bool q6apm_fullio_reference_render(struct snd_soc_card *card)
++{
++	return card && of_machine_is_compatible("microsoft,denali") &&
++	       of_property_read_bool(card->dev->of_node, "microsoft,denali-fullio-reference-render") &&
++	       !of_property_read_bool(card->dev->of_node, "microsoft,denali-fullio-muted-test");
++}
++EXPORT_SYMBOL_GPL(q6apm_fullio_reference_render);
++
++int q6apm_fullio_pcm_configure(struct q6apm_graph *graph, struct snd_soc_card *card, int sid)
++{
++	struct q6apm_fullio_ring *ring;
++
++	if (!q6apm_fullio_reference_render(card) || graph->id || graph->shm_iid != 0x4660 ||
++	    !q6apm_is_graph_in_push_pull_mode(graph) || !audioreach_fullio_graph(graph->info))
++		return -EPERM;
++	guard(mutex)(&graph->apm->graph_lock);
++	if (graph->ar_graph->start_count || graph->ar_graph->fullio_ring)
++		return -EBUSY;
++	ring = q6apm_fullio_ring_alloc(graph->apm, graph->dev, SZ_512K, sid);
++	if (IS_ERR(ring))
++		return PTR_ERR(ring);
++	ring->pcm_native = true;
++	return q6apm_fullio_ring_attach(graph, ring, 2 * FULLIO_PULL_PERIOD_BYTES, true);
++}
++EXPORT_SYMBOL_GPL(q6apm_fullio_pcm_configure);
++
++/* Mapping-only or never-started attachment, selected by the fixture DT. */
++int q6apm_fullio_ring_map_audit(struct q6apm_graph *graph, struct snd_soc_card *card,
++			       size_t bytes, int sid, u32 config_bytes)
++{
++	static atomic_t attempted = ATOMIC_INIT(0);
++	struct device_node *node = card->dev->of_node;
++	bool attach = of_property_read_bool(node, "microsoft,denali-fullio-ring-attach-audit");
++	struct q6apm_fullio_ring *ring;
++	int ret;
++
++	if (!of_machine_is_compatible("microsoft,denali") ||
++	    !of_property_read_bool(node, "microsoft,denali-fullio-ring-map-audit") ||
++	    !of_property_read_bool(node, "microsoft,denali-fullio-muted-test") ||
++	    !of_property_read_bool(node, "microsoft,denali-fullio-clock-off-audit") ||
++	    (of_property_read_bool(node, "microsoft,denali-fullio-dsp-start-audit") !=
++	     of_property_read_bool(node, "microsoft,denali-fullio-ring-dma-audit")) ||
++	    of_property_read_bool(node, "microsoft,denali-fullio-post-pa-test"))
++		return -EPERM;
++	guard(mutex)(&graph->apm->graph_lock);
++	if (!graph->ar_graph || READ_ONCE(graph->ar_graph->start_count) ||
++	    !audioreach_fullio_graph(graph->info) || graph->ar_graph->fullio_ring)
++		return -EPERM;
++	if (attach && (!graph->info->is_push_pull_mode || !graph->shm_iid ||
++		       !config_bytes || config_bytes > bytes))
++		return -EPERM;
++	if (atomic_cmpxchg(&attempted, 0, 1))
++		return -EALREADY;
++
++	ring = q6apm_fullio_ring_alloc(graph->apm, graph->dev, bytes, sid);
++	if (IS_ERR(ring))
++		return dev_err_probe(graph->dev, PTR_ERR(ring), "FullIO isolated PCM ring MAP unverified\n");
++	if (attach) {
++		ret = q6apm_fullio_ring_attach(graph, ring, config_bytes,
++				of_property_read_bool(node, "microsoft,denali-fullio-ring-dma-audit") ||
++				of_property_read_bool(node, "microsoft,denali-fullio-sink-readback-audit"));
++		if (ret)
++			return dev_err_probe(graph->dev, ret, "FullIO attached ring SET_CFG unverified; waiting for CLOSE\n");
++		dev_info(graph->dev, "FullIO independent ring SET_CFG acknowledged; no START\n");
++		return 0;
++	}
++	ret = q6apm_fullio_ring_drop(graph->apm, &ring, true);
++	if (!ret)
++		dev_info(graph->dev, "FullIO isolated PCM data and position MAP/UNMAP acknowledged; never supplied to graph\n");
++	return ret;
++}
++EXPORT_SYMBOL_GPL(q6apm_fullio_ring_map_audit);
++
++/* One non-sleeping sample. The firmware writes zero, then index and time,
++ * then the next sequence. Do not use a transient index to report PCM progress.
++ * The caller holds the backing alive; no pointer escapes this function.
++ */
++static int q6apm_fullio_ring_cursor(const struct q6apm_fullio_ring *ring,
++				    u32 frame_bytes, u32 *sequence, u32 *offset)
++{
++	const __le32 *pos = ring->cpu + ring->data.size;
++	u32 seq, bytes;
++
++	seq = le32_to_cpu(READ_ONCE(pos[0]));
++	if (!seq)
++		return -EAGAIN;
++	dma_rmb();
++	bytes = le32_to_cpu(READ_ONCE(pos[1]));
++	dma_rmb();
++	if (seq != le32_to_cpu(READ_ONCE(pos[0])))
++		return -EAGAIN;
++	if (!frame_bytes || bytes >= ring->config_bytes || bytes % frame_bytes)
++		return -ERANGE;
++	*sequence = seq;
++	*offset = bytes;
++	return 0;
++}
++
++/* A borrowed sample-only view. ALSA never owns or frees the allocation;
++ * the FE must detach the view before dropping its graph reference.
++ */
++struct snd_dma_buffer *q6apm_fullio_pcm_buffer(struct q6apm_graph *graph, size_t bytes)
++{
++	struct q6apm_fullio_ring *ring = smp_load_acquire(&graph->ar_graph->fullio_ring);
++
++	if (!ring || !bytes || bytes != smp_load_acquire(&ring->pcm_buffer.bytes))
++		return NULL;
++	return &ring->pcm_buffer;
++}
++EXPORT_SYMBOL_GPL(q6apm_fullio_pcm_buffer);
++
++/* Nonblocking PCM accessor. The open PCM retains a graph reference, so
++ * the attached coherent allocation cannot be released during a sample.
++ */
++int q6apm_fullio_pcm_cursor(struct q6apm_graph *graph, u32 frame_bytes, u32 *offset)
++{
++	const struct q6apm_fullio_ring *ring;
++	u32 sequence;
++
++	ring = smp_load_acquire(&graph->ar_graph->fullio_ring);
++	if (!ring)
++		return -EAGAIN;
++	return q6apm_fullio_ring_cursor(ring, frame_bytes, &sequence, offset);
++}
++EXPORT_SYMBOL_GPL(q6apm_fullio_pcm_cursor);
++
++int q6apm_fullio_ring_position_audit(struct q6apm_graph *graph, bool started)
++{
++	struct q6apm_fullio_ring *ring = graph->ar_graph->fullio_ring;
++	const u32 frame_bytes = 2 * sizeof(__le16); /* Fixed stereo S16_LE audit. */
++	u32 previous = 0, previous_index = 0, index, seq;
++	int ret;
++
++	lockdep_assert_held(&graph->apm->graph_lock);
++	if (!ring || !ring->config_bytes ||
++	    ring->state != (started ? FULLIO_PULL_RUNNING : FULLIO_PULL_NEW))
++		return -EPERM;
++	if (!started) {
++		if (memchr_inv(ring->cpu + ring->data.size, 0, ring->pos.size) ||
++		    memchr_inv(ring->cpu, 0, ring->data.size))
++			return -EILSEQ;
++		dma_wmb();
++		return 0;
++	}
++	/* The publication sequence can advance with a stationary byte cursor.
++	 * Require movement within this bounded window as well. Zero sequence
++	 * marks an in-progress publication; an index of zero is valid.
++	 */
++	for (int i = 0; i < 8; i++) {
++		ret = q6apm_fullio_ring_cursor(ring, frame_bytes, &seq, &index);
++		if (ret && ret != -EAGAIN)
++			return ret;
++		if (!ret) {
++			/* Modular serial arithmetic distinguishes wrap from a reset.
++			 * A half-range jump cannot be produced in the audit window.
++			 */
++			if (previous && (seq - previous >= BIT(31) ||
++					 (seq == previous && index != previous_index)))
++				return -EILSEQ;
++			if (previous && seq != previous && index != previous_index) {
++				dev_info(graph->dev,
++					 "FullIO independent ring: DSP byte cursor advanced: seq=%u->%u bytes=%u->%u\n",
++					 previous, seq, previous_index, index);
++				return 0;
++			}
++			previous = seq;
++			previous_index = index;
++		}
++		if (i < 7)
++			usleep_range(3000, 4000);
++	}
++	return -ENODATA;
++}
++EXPORT_SYMBOL_GPL(q6apm_fullio_ring_position_audit);
++
++static int q6apm_fullio_validate_frames(const void *data, size_t bytes, bool single)
++{
++	const u8 *frame = data;
++	unsigned int count = 0;
++
++	if (!data || !bytes || bytes > SZ_16K)
++		return -EINVAL;
++	/* The v19c MFC command is a single 28-byte, unpadded payload.
++	 * Do not relax the alignment rule for other frames or OOB records.
++	 */
++	if (!IS_ALIGNED(bytes, 8)) {
++		if (!single || bytes != 28 || get_unaligned_le32(frame) != 0x466a ||
++		    get_unaligned_le32(frame + 4) != PARAM_ID_MFC_OUTPUT_MEDIA_FORMAT ||
++		    get_unaligned_le32(frame + 8) != 12 || get_unaligned_le32(frame + 12) ||
++		    get_unaligned_le32(frame + 16) != 48000 ||
++		    get_unaligned_le16(frame + 20) != 16 || get_unaligned_le16(frame + 22) != 2)
++			return -EINVAL;
++		return 0;
++	}
++	while (bytes) {
++		u32 size;
++		size_t step;
++
++		if (bytes < APM_MODULE_PARAM_DATA_SIZE ||
++		    !get_unaligned_le32(frame) || !get_unaligned_le32(frame + 4) ||
++		    get_unaligned_le32(frame + 12))
++			return -EINVAL;
++		size = get_unaligned_le32(frame + 8);
++		if (!size || size > bytes - APM_MODULE_PARAM_DATA_SIZE)
++			return -EINVAL;
++		step = ALIGN(APM_MODULE_PARAM_DATA_SIZE + (size_t)size, 8);
++		if (step > bytes)
++			return -EINVAL;
++		frame += step;
++		bytes -= step;
++		count++;
++	}
++	return single && count != 1 ? -EINVAL : 0;
++}
++
++static int q6apm_fullio_send_cfg_oob(struct q6apm *apm, gpr_port_t *port,
++				    struct q6apm_fullio_oob_region *region, void *buffer,
++				    const void *data, size_t bytes)
++{
++	struct apm_cmd_header *cmd;
++	int ret;
++
++	if (!buffer || !region->handle || region->poisoned || bytes > region->size)
++		return -EINVAL;
++	if (!q6apm_fullio_transport_enabled(apm))
++		return -EAGAIN;
++
++	struct gpr_pkt *pkt __free(kfree) = port ?
++		audioreach_alloc_cmd_pkt(0, APM_CMD_SET_CFG, 0, port->id,
++					APM_MODULE_INSTANCE_ID) :
++		audioreach_alloc_apm_cmd_pkt(0, APM_CMD_SET_CFG, 0);
++	if (IS_ERR(pkt))
++		return PTR_ERR(pkt);
++
++	cmd = (void *)pkt + GPR_HDR_SIZE;
++	cmd->payload_address_lsw = lower_32_bits(region->dsp_addr);
++	cmd->payload_address_msw = upper_32_bits(region->dsp_addr);
++	cmd->mem_map_handle = region->handle;
++	cmd->payload_size = bytes;
++
++	memset(buffer, 0, region->size);
++	memcpy(buffer, data, bytes);
++	dma_wmb();
++	ret = q6apm_fullio_oob_rpc(apm, port, pkt, NULL, NULL);
++	if (ret)
++		region->poisoned = true;
++	return ret;
++}
++
++int q6apm_fullio_set_cfg_oob(struct q6apm_graph *graph,
++			   struct q6apm_fullio_oob_region *region, void *buffer,
++			   const void *data, size_t bytes, bool use_graph_port)
++{
++	int ret;
++
++	if (!graph->ar_graph || (use_graph_port && !graph->port))
++		return -EINVAL;
++	ret = q6apm_fullio_validate_frames(data, bytes, false);
++	if (ret)
++		return ret;
++	return q6apm_fullio_send_cfg_oob(graph->apm, use_graph_port ? graph->port : NULL,
++					region, buffer, data, bytes);
++}
++EXPORT_SYMBOL_GPL(q6apm_fullio_set_cfg_oob);
++
++int q6apm_fullio_set_cfg_inband(struct q6apm_graph *graph, const void *data,
++			      size_t bytes)
++{
++	int ret;
++
++	if (!graph->ar_graph || !graph->port)
++		return -EINVAL;
++	ret = q6apm_fullio_validate_frames(data, bytes, true);
++	if (ret)
++		return ret;
++	if (!q6apm_fullio_transport_enabled(graph->apm))
++		return -EAGAIN;
++
++	struct gpr_pkt *pkt __free(kfree) =
++		audioreach_alloc_cmd_pkt(bytes, APM_CMD_SET_CFG, 0, graph->port->id,
++					get_unaligned_le32(data));
++	if (IS_ERR(pkt))
++		return PTR_ERR(pkt);
++
++	memcpy((void *)pkt + GPR_HDR_SIZE + APM_CMD_HDR_SIZE, data, bytes);
++	return q6apm_fullio_oob_rpc(graph->apm, graph->port, pkt, NULL, NULL);
++}
++EXPORT_SYMBOL_GPL(q6apm_fullio_set_cfg_inband);
++
++int q6apm_fullio_get_cfg(struct q6apm_graph *graph, u32 instance, u32 param,
++			void *data, size_t bytes)
++{
++	struct q6apm_fullio_get get = {
++		.instance = instance, .param = param, .bytes = bytes, .data = data,
++	};
++	struct apm_module_param_data *request;
++	size_t payload_size;
++
++	if (!graph->ar_graph || !graph->port || !data ||
++	    !((instance == 0x4027 && param == 0x080011e8 && bytes == 68) ||
++	      (instance == 0x4024 && param == 0x080011f6 && bytes == 44) ||
++	      (instance == 0x4157 && bytes == 12 &&
++	       (param == PARAM_ID_HW_EP_MF_CFG || param == PARAM_ID_CODEC_DMA_INTF_CFG)) ||
++	      (param == Q6APM_FULLIO_LOG_CFG && bytes == 12 &&
++	       (instance == 0x4003 || instance == 0x4025 || instance == 0x402a)) ||
++	      (instance == 0x4a63 && param == 0x08001039 && bytes == 104) ||
++	      (instance == 0x4a63 && param == 0x08001035 && bytes == 4)))
++		return -EINVAL;
++	if (!q6apm_fullio_transport_enabled(graph->apm))
++		return -EAGAIN;
++
++	payload_size = ALIGN(APM_MODULE_PARAM_DATA_SIZE + bytes, 8);
++	struct gpr_pkt *pkt __free(kfree) =
++		audioreach_alloc_cmd_pkt(payload_size, APM_CMD_GET_CFG, 0, graph->port->id,
++					instance);
++	if (IS_ERR(pkt))
++		return PTR_ERR(pkt);
++
++	request = (void *)pkt + GPR_HDR_SIZE + APM_CMD_HDR_SIZE;
++	request->module_instance_id = instance;
++	request->param_id = param;
++	request->param_size = bytes;
++	return q6apm_fullio_oob_rpc(graph->apm, graph->port, pkt, NULL, &get);
++}
++EXPORT_SYMBOL_GPL(q6apm_fullio_get_cfg);
++
++static bool q6apm_fullio_close_blocks_open(struct q6apm *apm, struct audioreach_graph_info *info)
++{
++	lockdep_assert_held(&apm->graph_lock);
++	return apm->fullio_close_failed && audioreach_fullio_graph(info);
++}
++
+ static struct audioreach_graph *q6apm_get_audioreach_graph(struct q6apm *apm, uint32_t graph_id)
+ {
+ 	struct audioreach_graph_info *info;
+ 	struct audioreach_graph *graph;
+-	int id;
++	int ret;
+ 
+-	mutex_lock(&apm->lock);
++	guard(mutex)(&apm->graph_lock);
+ 	graph = idr_find(&apm->graph_idr, graph_id);
+-	mutex_unlock(&apm->lock);
+-
+ 	if (graph) {
++		if (q6apm_fullio_close_blocks_open(apm, graph->info))
++			return ERR_PTR(-ENOTRECOVERABLE);
+ 		kref_get(&graph->refcount);
+ 		return graph;
+ 	}
+ 
++	mutex_lock(&apm->lock);
+ 	info = idr_find(&apm->graph_info_idr, graph_id);
+-
++	mutex_unlock(&apm->lock);
+ 	if (!info)
+ 		return ERR_PTR(-ENODEV);
++	if (q6apm_fullio_close_blocks_open(apm, info))
++		return ERR_PTR(-ENOTRECOVERABLE);
+ 
+ 	graph = kzalloc_obj(*graph);
+ 	if (!graph)
+@@ -67,34 +906,36 @@ static struct audioreach_graph *q6apm_get_audioreach_graph(struct q6apm *apm, ui
+ 	graph->apm = apm;
+ 	graph->info = info;
+ 	graph->id = graph_id;
+-
+ 	graph->graph = audioreach_alloc_graph_pkt(apm, info);
+ 	if (IS_ERR(graph->graph)) {
+-		void *err = graph->graph;
+-
+-		kfree(graph);
+-		return ERR_CAST(err);
++		ret = PTR_ERR(graph->graph);
++		goto free_graph;
+ 	}
+ 
+-	mutex_lock(&apm->lock);
+-	id = idr_alloc(&apm->graph_idr, graph, graph_id, graph_id + 1, GFP_KERNEL);
+-	if (id < 0) {
+-		dev_err(apm->dev, "Unable to allocate graph id (%d)\n", graph_id);
+-		kfree(graph->graph);
+-		kfree(graph);
+-		mutex_unlock(&apm->lock);
+-		return ERR_PTR(id);
++	/* Reserve the ID before sending. No other owner sees it while the
++	 * graph lock is held, including during the DSP acknowledgement.
++	 */
++	ret = idr_alloc(&apm->graph_idr, graph, graph_id, graph_id + 1, GFP_KERNEL);
++	if (ret < 0)
++		goto free_packet;
++
++	ret = q6apm_send_cmd_sync(apm, graph->graph, 0);
++	if (ret) {
++		idr_remove(&apm->graph_idr, graph_id);
++		goto free_packet;
+ 	}
+-	mutex_unlock(&apm->lock);
+-
+ 	kref_init(&graph->refcount);
+-
+-	q6apm_send_cmd_sync(apm, graph->graph, 0);
+-
+ 	return graph;
++
++free_packet:
++	kfree(graph->graph);
++free_graph:
++	kfree(graph);
++	return ERR_PTR(ret);
+ }
+ 
+-static int audioreach_graph_mgmt_cmd(struct audioreach_graph *graph, uint32_t opcode)
++static int audioreach_graph_mgmt_transaction(struct audioreach_graph *graph, u32 opcode,
++					     bool require_token)
+ {
+ 	struct audioreach_graph_info *info = graph->info;
+ 	int num_sub_graphs = info->num_sub_graphs;
+@@ -120,9 +961,16 @@ static int audioreach_graph_mgmt_cmd(struct audioreach_graph *graph, uint32_t op
+ 	list_for_each_entry(sg, &info->sg_list, node)
+ 		mgmt_cmd->sub_graph_id_list[i++] = sg->sub_graph_id;
+ 
++	if (require_token)
++		return q6apm_fullio_oob_rpc(apm, NULL, pkt, NULL, NULL);
+ 	return q6apm_send_cmd_sync(apm, pkt, 0);
+ }
+ 
++static int audioreach_graph_mgmt_cmd(struct audioreach_graph *graph, u32 opcode)
++{
++	return audioreach_graph_mgmt_transaction(graph, opcode, false);
++}
++
+ static void q6apm_put_audioreach_graph(struct kref *ref)
+ {
+ 	struct audioreach_graph *graph;
+@@ -130,18 +978,47 @@ static void q6apm_put_audioreach_graph(struct kref *ref)
+ 
+ 	graph = container_of(ref, struct audioreach_graph, refcount);
+ 	apm = graph->apm;
++	lockdep_assert_held(&apm->graph_lock);
+ 
+-	audioreach_graph_mgmt_cmd(graph, APM_CMD_GRAPH_CLOSE);
++	if (audioreach_fullio_graph(graph->info)) {
++		int ret = audioreach_graph_mgmt_transaction(graph, APM_CMD_GRAPH_CLOSE, true);
+ 
+-	mutex_lock(&apm->lock);
+-	graph = idr_remove(&apm->graph_idr, graph->id);
+-	mutex_unlock(&apm->lock);
++		if (ret) {
++			apm->fullio_close_failed = true;
++			dev_err(&apm->gdev->dev, "FullIO GRAPH_CLOSE unverified (%d); graph reopen blocked\n", ret);
++		} else {
++			dev_info(&apm->gdev->dev, "FullIO GRAPH_CLOSE acknowledged\n");
++		}
++		if (graph->fullio_ring) {
++			bool had_gainstep = graph->fullio_ring->gainstep_cpu;
++			int release = q6apm_fullio_ring_drop(apm, &graph->fullio_ring,
++							      !ret && !graph->start_count &&
++							      (graph->fullio_ring->state == FULLIO_PULL_NEW ||
++							       graph->fullio_ring->state == FULLIO_PULL_STOPPED));
++
++			if (release)
++				apm->fullio_close_failed = true;
++			else if (had_gainstep)
++				dev_info(&apm->gdev->dev, "FullIO render ring and GainStep page released after CLOSE and UNMAP ACKs\n");
++			else
++				dev_info(&apm->gdev->dev, "FullIO independent ring released after CLOSE and both UNMAP ACKs\n");
++		}
++	} else {
++		audioreach_graph_mgmt_cmd(graph, APM_CMD_GRAPH_CLOSE);
++	}
++	idr_remove(&apm->graph_idr, graph->id);
+ 
+ 	kfree(graph->graph);
+ 	kfree(graph);
+ }
+ 
+ 
++static void q6apm_release_audioreach_graph(struct audioreach_graph *graph)
++{
++	guard(mutex)(&graph->apm->graph_lock);
++	kref_put(&graph->refcount, q6apm_put_audioreach_graph);
++}
++
+ static int q6apm_get_apm_state(struct q6apm *apm)
+ {
+ 	struct gpr_pkt *pkt __free(kfree) = audioreach_alloc_apm_cmd_pkt(0,
+@@ -453,6 +1330,9 @@ int q6apm_graph_media_format_pcm(struct q6apm_graph *graph, struct audioreach_mo
+ 	struct audioreach_module *module;
+ 	int ret;
+ 
++	if (audioreach_fullio_graph(info))
++		return -EOPNOTSUPP;
++
+ 	list_for_each_entry(sgs, &info->sg_list, node) {
+ 		list_for_each_entry(container, &sgs->container_list, node) {
+ 			list_for_each_entry(module, &container->modules_list, node) {
+@@ -562,6 +1442,42 @@ int q6apm_get_hw_pointer(struct q6apm_graph *graph, int dir)
+ }
+ EXPORT_SYMBOL_GPL(q6apm_get_hw_pointer);
+ 
++static bool q6apm_fullio_soft_event(struct q6apm_graph *graph, const struct gpr_resp_pkt *data)
++{
++	const struct apm_module_event *event = data->payload;
++	u32 expected = READ_ONCE(graph->fullio_soft_event);
++
++	if (!expected || !event || data->payload_size != sizeof(*event) ||
++	    data->hdr.src_domain != GPR_DOMAIN_ID_ADSP || data->hdr.src_port != FULLIO_SOFT_PAUSE_IID ||
++	    data->hdr.dest_port != graph->port->id || event->event_payload_size ||
++	    event->event_id != expected)
++		return false;
++	if (cmpxchg(&graph->fullio_soft_event, expected, 0) != expected)
++		return false;
++	wake_up(&graph->cmd_wait);
++	return true;
++}
++
++/* In FullIO, only the registered pull module and its two configured levels
++ * can wake the PCM consumer. The body is one little-endian u32, not a cursor.
++ */
++static bool q6apm_fullio_pull_watermark(const struct q6apm_graph *graph,
++					 const struct gpr_resp_pkt *data)
++{
++	const struct apm_module_event *event = data->payload;
++	u32 level;
++
++	if (!event || data->payload_size < (int)(sizeof(*event) + sizeof(__le32)) ||
++	    data->hdr.src_domain != GPR_DOMAIN_ID_ADSP || graph->shm_iid != 0x4660 ||
++	    data->hdr.src_port != graph->shm_iid || data->hdr.dest_port != graph->port->id ||
++	    event->event_id != EVENT_ID_SH_MEM_PULL_PUSH_MODE_WATERMARK ||
++	    event->event_payload_size != sizeof(__le32))
++		return false;
++
++	level = get_unaligned_le32(event + 1);
++	return level == FULLIO_PULL_PERIOD_BYTES || level == 2 * FULLIO_PULL_PERIOD_BYTES;
++}
++
+ static int graph_callback(const struct gpr_resp_pkt *data, void *priv, int op)
+ {
+ 	struct data_cmd_rsp_rd_sh_mem_ep_data_buffer_done_v2 *rd_done;
+@@ -576,12 +1492,31 @@ static int graph_callback(const struct gpr_resp_pkt *data, void *priv, int op)
+ 	int token;
+ 
+ 	result = data->payload;
++	if (hdr->opcode == GPR_BASIC_RSP_RESULT) {
++		if (!result || data->payload_size < (int)sizeof(*result))
++			return -EINVAL;
++		/* Route only reserved FullIO control acknowledgements. */
++		if ((result->opcode == APM_CMD_SET_CFG || result->opcode == APM_CMD_GET_CFG ||
++		     result->opcode == APM_CMD_REGISTER_MODULE_EVENTS) &&
++		    q6apm_fullio_oob_reply(graph->apm, data))
++			return 0;
++	}
++
++	if (hdr->opcode == APM_CMD_RSP_GET_CFG && q6apm_fullio_oob_reply(graph->apm, data))
++		return 0;
+ 
+ 	switch (hdr->opcode) {
+ 	case APM_EVENT_MODULE_TO_CLIENT:
++		if (q6apm_fullio_soft_event(graph, data) || !graph->cb)
++			break;
+ 		event = data->payload;
++		if (!event || data->payload_size < (int)sizeof(*event))
++			return -EINVAL;
+ 		switch (event->event_id) {
+ 		case EVENT_ID_SH_MEM_PULL_PUSH_MODE_WATERMARK:
++			if (audioreach_fullio_graph(graph->info) &&
++			    !q6apm_fullio_pull_watermark(graph, data))
++				break;
+ 			client_event = APM_CLIENT_EVENT_WATERMARK_EVENT;
+ 			graph->cb(client_event, hdr->token, data->payload, graph->priv);
+ 			break;
+@@ -670,6 +1605,115 @@ static int graph_callback(const struct gpr_resp_pkt *data, void *priv, int op)
+ 	return 0;
+ }
+ 
++static int q6apm_fullio_register_event(struct q6apm_graph *graph, u32 iid, u32 event_id,
++				     const void *config, size_t config_size)
++{
++	struct apm_module_register_events *event;
++	size_t payload_size = ALIGN(sizeof(*event) + config_size, 8);
++	struct gpr_pkt *pkt __free(kfree) =
++		audioreach_alloc_cmd_pkt(payload_size, APM_CMD_REGISTER_MODULE_EVENTS, 0,
++				       graph->port->id, iid);
++
++	if (IS_ERR(pkt))
++		return PTR_ERR(pkt);
++
++	event = (void *)pkt + GPR_HDR_SIZE + APM_CMD_HDR_SIZE;
++	memset(event, 0, payload_size);
++	event->module_instance_id = iid;
++	event->event_id = event_id;
++	event->is_register = 1;
++	event->event_config_payload_size = config_size;
++	if (config_size)
++		memcpy(event + 1, config, config_size);
++
++	return q6apm_fullio_oob_rpc(graph->apm, graph->port, pkt, NULL, NULL);
++}
++
++int q6apm_fullio_register_pull_events(struct q6apm_graph *graph, u32 period_bytes)
++{
++	const struct audioreach_module *pause;
++	const struct q6apm_fullio_ring *ring = graph->ar_graph->fullio_ring;
++	const __le32 levels[] = { cpu_to_le32(2), cpu_to_le32(period_bytes),
++				 cpu_to_le32(2 * period_bytes) };
++	int ret;
++
++	if (!audioreach_fullio_graph(graph->info) || graph->shm_iid != 0x4660 ||
++	    !ring || period_bytes != FULLIO_PULL_PERIOD_BYTES || ring->config_bytes != 2 * period_bytes)
++		return -EINVAL;
++	pause = q6apm_find_module_by_mid(graph, 0x07001019);
++	if (!pause || pause->instance_id != FULLIO_SOFT_PAUSE_IID)
++		return -EINVAL;
++
++	ret = q6apm_fullio_register_event(graph, graph->shm_iid,
++					 EVENT_ID_SH_MEM_PULL_PUSH_MODE_WATERMARK,
++					 levels, sizeof(levels));
++	if (ret)
++		return ret;
++	ret = q6apm_fullio_register_event(graph, pause->instance_id, FULLIO_SOFT_PAUSE_COMPLETE, NULL, 0);
++	if (ret)
++		return ret;
++	return q6apm_fullio_register_event(graph, pause->instance_id, FULLIO_SOFT_RESUME_COMPLETE, NULL, 0);
++}
++EXPORT_SYMBOL_GPL(q6apm_fullio_register_pull_events);
++
++static int q6apm_fullio_soft_transition(struct q6apm_graph *graph, bool pause)
++{
++	struct q6apm_fullio_ring *ring = graph->ar_graph->fullio_ring;
++	struct gpr_pkt *pkt __free(kfree) = NULL;
++	struct apm_module_param_data *param;
++	int ret;
++
++	lockdep_assert_held(&graph->apm->graph_lock);
++	if (!ring || ring->state != (pause ? FULLIO_PULL_RUNNING : FULLIO_PULL_PAUSED))
++		return -EPERM;
++
++	pkt = audioreach_alloc_cmd_pkt(APM_MODULE_PARAM_DATA_SIZE, APM_CMD_SET_CFG, 0,
++				       graph->port->id, FULLIO_SOFT_PAUSE_IID);
++	if (IS_ERR(pkt))
++		return PTR_ERR(pkt);
++	param = (void *)pkt + GPR_HDR_SIZE + APM_CMD_HDR_SIZE;
++	*param = (struct apm_module_param_data) {
++		.module_instance_id = FULLIO_SOFT_PAUSE_IID,
++		.param_id = pause ? 0x0800102e : 0x0800102f,
++	};
++	/* Events have no request token. Arm before send for event-before-ACK,
++	 * and never reuse the same event or retry an ambiguous transaction.
++	 */
++	ring->state = FULLIO_PULL_UNCERTAIN;
++	WRITE_ONCE(graph->fullio_soft_event, pause ? FULLIO_SOFT_PAUSE_COMPLETE : FULLIO_SOFT_RESUME_COMPLETE);
++	ret = q6apm_fullio_oob_rpc(graph->apm, graph->port, pkt, NULL, NULL);
++	if (!ret && !wait_event_timeout(graph->cmd_wait, !READ_ONCE(graph->fullio_soft_event),
++				       msecs_to_jiffies(50)))
++		ret = -ETIMEDOUT;
++	WRITE_ONCE(graph->fullio_soft_event, 0);
++	if (ret)
++		return dev_err_probe(graph->dev, ret, "FullIO soft-%s unverified\n", pause ? "pause" : "resume");
++	ring->state = pause ? FULLIO_PULL_PAUSED : FULLIO_PULL_RUNNING;
++	dev_info(graph->dev, "FullIO soft-%s command and completion verified\n", pause ? "pause" : "resume");
++	return 0;
++}
++
++int q6apm_fullio_soft_cycle_audit(struct q6apm_graph *graph)
++{
++	const struct q6apm_fullio_ring *ring = graph->ar_graph->fullio_ring;
++	struct audioreach_module *pause;
++	int ret;
++
++	lockdep_assert_held(&graph->apm->graph_lock);
++	if (!ring || ring->state != FULLIO_PULL_RUNNING || graph->cb ||
++	    graph->fullio_soft_cycle_attempted || !q6apm_fullio_mute_is_verified(graph))
++		return -EPERM;
++	pause = q6apm_find_module_by_mid(graph, 0x07001019);
++	if (!pause || pause->instance_id != FULLIO_SOFT_PAUSE_IID)
++		return -EINVAL;
++	graph->fullio_soft_cycle_attempted = true;
++	ret = q6apm_fullio_soft_transition(graph, true);
++	if (ret || !q6apm_fullio_mute_is_verified(graph))
++		return ret ?: -ESTALE;
++	return q6apm_fullio_soft_transition(graph, false);
++}
++EXPORT_SYMBOL_GPL(q6apm_fullio_soft_cycle_audit);
++
+ int q6apm_register_watermark_event(struct q6apm_graph *graph, int water_mark_level_bytes,
+ 				   int num_levels)
+ {
+@@ -682,8 +1726,14 @@ int q6apm_push_pull_config(struct q6apm_graph *graph, phys_addr_t bphys,
+ {
+ 	struct audioreach_graph_info *info = graph->info;
+ 
+-	return audioreach_setup_push_pull(graph, bphys, pphys, info->mem_map_handle,
+-					  info->pos_buf_mem_map_handle, size);
++	u32 data_handle = READ_ONCE(info->mem_map_handle);
++	u32 pos_handle = READ_ONCE(info->pos_buf_mem_map_handle);
++
++	/* Presence is necessary, but does not prove current DSP ownership. */
++	if (audioreach_fullio_graph(info) && (!data_handle || !pos_handle))
++		return -ENODATA;
++
++	return audioreach_setup_push_pull(graph, bphys, pphys, data_handle, pos_handle, size);
+ }
+ EXPORT_SYMBOL_GPL(q6apm_push_pull_config);
+ 
+@@ -724,6 +1774,44 @@ static int q6apm_graph_get_module_iid(struct q6apm_graph *graph, uint32_t mid)
+ 	return module->instance_id;
+ }
+ 
++/* The topology declares which FE owns a physical backend. A return value
++ * separate from the graph ID matters: graph 0 is valid.
++ */
++int q6apm_find_integrated_backend(struct device *dev, u32 backend, int *owner)
++{
++	struct q6apm *apm = dev_get_drvdata(dev->parent);
++	struct audioreach_graph_info *info;
++	struct audioreach_sub_graph *sg;
++	struct audioreach_container *container;
++	struct audioreach_module *module;
++	int id, graph = -ENOENT;
++
++	if (!apm)
++		return -ENODEV;
++	mutex_lock(&apm->lock);
++	idr_for_each_entry(&apm->graph_info_idr, info, id) {
++		list_for_each_entry(sg, &info->sg_list, node) {
++			list_for_each_entry(container, &sg->container_list, node) {
++				list_for_each_entry(module, &container->modules_list, node) {
++					if (!backend || module->integrated_backend_id != backend)
++						continue;
++					if (graph >= 0 && graph != id) {
++						mutex_unlock(&apm->lock);
++						return -EEXIST;
++					}
++					graph = id;
++				}
++			}
++		}
++	}
++	mutex_unlock(&apm->lock);
++	if (graph < 0)
++		return graph;
++	*owner = graph;
++	return 0;
++}
++EXPORT_SYMBOL_GPL(q6apm_find_integrated_backend);
++
+ struct q6apm_graph *q6apm_graph_open(struct device *dev, q6apm_cb cb,
+ 				     void *priv, int graph_id, int dir)
+ {
+@@ -784,7 +1872,7 @@ struct q6apm_graph *q6apm_graph_open(struct device *dev, q6apm_cb cb,
+ free_graph:
+ 	kfree(graph);
+ put_ar_graph:
+-	kref_put(&ar_graph->refcount, q6apm_put_audioreach_graph);
++	q6apm_release_audioreach_graph(ar_graph);
+ 	return ERR_PTR(ret);
+ }
+ EXPORT_SYMBOL_GPL(q6apm_graph_open);
+@@ -793,9 +1881,13 @@ int q6apm_graph_close(struct q6apm_graph *graph)
+ {
+ 	struct audioreach_graph *ar_graph = graph->ar_graph;
+ 
+-	graph->ar_graph = NULL;
+-	kref_put(&ar_graph->refcount, q6apm_put_audioreach_graph);
++	q6apm_fullio_mute_invalidate(graph);
++	/* CLOSE and ring release use the APM service port. First retire this
++	 * PCM port and drain its callbacks while their graph state still lives.
++	 */
+ 	gpr_free_port(graph->port);
++	graph->ar_graph = NULL;
++	q6apm_release_audioreach_graph(ar_graph);
+ 	kfree(graph);
+ 
+ 	return 0;
+@@ -808,11 +1900,145 @@ int q6apm_graph_prepare(struct q6apm_graph *graph)
+ }
+ EXPORT_SYMBOL_GPL(q6apm_graph_prepare);
+ 
++/* Start the producer once, with the graph muted and no endpoint owner
++ * published. PCM START does not repeat the DSP transaction.
++ */
++int q6apm_fullio_pcm_start(struct q6apm_graph *graph)
++{
++	struct audioreach_graph *ar = graph->ar_graph;
++	struct q6apm_fullio_ring *ring;
++	int ret;
++
++	guard(mutex)(&graph->apm->graph_lock);
++	ring = ar->fullio_ring;
++	if (!ring || !ring->pcm_native || graph->id || !audioreach_fullio_graph(graph->info) ||
++	    !q6apm_fullio_mute_is_verified(graph))
++		return -EPERM;
++	if (ring->state == FULLIO_PULL_RUNNING)
++		return READ_ONCE(ar->start_count) ? 0 : -ENOTRECOVERABLE;
++	if (ring->state != FULLIO_PULL_NEW || !ring->pcm_buffer.bytes || ar->start_count)
++		return -ENOTRECOVERABLE;
++	ring->state = FULLIO_PULL_UNCERTAIN;
++	ret = audioreach_graph_mgmt_transaction(ar, APM_CMD_GRAPH_START, true);
++	if (ret)
++		return ret;
++	/* The endpoint controls and CLOSE proof track this owner count. */
++	WRITE_ONCE(ar->start_count, 1);
++	ring->state = FULLIO_PULL_RUNNING;
++	return q6apm_fullio_mute_is_verified(graph) ? 0 : -ESTALE;
++}
++EXPORT_SYMBOL_GPL(q6apm_fullio_pcm_start);
++
++int q6apm_fullio_pcm_stop(struct q6apm_graph *graph)
++{
++	struct audioreach_graph *ar = graph->ar_graph;
++	struct q6apm_fullio_ring *ring;
++	int ret;
++
++	guard(mutex)(&graph->apm->graph_lock);
++	q6apm_fullio_mute_invalidate(graph);
++	ring = ar->fullio_ring;
++	if (!ring || ring->state == FULLIO_PULL_NEW || ring->state == FULLIO_PULL_STOPPED)
++		return 0;
++	if (!ring->pcm_native || ring->state == FULLIO_PULL_STOP_UNVERIFIED)
++		return -ENOTRECOVERABLE;
++	ring->state = FULLIO_PULL_STOP_UNVERIFIED;
++	ret = audioreach_graph_mgmt_transaction(ar, APM_CMD_GRAPH_STOP, true);
++	if (!ret) {
++		ring->state = FULLIO_PULL_STOPPED;
++		WRITE_ONCE(ar->start_count, 0);
++	}
++	return ret;
++}
++EXPORT_SYMBOL_GPL(q6apm_fullio_pcm_stop);
++
++/* One diagnostic transaction per APM lifetime. Never use this to leave
++ * a graph running or to vouch for valid feedback or analogue silence.
++ */
++int q6apm_fullio_audit_start_stop(struct q6apm_graph *graph, struct snd_soc_card *card,
++				 int (*verify)(void *ctx, bool started), void *ctx,
++				 int *stop_error)
++{
++	struct device_node *node = card->dev->of_node;
++	struct audioreach_graph *ar = graph->ar_graph;
++	struct q6apm *apm = graph->apm;
++	u64 start_ack_ns = 0, stop_begin_ns;
++	int ret, stop;
++
++	*stop_error = 0;
++	if (!verify || !of_machine_is_compatible("microsoft,denali") ||
++	    !of_property_read_bool(node, "microsoft,denali-fullio-muted-test") ||
++	    !of_property_read_bool(node, "microsoft,denali-fullio-clock-off-audit") ||
++	    !of_property_read_bool(node, "microsoft,denali-fullio-dsp-prepare-audit") ||
++	    !of_property_read_bool(node, "microsoft,denali-fullio-dsp-start-audit") ||
++	    of_property_read_bool(node, "microsoft,denali-fullio-post-pa-test"))
++		return -EPERM;
++	guard(mutex)(&apm->graph_lock);
++	if (!ar || READ_ONCE(ar->start_count) || !audioreach_fullio_graph(ar->info) ||
++	    !q6apm_fullio_mute_is_verified(graph))
++		return -EPERM;
++	if (apm->fullio_start_audit_attempted)
++		return -EALREADY;
++	if (!!ar->fullio_ring != of_property_read_bool(node, "microsoft,denali-fullio-ring-dma-audit") ||
++	    (ar->fullio_ring && ar->fullio_ring->state != FULLIO_PULL_NEW))
++		return -EPERM;
++	ret = verify(ctx, false);
++	if (ret || !q6apm_fullio_mute_is_verified(graph))
++		return ret ?: -ESTALE;
++
++	apm->fullio_start_audit_attempted = true;
++	if (ar->fullio_ring)
++		ar->fullio_ring->state = FULLIO_PULL_UNCERTAIN;
++	ret = audioreach_graph_mgmt_transaction(ar, APM_CMD_GRAPH_START, true);
++	if (!ret) {
++		if (ar->fullio_ring)
++			ar->fullio_ring->state = FULLIO_PULL_RUNNING;
++		start_ack_ns = ktime_get_ns();
++		ret = verify(ctx, true);
++		if (!ret && !q6apm_fullio_mute_is_verified(graph))
++			ret = -ESTALE;
++		if (!ret && of_property_read_bool(node,
++						  "microsoft,denali-fullio-dsp-stop-fault-audit")) {
++			dev_info(graph->dev,
++				 "FullIO injected post-START verification failure; PAs and clocks off\n");
++			ret = -ECANCELED;
++		}
++	}
++	q6apm_fullio_mute_invalidate(graph);
++	/* A START timeout can leave DSP execution uncertain. Attempt STOP
++	 * whenever START was attempted, even if verification or START failed.
++	 */
++	stop_begin_ns = ktime_get_ns();
++	if (ar->fullio_ring)
++		ar->fullio_ring->state = FULLIO_PULL_UNCERTAIN;
++	stop = audioreach_graph_mgmt_transaction(ar, APM_CMD_GRAPH_STOP, true);
++	*stop_error = stop;
++	if (!stop && ar->fullio_ring) {
++		ar->fullio_ring->state = FULLIO_PULL_STOPPED;
++		dev_info(graph->dev, "FullIO independent ring GRAPH_STOP acknowledged\n");
++	}
++	if (of_property_read_bool(node, "microsoft,denali-fullio-immediate-taps-audit"))
++		dev_info(graph->dev,
++			 "FullIO tap host window: start_ack_ns=%llu stop_begin_ns=%llu verify=%d stop=%d\n",
++			 start_ack_ns, stop_begin_ns, ret, stop);
++	if (stop)
++		return dev_err_probe(graph->dev, stop, "FullIO audit GRAPH_STOP unverified; no retry\n");
++	if (ret)
++		return dev_err_probe(graph->dev, ret, "FullIO start audit failed; GRAPH_STOP acknowledged\n");
++	dev_info(graph->dev, "FullIO silent START/STOP audit passed; no PA enable or PCM writes\n");
++	return 0;
++}
++EXPORT_SYMBOL_GPL(q6apm_fullio_audit_start_stop);
++
+ int q6apm_graph_start(struct q6apm_graph *graph)
+ {
+ 	struct audioreach_graph *ar_graph = graph->ar_graph;
+ 	int ret;
+ 
++	/* No FullIO start until protection and recorded sample liveness are proven. */
++	if (audioreach_fullio_graph(ar_graph->info))
++		return -EOPNOTSUPP;
++
+ 	if (ar_graph->start_count == 0) {
+ 		ret = audioreach_graph_mgmt_cmd(ar_graph, APM_CMD_GRAPH_START);
+ 		if (ret)
+@@ -829,6 +2055,7 @@ int q6apm_graph_stop(struct q6apm_graph *graph)
+ {
+ 	struct audioreach_graph *ar_graph = graph->ar_graph;
+ 
++	q6apm_fullio_mute_invalidate(graph);
+ 	if (ar_graph->start_count == 0)
+ 		return 0;
+ 
+@@ -841,13 +2068,435 @@ EXPORT_SYMBOL_GPL(q6apm_graph_stop);
+ 
+ int q6apm_graph_flush(struct q6apm_graph *graph)
+ {
++	q6apm_fullio_mute_invalidate(graph);
+ 	return audioreach_graph_mgmt_cmd(graph->ar_graph, APM_CMD_GRAPH_FLUSH);
+ }
+ EXPORT_SYMBOL_GPL(q6apm_graph_flush);
+ 
++/* FullIO v19c renders through the fixed graph 0. Never open a graph on
++ * behalf of a mixer transaction. graph_lock preserves owner and mapping.
++ */
++static struct audioreach_graph *q6apm_fullio_running_render(struct q6apm *apm)
++{
++	struct audioreach_graph *graph;
++
++	lockdep_assert_held(&apm->graph_lock);
++	graph = idr_find(&apm->graph_idr, 0);
++	if (!graph || !audioreach_fullio_graph(graph->info) || !graph->start_count)
++		return ERR_PTR(-EAGAIN);
++	if (apm->fullio_close_failed || !q6apm_fullio_transport_enabled(apm))
++		return ERR_PTR(-ENOTRECOVERABLE);
++	return graph;
++}
++
++static int q6apm_fullio_endpoint_put(struct snd_kcontrol *kcontrol, struct gpr_pkt *packet)
++{
++	struct gpr_pkt *pkt __free(kfree) = packet;
++	struct snd_soc_component *component = snd_kcontrol_chip(kcontrol);
++	struct q6apm *apm = dev_get_drvdata(component->dev);
++	struct audioreach_graph *graph;
++
++	if (IS_ERR(pkt))
++		return PTR_ERR(pkt);
++
++	guard(mutex)(&apm->graph_lock);
++	graph = q6apm_fullio_running_render(apm);
++	if (IS_ERR(graph))
++		return PTR_ERR(graph);
++	return q6apm_fullio_oob_rpc(apm, NULL, pkt, NULL, NULL);
++}
++
++#define FULLIO_ENDPOINT_TLV_HEADER_BYTES (2 * sizeof(u32))
++#define FULLIO_GAINSTEP_SMALL_BYTES 216
++#define FULLIO_GAINSTEP_LARGE_BYTES 272
++#define FULLIO_ENDPOINT_GAIN_BYTES (2 * sizeof(__le32))
++
++static int q6apm_fullio_copy_endpoint_tlv(const unsigned int __user *tlv,
++					 unsigned int size, void *payload, size_t bytes)
++{
++	u32 header[2];
++
++	if (size != sizeof(header) + bytes)
++		return -EINVAL;
++	if (copy_from_user(header, tlv, sizeof(header)))
++		return -EFAULT;
++	/* ASoC clamps size to the control maximum before reaching us. */
++	if (header[0] || header[1] != bytes)
++		return -EINVAL;
++	if (copy_from_user(payload, tlv + ARRAY_SIZE(header), bytes))
++		return -EFAULT;
++	return 0;
++}
++
++static int q6apm_fullio_volume_only_put(struct snd_kcontrol *kcontrol,
++				       const unsigned int __user *bytes, unsigned int size)
++{
++	__le32 gain[2];
++	int ret;
++
++	ret = q6apm_fullio_copy_endpoint_tlv(bytes, size, gain, sizeof(gain));
++	if (ret)
++		return ret;
++	return q6apm_fullio_endpoint_put(kcontrol,
++		audioreach_alloc_fullio_final_volume(le32_to_cpu(gain[0]), le32_to_cpu(gain[1])));
++}
++
++static int q6apm_fullio_endpoint_mute_put(struct snd_kcontrol *kcontrol,
++					 const unsigned int __user *bytes, unsigned int size)
++{
++	__le32 mute;
++	int ret;
++
++	ret = q6apm_fullio_copy_endpoint_tlv(bytes, size, &mute, sizeof(mute));
++	if (ret)
++		return ret;
++	if (le32_to_cpu(mute) > 1)
++		return -EINVAL;
++	return q6apm_fullio_endpoint_put(kcontrol, audioreach_alloc_fullio_final_mute(le32_to_cpu(mute)));
++}
++
++static int q6apm_fullio_validate_gainstep(const u8 *delta, size_t bytes)
++{
++	/* serialized_sha256 for steps 1–30 in the pinned v19c runtime inventory. */
++	static const u8 allowed[][SHA256_DIGEST_SIZE] = {
++		{
++			0xe5, 0x9e, 0xff, 0x5f, 0x8b, 0xb9, 0xb6, 0xd2,
++			0x0c, 0x18, 0x15, 0xbe, 0xf2, 0x89, 0x51, 0x04,
++			0xac, 0xf3, 0x2f, 0x5a, 0x1c, 0xf6, 0x54, 0x06,
++			0xe8, 0xfb, 0x4e, 0x3d, 0x09, 0xc1, 0x58, 0x0c,
++		},
++		{
++			0x4c, 0x9a, 0x1c, 0x5d, 0x2b, 0xbb, 0xeb, 0x54,
++			0x9f, 0xcc, 0xb9, 0x60, 0x16, 0xbc, 0xf3, 0x81,
++			0x52, 0x2b, 0x98, 0x09, 0x50, 0x90, 0x04, 0x07,
++			0xd8, 0x57, 0x14, 0x24, 0x76, 0x47, 0x82, 0x34,
++		},
++		{
++			0x9b, 0x2d, 0xfc, 0x98, 0x82, 0x0e, 0x80, 0xbc,
++			0x44, 0x59, 0x48, 0xca, 0x43, 0xce, 0xcd, 0xb7,
++			0xc8, 0xbf, 0x76, 0x0f, 0xd3, 0x3e, 0x70, 0x4c,
++			0x5f, 0xd0, 0xfb, 0x1f, 0x96, 0x11, 0x8e, 0xa2,
++		},
++		{
++			0x99, 0x99, 0xd8, 0x3f, 0x47, 0x40, 0xe0, 0x4b,
++			0x22, 0x3c, 0xae, 0x0d, 0x48, 0x87, 0x65, 0x29,
++			0x81, 0x63, 0x64, 0x96, 0x61, 0x08, 0x3b, 0x41,
++			0xbb, 0xbb, 0x5a, 0x1a, 0x22, 0x15, 0x4c, 0x88,
++		},
++		{
++			0xb1, 0x33, 0x5d, 0xaa, 0xf5, 0x56, 0xe5, 0x00,
++			0x75, 0xaf, 0x59, 0xa8, 0xdb, 0xab, 0xe7, 0xa3,
++			0xc8, 0xb3, 0x24, 0xb0, 0x02, 0xdf, 0xa3, 0x12,
++			0xa9, 0x26, 0x95, 0x7f, 0x02, 0x08, 0x25, 0x92,
++		},
++		{
++			0xbe, 0xaf, 0xba, 0x01, 0xdd, 0x99, 0x5c, 0x10,
++			0xd6, 0x0a, 0xdc, 0xa7, 0xea, 0xb9, 0x87, 0x16,
++			0x4e, 0x87, 0x39, 0xb1, 0x06, 0x5e, 0xd0, 0x67,
++			0xa4, 0x91, 0xb3, 0x36, 0x69, 0x81, 0xad, 0x18,
++		},
++		{
++			0xad, 0x38, 0x08, 0xb3, 0x3b, 0x6b, 0x22, 0x49,
++			0xb0, 0x19, 0x9c, 0x25, 0xd2, 0x51, 0xab, 0x88,
++			0x14, 0xc0, 0x61, 0xcc, 0xa8, 0x7e, 0x70, 0xd8,
++			0xc8, 0x09, 0x97, 0xa5, 0x5e, 0x7e, 0x28, 0xda,
++		},
++		{
++			0xdf, 0xe8, 0x3e, 0x17, 0x52, 0x97, 0xa6, 0xe9,
++			0x4e, 0x18, 0xd4, 0x4a, 0xe2, 0xe6, 0xab, 0xc3,
++			0xb8, 0x59, 0xef, 0x89, 0x50, 0x26, 0x18, 0xd0,
++			0xe1, 0xb8, 0x95, 0x41, 0x9e, 0xb8, 0xbf, 0x98,
++		},
++		{
++			0x56, 0x96, 0xbe, 0xab, 0x59, 0xcf, 0xab, 0xf1,
++			0xdd, 0xfc, 0xd7, 0x17, 0x78, 0xa4, 0x1c, 0xb1,
++			0x7a, 0x63, 0x4e, 0xd0, 0xae, 0x55, 0xa6, 0x78,
++			0x2e, 0xca, 0x3c, 0x3e, 0x27, 0xc2, 0x73, 0x0e,
++		},
++		{
++			0x7a, 0x92, 0x3d, 0xd2, 0xc5, 0x82, 0xc3, 0x9e,
++			0xb0, 0x87, 0xed, 0xa4, 0x41, 0xe4, 0x72, 0x52,
++			0xe5, 0xce, 0xec, 0x81, 0xc7, 0x05, 0x87, 0x73,
++			0x5e, 0x86, 0xd0, 0x02, 0x28, 0xee, 0xf2, 0xab,
++		},
++		{
++			0x30, 0xfb, 0x11, 0x0f, 0x86, 0x2f, 0xe7, 0x99,
++			0x8d, 0xad, 0xcb, 0x36, 0x2f, 0x79, 0xb9, 0x51,
++			0x4c, 0xdb, 0x9b, 0x8d, 0x33, 0x2e, 0x21, 0x06,
++			0x35, 0x2b, 0x75, 0x5f, 0x33, 0x47, 0xc2, 0x19,
++		},
++		{
++			0x64, 0xcf, 0x85, 0xd9, 0x1a, 0xaa, 0x6c, 0xff,
++			0xa1, 0x4b, 0xc9, 0xe1, 0x78, 0x7a, 0x5e, 0xfb,
++			0xc0, 0xdc, 0xf5, 0x21, 0xc0, 0x2c, 0x8d, 0xce,
++			0x90, 0xa0, 0xb0, 0x2e, 0x1b, 0x85, 0xdd, 0x96,
++		},
++		{
++			0x00, 0xb4, 0x00, 0x33, 0xba, 0x28, 0x5e, 0x44,
++			0x44, 0xa1, 0x30, 0x54, 0x70, 0x0f, 0xa6, 0x03,
++			0x03, 0x31, 0xa1, 0x13, 0xaf, 0x42, 0x86, 0xd7,
++			0xc2, 0xef, 0x36, 0x3d, 0xcc, 0xc0, 0x5d, 0xd3,
++		},
++		{
++			0x44, 0xd5, 0xf6, 0xa8, 0x66, 0xf4, 0xcd, 0x45,
++			0x87, 0xa2, 0x48, 0x10, 0x60, 0x4f, 0x41, 0x44,
++			0xdf, 0x04, 0x77, 0xad, 0xbb, 0xa2, 0xf2, 0x37,
++			0x8f, 0x42, 0xef, 0x4d, 0xd0, 0xc9, 0x38, 0x2e,
++		},
++		{
++			0x3b, 0x0e, 0xb9, 0xf9, 0xbd, 0xd6, 0x20, 0xb2,
++			0x26, 0xb7, 0xc9, 0x31, 0x41, 0x37, 0xff, 0xb2,
++			0xbd, 0x7a, 0x69, 0xda, 0x71, 0xa3, 0xc3, 0x50,
++			0x7a, 0xdd, 0x3d, 0x35, 0x47, 0xc7, 0x78, 0x00,
++		},
++		{
++			0x3d, 0x38, 0x12, 0xbe, 0xec, 0x86, 0xf3, 0x48,
++			0xd7, 0xe4, 0x21, 0x3e, 0xec, 0x83, 0x21, 0xa8,
++			0xcc, 0x9d, 0xce, 0x35, 0x41, 0x55, 0x7a, 0x0a,
++			0xae, 0xe4, 0xec, 0x81, 0x9f, 0x0d, 0xa6, 0x87,
++		},
++		{
++			0xfd, 0x30, 0xd4, 0x8d, 0xe9, 0x5c, 0x87, 0x5e,
++			0x21, 0x78, 0x9d, 0x7e, 0xf4, 0x39, 0x07, 0x65,
++			0x3b, 0x09, 0x14, 0x1d, 0xeb, 0x6c, 0x9e, 0x21,
++			0xf9, 0xcd, 0x4f, 0x23, 0x8d, 0x1b, 0xc1, 0x19,
++		},
++		{
++			0xe3, 0x3f, 0x00, 0x13, 0xa8, 0xfa, 0x07, 0x2f,
++			0x90, 0x84, 0x11, 0xbc, 0x5a, 0x43, 0xb4, 0xef,
++			0x12, 0xf3, 0x91, 0x5d, 0xca, 0xa2, 0x65, 0x1c,
++			0x10, 0x31, 0x4f, 0x7d, 0xb6, 0x1c, 0x5d, 0x17,
++		},
++		{
++			0x5e, 0x38, 0x00, 0x6f, 0xa9, 0x1d, 0xab, 0xab,
++			0x5a, 0x20, 0xa1, 0x85, 0xf0, 0x7e, 0x5c, 0x56,
++			0x66, 0x03, 0x7d, 0xa0, 0xdc, 0x92, 0x8c, 0xc5,
++			0xa8, 0xda, 0xa8, 0xc4, 0x7d, 0x5d, 0x34, 0x3f,
++		},
++		{
++			0x0b, 0xf2, 0x78, 0xf9, 0xb5, 0xa7, 0x26, 0x99,
++			0xff, 0x51, 0xc4, 0x37, 0x48, 0x2a, 0x4a, 0x5e,
++			0x80, 0x0c, 0xba, 0xc8, 0x49, 0xfd, 0x56, 0xe7,
++			0x11, 0x78, 0x0e, 0xd2, 0xa9, 0x89, 0x98, 0x1c,
++		},
++		{
++			0x98, 0x23, 0x21, 0xf0, 0xf7, 0xb9, 0xb5, 0xf1,
++			0xd4, 0x8d, 0x4b, 0x40, 0x1f, 0x4f, 0xb6, 0x9f,
++			0x36, 0x2b, 0x1d, 0x18, 0x14, 0xaf, 0x42, 0x30,
++			0xb3, 0x02, 0x99, 0x7e, 0x74, 0x62, 0xb6, 0x54,
++		},
++		{
++			0x80, 0x8b, 0x31, 0xd3, 0xf8, 0x8c, 0x92, 0xad,
++			0xb5, 0xd5, 0x34, 0x1d, 0x6d, 0x9e, 0x73, 0xce,
++			0xe4, 0x75, 0x5b, 0xa3, 0x31, 0x9d, 0xfe, 0x2f,
++			0x4d, 0xb2, 0xa2, 0xc0, 0x14, 0x3c, 0x5f, 0xb5,
++		},
++		{
++			0x25, 0x3d, 0x90, 0x78, 0xf0, 0x54, 0xa7, 0xdd,
++			0xed, 0x7a, 0x3b, 0x73, 0xf3, 0xe4, 0xda, 0xa5,
++			0x9e, 0x34, 0x34, 0xf7, 0x72, 0x26, 0xc4, 0x6d,
++			0x8e, 0x63, 0x7b, 0x65, 0xd6, 0xd9, 0x66, 0x8e,
++		},
++		{
++			0xec, 0xbf, 0xb8, 0x22, 0x2a, 0x78, 0x1d, 0x0d,
++			0x9e, 0xba, 0x0d, 0x00, 0xda, 0x5e, 0x84, 0x32,
++			0x51, 0xdc, 0x30, 0xf3, 0x73, 0x94, 0xdc, 0x22,
++			0x71, 0x5d, 0x34, 0x41, 0xa0, 0x45, 0x65, 0x4d,
++		},
++		{
++			0x40, 0xfb, 0xcf, 0x93, 0x1a, 0x91, 0xc2, 0x21,
++			0x56, 0x32, 0x99, 0xdb, 0xe3, 0x53, 0xf7, 0x94,
++			0x62, 0x92, 0xc6, 0x02, 0xb0, 0x05, 0x61, 0x77,
++			0x3e, 0x16, 0xb2, 0xab, 0x8c, 0x64, 0x54, 0x21,
++		},
++		{
++			0x33, 0xbb, 0x1a, 0x08, 0xb3, 0x4c, 0xa9, 0xfb,
++			0x85, 0x6f, 0x4d, 0x9b, 0x50, 0x6d, 0xf4, 0xfa,
++			0xac, 0x83, 0x2c, 0x8b, 0xda, 0xaf, 0xe9, 0x5f,
++			0x5e, 0xa6, 0xfc, 0x8a, 0x09, 0x13, 0x3c, 0x94,
++		},
++		{
++			0x89, 0x6b, 0xfa, 0xa1, 0xfe, 0x94, 0xc8, 0xbd,
++			0x82, 0xb7, 0x0c, 0x9b, 0xd0, 0x86, 0x58, 0xe6,
++			0xc6, 0x0c, 0x41, 0x7e, 0x5d, 0x80, 0xe2, 0x1c,
++			0x30, 0x8e, 0x15, 0xa6, 0x87, 0xe5, 0x30, 0x96,
++		},
++		{
++			0x13, 0xd6, 0x79, 0x99, 0xef, 0xfe, 0xe2, 0xf8,
++			0x29, 0x32, 0x03, 0xef, 0x6a, 0xb9, 0x31, 0xdf,
++			0x05, 0x4a, 0xa1, 0x73, 0x05, 0xe9, 0xea, 0xf3,
++			0x0c, 0x14, 0x53, 0x84, 0xe0, 0xfd, 0x5d, 0x1a,
++		},
++		{
++			0xc4, 0x94, 0x60, 0x6f, 0x57, 0x14, 0xee, 0x79,
++			0xc4, 0x4a, 0x21, 0x4e, 0xcd, 0x31, 0x3f, 0xec,
++			0x1f, 0xb2, 0x80, 0x87, 0x4d, 0x80, 0xc6, 0x8f,
++			0x4e, 0x5a, 0x44, 0x9b, 0x24, 0x6d, 0x73, 0xe9,
++		},
++		{
++			0xf2, 0x66, 0xb6, 0x01, 0xb8, 0xa0, 0x26, 0xe8,
++			0xdf, 0xef, 0xe6, 0x31, 0x39, 0xc6, 0xba, 0xa6,
++			0x16, 0xc7, 0x98, 0x98, 0x65, 0xd9, 0x76, 0x1b,
++			0xb9, 0x11, 0x16, 0xb0, 0x06, 0x0a, 0xcd, 0xe5,
++		},
++	};
++	u8 digest[SHA256_DIGEST_SIZE];
++	unsigned int i;
++
++	if (bytes != FULLIO_GAINSTEP_SMALL_BYTES && bytes != FULLIO_GAINSTEP_LARGE_BYTES)
++		return -EINVAL;
++
++	/* Shape alone would permit arbitrary filter coefficients. The packaged
++	 * v19c synchronizer sends one of these exact CKV deltas.
++	 */
++	sha256(delta, bytes, digest);
++	for (i = 0; i < ARRAY_SIZE(allowed); i++)
++		if (!memcmp(digest, allowed[i], sizeof(digest)))
++			return 0;
++	return -EINVAL;
++}
++
++static int q6apm_fullio_map_gainstep(struct q6apm *apm, struct q6apm_fullio_ring *ring)
++{
++	struct q6apm_fullio_oob_region *region = &ring->gainstep;
++	int ret;
++
++	lockdep_assert_held(&apm->graph_lock);
++	if (region->poisoned)
++		return -ENOTRECOVERABLE;
++	if (region->handle)
++		return 0;
++
++	ring->gainstep_cpu = dma_alloc_coherent(ring->dev, SZ_4K, &ring->gainstep_dma, GFP_KERNEL);
++	if (!ring->gainstep_cpu)
++		return -ENOMEM;
++	ret = -ERANGE;
++	if (ring->sid >= 0 && upper_32_bits(ring->gainstep_dma))
++		goto free_page;
++
++	region->dsp_addr = (u64)ring->gainstep_dma | (ring->sid < 0 ? 0 : (u64)ring->sid << 32);
++	region->size = SZ_4K;
++	ret = q6apm_fullio_oob_map(apm, region);
++	if (!ret) {
++		if (region->handle != ring->data.handle && region->handle != ring->pos.handle)
++			return 0;
++		/* An aliased handle cannot be retired on either owner's behalf. */
++		region->poisoned = true;
++		if (region->handle == ring->data.handle)
++			ring->data.poisoned = true;
++		if (region->handle == ring->pos.handle)
++			ring->pos.poisoned = true;
++		return -EPROTO;
++	}
++	if (region->poisoned)
++		return ret;
++
++free_page:
++	dma_free_coherent(ring->dev, SZ_4K, ring->gainstep_cpu, ring->gainstep_dma);
++	ring->gainstep_cpu = NULL;
++	return ret;
++}
++
++static int q6apm_fullio_volume_transaction_put(struct snd_kcontrol *kcontrol,
++						const unsigned int __user *bytes, unsigned int size)
++{
++	u8 payload[FULLIO_ENDPOINT_GAIN_BYTES + FULLIO_GAINSTEP_LARGE_BYTES];
++	const size_t overhead = FULLIO_ENDPOINT_TLV_HEADER_BYTES + FULLIO_ENDPOINT_GAIN_BYTES;
++	const u8 *delta = payload + FULLIO_ENDPOINT_GAIN_BYTES;
++	struct snd_soc_component *component = snd_kcontrol_chip(kcontrol);
++	struct q6apm *apm = dev_get_drvdata(component->dev);
++	struct audioreach_graph *graph;
++	struct q6apm_fullio_ring *ring;
++	size_t delta_bytes;
++	unsigned long flags;
++	u64 epoch;
++	int ret;
++
++	if (size != overhead + FULLIO_GAINSTEP_SMALL_BYTES &&
++	    size != overhead + FULLIO_GAINSTEP_LARGE_BYTES)
++		return -EINVAL;
++	delta_bytes = size - overhead;
++	ret = q6apm_fullio_copy_endpoint_tlv(bytes, size, payload, size - FULLIO_ENDPOINT_TLV_HEADER_BYTES);
++	if (ret)
++		return ret;
++	ret = q6apm_fullio_validate_gainstep(delta, delta_bytes);
++	if (ret)
++		return ret;
++
++	struct gpr_pkt *gain __free(kfree) =
++		audioreach_alloc_fullio_final_volume(get_unaligned_le32(payload),
++						   get_unaligned_le32(payload + sizeof(__le32)));
++	if (IS_ERR(gain))
++		return PTR_ERR(gain);
++
++	guard(mutex)(&apm->graph_lock);
++	graph = q6apm_fullio_running_render(apm);
++	if (IS_ERR(graph))
++		return PTR_ERR(graph);
++	ring = graph->fullio_ring;
++	if (!ring)
++		return -EAGAIN;
++
++	ret = q6apm_fullio_map_gainstep(apm, ring);
++	if (ret)
++		return ret;
++
++	spin_lock_irqsave(&apm->fullio_oob_lock, flags);
++	epoch = apm->fullio_transport_epoch;
++	ret = q6apm_fullio_transport_enabled(apm) ? 0 : -ESTALE;
++	spin_unlock_irqrestore(&apm->fullio_oob_lock, flags);
++	if (ret)
++		return ret;
++
++	/* Windows sends final VOL_CTRL first, then the four-frame OOB delta. */
++	ret = q6apm_fullio_oob_rpc(apm, NULL, gain, NULL, NULL);
++	if (ret)
++		return ret;
++	spin_lock_irqsave(&apm->fullio_oob_lock, flags);
++	if (apm->fullio_transport_epoch != epoch || !q6apm_fullio_transport_enabled(apm))
++		ret = -ESTALE;
++	spin_unlock_irqrestore(&apm->fullio_oob_lock, flags);
++	if (ret)
++		return ret;
++
++	ret = q6apm_fullio_send_cfg_oob(apm, NULL, &ring->gainstep, ring->gainstep_cpu,
++					delta, delta_bytes);
++	spin_lock_irqsave(&apm->fullio_oob_lock, flags);
++	if (!ret && (apm->fullio_transport_epoch != epoch || !q6apm_fullio_transport_enabled(apm)))
++		ret = -ESTALE;
++	spin_unlock_irqrestore(&apm->fullio_oob_lock, flags);
++	return ret;
++}
++
++static const struct snd_kcontrol_new q6apm_fullio_endpoint_controls[] = {
++	SND_SOC_BYTES_TLV("SP11 Windows Volume Transaction", FULLIO_ENDPOINT_TLV_HEADER_BYTES +
++			  FULLIO_ENDPOINT_GAIN_BYTES + FULLIO_GAINSTEP_LARGE_BYTES,
++			  NULL, q6apm_fullio_volume_transaction_put),
++	SND_SOC_BYTES_TLV("SP11 Windows Volume Only", FULLIO_ENDPOINT_TLV_HEADER_BYTES + FULLIO_ENDPOINT_GAIN_BYTES,
++			  NULL, q6apm_fullio_volume_only_put),
++	SND_SOC_BYTES_TLV("SP11 Windows Endpoint Mute", FULLIO_ENDPOINT_TLV_HEADER_BYTES + sizeof(u32),
++			  NULL, q6apm_fullio_endpoint_mute_put),
++};
++
+ static int q6apm_audio_probe(struct snd_soc_component *component)
+ {
+-	return audioreach_tplg_init(component);
++	struct q6apm *apm = dev_get_drvdata(component->dev);
++	struct audioreach_graph_info *info;
++	int ret = audioreach_tplg_init(component);
++
++	if (ret || !of_machine_is_compatible("microsoft,denali") ||
++	    of_property_read_bool(component->card->dev->of_node, "microsoft,denali-fullio-muted-test"))
++		return ret;
++
++	info = idr_find(&apm->graph_info_idr, 0);
++	if (!info || !audioreach_fullio_graph(info))
++		return 0;
++
++	ret = snd_soc_add_component_controls(component, q6apm_fullio_endpoint_controls,
++					     ARRAY_SIZE(q6apm_fullio_endpoint_controls));
++	if (ret)
++		snd_soc_tplg_component_remove(component);
++	return ret;
+ }
+ 
+ static void q6apm_audio_remove(struct snd_soc_component *component)
+@@ -891,6 +2540,9 @@ static int apm_probe(gpr_device_t *gdev)
+ 		return -ENOMEM;
+ 
+ 	mutex_init(&apm->lock);
++	mutex_init(&apm->graph_lock);
++	spin_lock_init(&apm->fullio_oob_lock);
++	init_completion(&apm->fullio_oob_done);
+ 	apm->dev = dev;
+ 	apm->gdev = gdev;
+ 	init_waitqueue_head(&apm->wait);
+@@ -948,7 +2600,7 @@ static int apm_callback(const struct gpr_resp_pkt *data, void *priv, int op)
+ 	const struct gpr_hdr *hdr = &data->hdr;
+ 	int graph_id, is_pos_buf;
+ 
+-	if (!apm)
++	if (!apm || q6apm_fullio_oob_reply(apm, data))
+ 		return 0;
+ 
+ 	result = data->payload;
+diff --git a/sound/soc/qcom/qdsp6/q6apm.h b/sound/soc/qcom/qdsp6/q6apm.h
+index 9092359..36b5063 100644
+--- a/sound/soc/qcom/qdsp6/q6apm.h
++++ b/sound/soc/qcom/qdsp6/q6apm.h
+@@ -3,6 +3,8 @@
+ #define __Q6APM_H__
+ #include <linux/types.h>
+ #include <linux/atomic.h>
++#include <linux/completion.h>
++#include <linux/spinlock.h>
+ #include <linux/slab.h>
+ #include <linux/wait.h>
+ #include <linux/kernel.h>
+@@ -63,6 +65,23 @@ struct q6apm {
+ 	uint32_t state;
+ 
+ 	struct list_head widget_list;
++	/* Serializes DSP graph open, publication and final close. */
++	struct mutex graph_lock;
++	unsigned long fullio_transport;
++	u64 fullio_transport_epoch; /* Protected by fullio_oob_lock. */
++	bool fullio_start_audit_attempted; /* Protected by graph_lock. */
++	bool fullio_close_failed; /* Protected by graph_lock; sticky. */
++	/* Dedicated, token-matched OOB mapping acknowledgement. */
++	spinlock_t fullio_oob_lock;
++	struct completion fullio_oob_done;
++	u32 fullio_oob_token;
++	u32 fullio_oob_op;
++	u32 fullio_oob_handle;
++	int fullio_oob_status;
++	struct q6apm_fullio_get *fullio_get;
++	/* One owner per DSP; a quarantined buffer keeps this slot claimed. */
++	atomic_t fullio_oob_claimed;
++	struct q6apm_fullio_cal_buffer *fullio_oob_quarantine;
+ 	struct idr graph_idr;
+ 	struct idr graph_info_idr;
+ 	struct idr sub_graphs_idr;
+@@ -91,6 +110,7 @@ struct audioreach_graph {
+ 	void *graph;
+ 	struct kref refcount;
+ 	struct q6apm *apm;
++	struct q6apm_fullio_ring *fullio_ring; /* Last graph reference owns it. */
+ };
+ 
+ typedef void (*q6apm_cb) (uint32_t opcode, uint32_t token,
+@@ -107,17 +127,83 @@ struct q6apm_graph {
+ 	struct audioreach_graph_data tx_data;
+ 	struct gpr_ibasic_rsp_result_t result;
+ 	wait_queue_head_t cmd_wait;
++	u32 fullio_soft_event;
++	bool fullio_soft_cycle_attempted;
+ 	struct mutex lock;
+ 	struct audioreach_graph *ar_graph;
+ 	struct audioreach_graph_info *info;
++	/* Mute evidence is local to this open graph; fullio_oob_lock protects it. */
++	u64 fullio_mute_epoch;
++	u64 fullio_mute_transport_epoch;
++	bool fullio_mute_verified;
+ };
+ 
++struct q6apm_fullio_mute_ticket {
++	const struct q6apm_graph *graph;
++	u64 graph_epoch;
++	u64 transport_epoch;
++};
++
++void q6apm_fullio_mute_invalidate(struct q6apm_graph *graph);
++int q6apm_fullio_mute_begin(struct q6apm_graph *graph, struct q6apm_fullio_mute_ticket *ticket);
++int q6apm_fullio_mute_commit(struct q6apm_graph *graph,
++			   const struct q6apm_fullio_mute_ticket *ticket);
++bool q6apm_fullio_mute_is_verified(struct q6apm_graph *graph);
++
+ /* Graph Operations */
++enum q6apm_fullio_feedback {
++	Q6APM_FULLIO_VI,
++	Q6APM_FULLIO_CPS,
++};
++
++/* Status is transport-enabled, not proof of valid samples or calibration. */
++void q6apm_fullio_set_transport(struct device *dev, enum q6apm_fullio_feedback path,
++			      bool enabled);
++bool q6apm_fullio_transport_enabled(struct q6apm *apm);
++
++/* The caller serializes access and owns the DMA allocation. A poisoned
++ * region stays pinned and untouched until the owning DSP has been reset.
++ */
++struct q6apm_fullio_oob_region {
++	u64 dsp_addr;
++	size_t size;
++	u32 handle;
++	bool poisoned;
++};
++int q6apm_fullio_oob_map(struct q6apm *apm, struct q6apm_fullio_oob_region *region);
++int q6apm_fullio_oob_unmap(struct q6apm *apm, struct q6apm_fullio_oob_region *region);
++int q6apm_fullio_ring_map_audit(struct q6apm_graph *graph, struct snd_soc_card *card,
++			       size_t bytes, int sid, u32 config_bytes);
++bool q6apm_fullio_reference_render(struct snd_soc_card *card);
++int q6apm_fullio_pcm_configure(struct q6apm_graph *graph, struct snd_soc_card *card, int sid);
++int q6apm_fullio_pcm_start(struct q6apm_graph *graph);
++int q6apm_fullio_pcm_stop(struct q6apm_graph *graph);
++struct snd_dma_buffer *q6apm_fullio_pcm_buffer(struct q6apm_graph *graph, size_t bytes);
++int q6apm_fullio_pcm_cursor(struct q6apm_graph *graph, u32 frame_bytes, u32 *offset);
++int q6apm_fullio_ring_position_audit(struct q6apm_graph *graph, bool started);
++int q6apm_fullio_register_pull_events(struct q6apm_graph *graph, u32 period_bytes);
++int q6apm_fullio_soft_cycle_audit(struct q6apm_graph *graph);
++/* For validated calibration only. These functions do not authorize playback. */
++int q6apm_fullio_set_cfg_oob(struct q6apm_graph *graph,
++			   struct q6apm_fullio_oob_region *region, void *buffer,
++			   const void *data, size_t bytes, bool use_graph_port);
++int q6apm_fullio_set_cfg_inband(struct q6apm_graph *graph, const void *data,
++			      size_t bytes);
++#define Q6APM_FULLIO_LOG_CFG 0x08001031
++int q6apm_fullio_get_cfg(struct q6apm_graph *graph, u32 instance, u32 param,
++			void *data, size_t bytes);
++
++int q6apm_find_integrated_backend(struct device *dev, u32 backend, int *owner);
+ struct q6apm_graph *q6apm_graph_open(struct device *dev, q6apm_cb cb,
+ 				     void *priv, int graph_id, int dir);
+ int q6apm_graph_close(struct q6apm_graph *graph);
+ int q6apm_graph_prepare(struct q6apm_graph *graph);
++struct gpr_pkt *audioreach_alloc_fullio_final_volume(u32 left, u32 right);
++struct gpr_pkt *audioreach_alloc_fullio_final_mute(bool mute);
+ int q6apm_graph_start(struct q6apm_graph *graph);
++int q6apm_fullio_audit_start_stop(struct q6apm_graph *graph, struct snd_soc_card *card,
++				 int (*verify)(void *ctx, bool started), void *ctx,
++				 int *stop_error);
+ int q6apm_graph_stop(struct q6apm_graph *graph);
+ int q6apm_graph_flush(struct q6apm_graph *graph);
+ 
+diff --git a/sound/soc/qcom/qdsp6/q6dsp-lpass-ports.c b/sound/soc/qcom/qdsp6/q6dsp-lpass-ports.c
+index f422346..efede4d 100644
+--- a/sound/soc/qcom/qdsp6/q6dsp-lpass-ports.c
++++ b/sound/soc/qcom/qdsp6/q6dsp-lpass-ports.c
+@@ -79,6 +79,33 @@
+ 		.id = did,						\
+ 	}
+ 
++#define Q6AFE_CDC_DMA_FEEDBACK_DAI(did, rate_bit, hz) {		\
++		.playback = {						\
++			.stream_name = #did " Protection",		\
++			.rates = rate_bit,				\
++			.formats = SNDRV_PCM_FMTBIT_S32_LE,		\
++			.channels_min = 2,				\
++			.channels_max = 2,				\
++			.rate_min = hz,					\
++			.rate_max = hz,					\
++		},							\
++		.capture = {						\
++			.stream_name = #did" Capture",		\
++			.rates = SNDRV_PCM_RATE_8000 | SNDRV_PCM_RATE_16000 |\
++				SNDRV_PCM_RATE_32000 | SNDRV_PCM_RATE_48000 |\
++				SNDRV_PCM_RATE_176400 | rate_bit,			\
++			.formats = SNDRV_PCM_FMTBIT_S16_LE |		\
++				   SNDRV_PCM_FMTBIT_S24_LE |		\
++				   SNDRV_PCM_FMTBIT_S32_LE,		\
++			.channels_min = 1,				\
++			.channels_max = 8,				\
++			.rate_min = 8000,				\
++			.rate_max = 176400,				\
++		},							\
++		.name = #did,						\
++		.id = did,						\
++	}
++
+ #define Q6AFE_DP_RX_DAI(did) {						\
+ 		.playback = {						\
+ 			.stream_name = #did" Playback",			\
+@@ -703,9 +730,9 @@ static struct snd_soc_dai_driver q6dsp_audio_fe_dais[] = {
+ 	Q6AFE_DP_RX_DAI(DISPLAY_PORT_RX_6),
+ 	Q6AFE_DP_RX_DAI(DISPLAY_PORT_RX_7),
+ 	Q6AFE_CDC_DMA_RX_DAI(WSA_CODEC_DMA_RX_0),
+-	Q6AFE_CDC_DMA_TX_DAI(WSA_CODEC_DMA_TX_0),
++	Q6AFE_CDC_DMA_FEEDBACK_DAI(WSA_CODEC_DMA_TX_0, SNDRV_PCM_RATE_8000, 8000),
+ 	Q6AFE_CDC_DMA_RX_DAI(WSA_CODEC_DMA_RX_1),
+-	Q6AFE_CDC_DMA_TX_DAI(WSA_CODEC_DMA_TX_1),
++	Q6AFE_CDC_DMA_FEEDBACK_DAI(WSA_CODEC_DMA_TX_1, SNDRV_PCM_RATE_24000, 24000),
+ 	Q6AFE_CDC_DMA_TX_DAI(WSA_CODEC_DMA_TX_2),
+ 	Q6AFE_CDC_DMA_TX_DAI(VA_CODEC_DMA_TX_0),
+ 	Q6AFE_CDC_DMA_TX_DAI(VA_CODEC_DMA_TX_1),
+diff --git a/sound/soc/qcom/qdsp6/topology.c b/sound/soc/qcom/qdsp6/topology.c
+index aa2ab2b..8ccbc53 100644
+--- a/sound/soc/qcom/qdsp6/topology.c
++++ b/sound/soc/qcom/qdsp6/topology.c
+@@ -2,12 +2,14 @@
+ // Copyright (c) 2020, Linaro Limited
+ 
+ #include <linux/cleanup.h>
++#include <linux/unaligned.h>
+ #include <sound/soc.h>
+ #include <sound/soc-dapm.h>
+ #include <sound/pcm.h>
+ #include <sound/control.h>
+ #include <sound/asound.h>
+ #include <linux/firmware.h>
++#include <linux/of.h>
+ #include <sound/soc-topology.h>
+ #include <sound/soc-dpcm.h>
+ #include <uapi/sound/snd_ar_tokens.h>
+@@ -206,146 +208,247 @@ static struct audioreach_module *audioreach_tplg_alloc_module(struct q6apm *apm,
+ 	return mod;
+ }
+ 
+-static const struct snd_soc_tplg_vendor_array *
+-audioreach_get_sg_array(const struct snd_soc_tplg_private *private)
++/* AudioReach private records have a 16-byte header and a payload length;
++ * ALSA vendor tuples instead include their header in the size. FullIO uses
++ * the two reserved words as zero. Preserve legacy handling of those words.
++ */
++#define AR_FULLIO_CTRL_LINK_TYPE 0x08001061
++#define AR_RAW_HEADER_SIZE (2 * sizeof(__le32))
++#define AR_FULLIO_HEADER_SIZE sizeof(struct audioreach_module_priv_data)
++
++static bool audioreach_fullio_stage(u32 type)
+ {
+-	const struct snd_soc_tplg_vendor_array *sg_array = NULL;
+-	bool found = false;
+-	int sz;
+-
+-	for (sz = 0; !found && (sz < le32_to_cpu(private->size)); ) {
+-		const struct snd_soc_tplg_vendor_value_elem *sg_elem;
+-		int tkn_count = 0;
+-
+-		sg_array = (struct snd_soc_tplg_vendor_array *)((u8 *)private->array + sz);
+-		sg_elem = sg_array->value;
+-		sz = sz + le32_to_cpu(sg_array->size);
+-		while (!found && tkn_count <= (le32_to_cpu(sg_array->num_elems) - 1)) {
+-			switch (le32_to_cpu(sg_elem->token)) {
+-			case AR_TKN_U32_SUB_GRAPH_INSTANCE_ID:
+-				found = true;
+-				break;
+-			default:
+-				break;
+-			}
+-			tkn_count++;
+-			sg_elem++;
+-		}
+-	}
++	return type >= AR_FULLIO_STAGE_BASE &&
++	       type < AR_FULLIO_STAGE_BASE + AR_FULLIO_STAGE_COUNT;
++}
++
++static bool audioreach_raw_record(u32 type)
++{
++	return type == SND_SOC_AR_TPLG_MODULE_CFG_TYPE ||
++	       type == AR_FULLIO_CTRL_LINK_TYPE || audioreach_fullio_stage(type);
++}
+ 
+-	if (found)
+-		return sg_array;
++static int audioreach_private_record(const u8 *data, size_t remaining,
++				    u32 *type, size_t *size)
++{
++	u32 len;
+ 
+-	return NULL;
++	if (remaining < AR_RAW_HEADER_SIZE)
++		return -EINVAL;
++	len = get_unaligned_le32(data);
++	*type = get_unaligned_le32(data + sizeof(__le32));
++	if (audioreach_raw_record(*type)) {
++		size_t header = AR_FULLIO_HEADER_SIZE;
++
++		if (!len || !IS_ALIGNED(len, sizeof(__le32)) ||
++		    remaining < header || len > remaining - header)
++			return -EINVAL;
++		if (*type != SND_SOC_AR_TPLG_MODULE_CFG_TYPE &&
++		    (get_unaligned_le32(data + 2 * sizeof(__le32)) ||
++		     get_unaligned_le32(data + 3 * sizeof(__le32))))
++			return -EINVAL;
++		*size = len + header;
++	} else {
++		if (len < sizeof(struct snd_soc_tplg_vendor_array) || len > remaining)
++			return -EINVAL;
++		if (*type == SND_SOC_TPLG_TUPLE_TYPE_WORD &&
++		    get_unaligned_le32(data + AR_RAW_HEADER_SIZE) >
++		    (len - sizeof(struct snd_soc_tplg_vendor_array)) /
++		    sizeof(struct snd_soc_tplg_vendor_value_elem))
++			return -EINVAL;
++		*size = len;
++	}
++	return 0;
+ }
+ 
+-static const struct snd_soc_tplg_vendor_array *
+-audioreach_get_cont_array(const struct snd_soc_tplg_private *private)
++static int audioreach_validate_fullio_stage(const u8 *data, size_t size)
+ {
+-	const struct snd_soc_tplg_vendor_array *cont_array = NULL;
+-	bool found = false;
+-	int sz;
+-
+-	for (sz = 0; !found && (sz < le32_to_cpu(private->size)); ) {
+-		const struct snd_soc_tplg_vendor_value_elem *cont_elem;
+-		int tkn_count = 0;
+-
+-		cont_array = (struct snd_soc_tplg_vendor_array *)((u8 *)private->array + sz);
+-		cont_elem = cont_array->value;
+-		sz = sz + le32_to_cpu(cont_array->size);
+-		while (!found && tkn_count <= (le32_to_cpu(cont_array->num_elems) - 1)) {
+-			switch (le32_to_cpu(cont_elem->token)) {
+-			case AR_TKN_U32_CONTAINER_INSTANCE_ID:
+-				found = true;
+-				break;
+-			default:
+-				break;
+-			}
+-			tkn_count++;
+-			cont_elem++;
+-		}
++	while (size) {
++		u32 len;
++		size_t frame_size;
++
++		if (size < 4 * sizeof(__le32) || !IS_ALIGNED(size, 8))
++			return -EINVAL;
++		len = get_unaligned_le32(data + 2 * sizeof(__le32));
++		if (!len || len > size - 4 * sizeof(__le32) ||
++		    get_unaligned_le32(data + 3 * sizeof(__le32)))
++			return -EINVAL;
++		frame_size = ALIGN(4 * sizeof(__le32) + (size_t)len, 8);
++		if (frame_size > size)
++			return -EINVAL;
++		data += frame_size;
++		size -= frame_size;
+ 	}
++	return 0;
++}
+ 
+-	if (found)
+-		return cont_array;
++static int audioreach_validate_fullio_links(const u8 *data, size_t size)
++{
++	u32 links, properties, payload;
+ 
+-	return NULL;
++	if (size < sizeof(__le32))
++		return -EINVAL;
++	links = get_unaligned_le32(data);
++	data += sizeof(__le32);
++	size -= sizeof(__le32);
++	while (links--) {
++		if (size < 5 * sizeof(__le32))
++			return -EINVAL;
++		properties = get_unaligned_le32(data + 4 * sizeof(__le32));
++		data += 5 * sizeof(__le32);
++		size -= 5 * sizeof(__le32);
++		while (properties--) {
++			if (size < 2 * sizeof(__le32))
++				return -EINVAL;
++			payload = get_unaligned_le32(data + sizeof(__le32));
++			data += 2 * sizeof(__le32);
++			size -= 2 * sizeof(__le32);
++			if (payload > size)
++				return -EINVAL;
++			data += payload;
++			size -= payload;
++		}
++	}
++	return size ? -EINVAL : 0;
+ }
+ 
+-static const struct snd_soc_tplg_vendor_array *
+-audioreach_get_module_array(const struct snd_soc_tplg_private *private)
++static int audioreach_validate_private(const struct snd_soc_tplg_private *private,
++				       bool muted_fixture)
+ {
+-	const struct snd_soc_tplg_vendor_array *mod_array = NULL;
+-	bool found = false;
+-	int sz = 0;
+-
+-	for (sz = 0; !found && (sz < le32_to_cpu(private->size)); ) {
+-		const struct snd_soc_tplg_vendor_value_elem *mod_elem;
+-		int tkn_count = 0;
+-
+-		mod_array = (struct snd_soc_tplg_vendor_array *)((u8 *)private->array + sz);
+-		mod_elem = mod_array->value;
+-		sz = sz + le32_to_cpu(mod_array->size);
+-		while (!found && tkn_count <= (le32_to_cpu(mod_array->num_elems) - 1)) {
+-			switch (le32_to_cpu(mod_elem->token)) {
+-			case AR_TKN_U32_MODULE_INSTANCE_ID:
+-				found = true;
+-				break;
+-			default:
+-				break;
+-			}
+-			tkn_count++;
+-			mod_elem++;
++	const u8 *data = private->data;
++	size_t remaining = le32_to_cpu(private->size), size;
++	bool fullio = false;
++	u32 type;
++	int ret;
++
++	while (remaining) {
++		ret = audioreach_private_record(data, remaining, &type, &size);
++		if (ret)
++			return ret;
++		if (type == AR_FULLIO_CTRL_LINK_TYPE) {
++			fullio = true;
++			ret = audioreach_validate_fullio_links(data + AR_FULLIO_HEADER_SIZE,
++							      size - AR_FULLIO_HEADER_SIZE);
++		} else if (audioreach_fullio_stage(type)) {
++			fullio = true;
++			ret = audioreach_validate_fullio_stage(data + AR_FULLIO_HEADER_SIZE,
++							      size - AR_FULLIO_HEADER_SIZE);
+ 		}
++		if (ret)
++			return ret;
++		data += size;
++		remaining -= size;
+ 	}
+ 
+-	if (found)
+-		return mod_array;
++	/* Accept these records only for the separate, silent Denali fixture. */
++	return fullio && !muted_fixture ? -EOPNOTSUPP : 0;
++}
+ 
++static const struct snd_soc_tplg_vendor_array *
++audioreach_find_word_array(const struct snd_soc_tplg_private *private, u32 token)
++{
++	const u8 *data = private->data;
++	size_t remaining = le32_to_cpu(private->size), size;
++	u32 type;
++
++	while (remaining) {
++		const struct snd_soc_tplg_vendor_array *array = (const void *)data;
++		u32 i;
++
++		if (audioreach_private_record(data, remaining, &type, &size))
++			return NULL;
++		if (type == SND_SOC_TPLG_TUPLE_TYPE_WORD) {
++			for (i = 0; i < le32_to_cpu(array->num_elems); i++)
++				if (le32_to_cpu(array->value[i].token) == token)
++					return array;
++		}
++		data += size;
++		remaining -= size;
++	}
+ 	return NULL;
+ }
+ 
+-static struct audioreach_module_priv_data *
+-audioreach_get_module_priv_data(const struct snd_soc_tplg_private *private)
++static const struct snd_soc_tplg_vendor_array *
++audioreach_get_sg_array(const struct snd_soc_tplg_private *private)
+ {
+-	int sz;
++	return audioreach_find_word_array(private, AR_TKN_U32_SUB_GRAPH_INSTANCE_ID);
++}
+ 
+-	for (sz = 0; sz < le32_to_cpu(private->size); ) {
+-		const struct snd_soc_tplg_vendor_array *mod_array;
+-		u32 array_size;
++static const struct snd_soc_tplg_vendor_array *
++audioreach_get_cont_array(const struct snd_soc_tplg_private *private)
++{
++	return audioreach_find_word_array(private, AR_TKN_U32_CONTAINER_INSTANCE_ID);
++}
+ 
+-		mod_array = (struct snd_soc_tplg_vendor_array *)((u8 *)private->array + sz);
+-		array_size = le32_to_cpu(mod_array->size);
++static const struct snd_soc_tplg_vendor_array *
++audioreach_get_module_array(const struct snd_soc_tplg_private *private)
++{
++	return audioreach_find_word_array(private, AR_TKN_U32_MODULE_INSTANCE_ID);
++}
+ 
+-		if (le32_to_cpu(mod_array->type) == SND_SOC_AR_TPLG_MODULE_CFG_TYPE) {
+-			struct audioreach_module_priv_data *pdata;
+-			u32 nwords;
++static struct audioreach_module_priv_data *
++audioreach_get_module_priv_data(const struct snd_soc_tplg_private *private, u32 wanted_type)
++{
++	const u8 *data = private->data;
++	size_t remaining = le32_to_cpu(private->size), size;
++	u32 type;
++	int ret;
+ 
+-			/* size is the byte count of the __le32 data[] */
+-			nwords = array_size / sizeof(__le32);
++	while (remaining) {
++		ret = audioreach_private_record(data, remaining, &type, &size);
++		if (ret)
++			return ERR_PTR(ret);
++		if (type == wanted_type) {
++			void *copy = kmemdup(data, size, GFP_KERNEL);
+ 
+-			/* the blob must lie within the private data */
+-			if (sizeof(*pdata) + (u64)array_size >
+-			    le32_to_cpu(private->size) - sz)
+-				return ERR_PTR(-EINVAL);
++			return copy ?: ERR_PTR(-ENOMEM);
++		}
++		data += size;
++		remaining -= size;
++	}
++	return NULL;
++}
+ 
+-			pdata = kzalloc_flex(*pdata, data, nwords);
+-			if (!pdata)
+-				return ERR_PTR(-ENOMEM);
++static void audioreach_fullio_free_stages(struct audioreach_module *mod)
++{
++	for (int i = 0; i < AR_FULLIO_STAGE_COUNT; i++) {
++		kfree(mod->fullio_stages[i]);
++		mod->fullio_stages[i] = NULL;
++	}
++}
+ 
+-			memcpy(pdata, ((u8 *)private->data + sz),
+-			       struct_size(pdata, data, nwords));
+-			return pdata;
+-		}
++static int audioreach_fullio_load_stages(struct audioreach_module *mod,
++					const struct snd_soc_tplg_private *private)
++{
++	const u8 *data = private->data;
++	size_t remaining = le32_to_cpu(private->size), size;
++	int ret;
++	u32 type;
+ 
+-		/* a zero size would never advance the walk */
+-		if (!array_size)
+-			return ERR_PTR(-EINVAL);
++	while (remaining) {
++		ret = audioreach_private_record(data, remaining, &type, &size);
++		if (ret)
++			goto fail;
++		if (audioreach_fullio_stage(type)) {
++			u32 i = type - AR_FULLIO_STAGE_BASE;
+ 
+-		sz = sz + array_size;
++			if (mod->fullio_stages[i]) {
++				ret = -EEXIST;
++				goto fail;
++			}
++			mod->fullio_stages[i] = kmemdup(data, size, GFP_KERNEL);
++			if (!mod->fullio_stages[i]) {
++				ret = -ENOMEM;
++				goto fail;
++			}
++		}
++		data += size;
++		remaining -= size;
+ 	}
+-
+-	return NULL;
++	return 0;
++fail:
++	audioreach_fullio_free_stages(mod);
++	return ret;
+ }
+ 
+ static struct audioreach_sub_graph *audioreach_parse_sg_tokens(struct q6apm *apm,
+@@ -359,6 +462,8 @@ static struct audioreach_sub_graph *audioreach_parse_sg_tokens(struct q6apm *apm
+ 	bool found;
+ 
+ 	sg_array = audioreach_get_sg_array(private);
++	if (!sg_array)
++		return ERR_PTR(-EINVAL);
+ 	sg_elem = sg_array->value;
+ 
+ 	while (tkn_count <= (le32_to_cpu(sg_array->num_elems) - 1)) {
+@@ -416,6 +521,8 @@ static struct audioreach_container *audioreach_parse_cont_tokens(struct q6apm *a
+ 	bool found = false;
+ 
+ 	cont_array = audioreach_get_cont_array(private);
++	if (!cont_array)
++		return ERR_PTR(-EINVAL);
+ 	cont_elem = cont_array->value;
+ 
+ 	while (tkn_count <= (le32_to_cpu(cont_array->num_elems) - 1)) {
+@@ -438,6 +545,14 @@ static struct audioreach_container *audioreach_parse_cont_tokens(struct q6apm *a
+ 		case AR_TKN_U32_CONTAINER_PROC_DOMAIN:
+ 			cont->proc_domain = le32_to_cpu(cont_elem->value);
+ 			break;
++		case AR_TKN_U32_CONTAINER_PARENT_ID:
++			cont->parent_container_id = le32_to_cpu(cont_elem->value);
++			cont->has_extended_properties = true;
++			break;
++		case AR_TKN_U32_CONTAINER_HEAP_ID:
++			cont->heap_id = le32_to_cpu(cont_elem->value);
++			cont->has_extended_properties = true;
++			break;
+ 		default:
+ 			dev_err(apm->dev, "Not a valid token %d for graph\n", cont_elem->token);
+ 			break;
+@@ -456,6 +571,7 @@ static struct audioreach_module *audioreach_parse_common_tokens(struct q6apm *ap
+ 							struct snd_soc_dapm_widget *w)
+ {
+ 	uint32_t max_ip_port = 0, max_op_port = 0;
++	u32 integrated_backend = 0;
+ 	uint32_t src_mod_op_port_id[AR_MAX_MOD_LINKS] = { 0, };
+ 	uint32_t dst_mod_inst_id[AR_MAX_MOD_LINKS] = { 0, };
+ 	uint32_t dst_mod_ip_port_id[AR_MAX_MOD_LINKS] = { 0, };
+@@ -470,6 +586,8 @@ static struct audioreach_module *audioreach_parse_common_tokens(struct q6apm *ap
+ 	int max_tokens;
+ 
+ 	mod_array = audioreach_get_module_array(private);
++	if (!mod_array)
++		return ERR_PTR(-EINVAL);
+ 	mod_elem = mod_array->value;
+ 	max_tokens = le32_to_cpu(mod_array->num_elems);
+ 	while (tkn_count <= (max_tokens - 1)) {
+@@ -573,6 +691,9 @@ static struct audioreach_module *audioreach_parse_common_tokens(struct q6apm *ap
+ 		case AR_TKN_U32_MODULE_DST_IN_PORT_ID7:
+ 			dst_mod_ip_port_id[7] = le32_to_cpu(mod_elem->value);
+ 			break;
++		case AR_TKN_U32_MODULE_INTEGRATED_BACKEND_ID:
++			integrated_backend = le32_to_cpu(mod_elem->value);
++			break;
+ 		default:
+ 			break;
+ 
+@@ -585,6 +706,7 @@ static struct audioreach_module *audioreach_parse_common_tokens(struct q6apm *ap
+ 		int pn, id = 0;
+ 
+ 		mod->module_id = module_id;
++		mod->integrated_backend_id = integrated_backend;
+ 		mod->max_ip_port = max_ip_port;
+ 		mod->max_op_port = max_op_port;
+ 		mod->src_mod_inst_id = src_mod_inst_id;
+@@ -612,6 +734,7 @@ static int audioreach_widget_load_module_common(struct snd_soc_component *compon
+ 	struct audioreach_sub_graph *sg;
+ 	struct audioreach_module *mod;
+ 	struct snd_soc_dobj *dobj;
++	int ret;
+ 
+ 	sg = audioreach_parse_sg_tokens(apm, &tplg_w->priv);
+ 	if (IS_ERR(sg))
+@@ -625,7 +748,7 @@ static int audioreach_widget_load_module_common(struct snd_soc_component *compon
+ 	if (IS_ERR_OR_NULL(mod))
+ 		return mod ? PTR_ERR(mod) : -ENODEV;
+ 
+-	mod->data = audioreach_get_module_priv_data(&tplg_w->priv);
++	mod->data = audioreach_get_module_priv_data(&tplg_w->priv, SND_SOC_AR_TPLG_MODULE_CFG_TYPE);
+ 	if (IS_ERR(mod->data)) {
+ 		int rc = PTR_ERR(mod->data);
+ 
+@@ -633,6 +756,27 @@ static int audioreach_widget_load_module_common(struct snd_soc_component *compon
+ 		return rc;
+ 	}
+ 
++	/* FullIO private data is still blocked by widget validation. */
++	mod->fullio_ctrl_links = audioreach_get_module_priv_data(&tplg_w->priv,
++							       AR_FULLIO_CTRL_LINK_TYPE);
++	if (IS_ERR(mod->fullio_ctrl_links)) {
++		int ret = PTR_ERR(mod->fullio_ctrl_links);
++
++		mod->fullio_ctrl_links = NULL;
++		kfree(mod->data);
++		mod->data = NULL;
++		return ret;
++	}
++
++	ret = audioreach_fullio_load_stages(mod, &tplg_w->priv);
++	if (ret) {
++		kfree(mod->fullio_ctrl_links);
++		kfree(mod->data);
++		mod->fullio_ctrl_links = NULL;
++		mod->data = NULL;
++		return ret;
++	}
++
+ 	dobj = &w->dobj;
+ 	dobj->private = mod;
+ 
+@@ -1040,6 +1184,18 @@ static int audioreach_widget_ready(struct snd_soc_component *component,
+ 				   int index, struct snd_soc_dapm_widget *w,
+ 				   struct snd_soc_tplg_dapm_widget *tplg_w)
+ {
++	/* Explicit diagnostic or native fixtures may load the FullIO graph. */
++	bool muted_fixture = of_machine_is_compatible("microsoft,denali") &&
++		(of_property_read_bool(component->card->dev->of_node,
++				      "microsoft,denali-fullio-muted-test") ||
++		 of_property_read_bool(component->card->dev->of_node,
++				      "microsoft,denali-fullio-reference-render"));
++	int ret = audioreach_validate_private(&tplg_w->priv, muted_fixture);
++
++	if (ret)
++		return dev_err_probe(component->dev, ret,
++				     "unsupported or invalid private data in widget %s\n", w->name);
++
+ 	switch (w->id) {
+ 	case snd_soc_dapm_aif_in:
+ 	case snd_soc_dapm_aif_out:
+@@ -1095,6 +1251,8 @@ static int audioreach_widget_unload(struct snd_soc_component *scomp,
+ 	cont->num_modules--;
+ 
+ 	list_del(&mod->node);
++	audioreach_fullio_free_stages(mod);
++	kfree(mod->fullio_ctrl_links);
+ 	kfree(mod->data);
+ 	kfree(mod);
+ 	/* Graph Info has N sub-graphs, sub-graph has N containers, Container has N Modules */

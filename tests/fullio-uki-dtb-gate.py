@@ -47,10 +47,9 @@ def main() -> None:
 
         assert verify(prep.verify_reference_dtb, NODES) == 'ok'
         muted_table = dict(NODES, **{'/sound': SOUND_MUTED})
-        assert verify(prep.verify_pa_off_dtb, muted_table) == 'ok'
         assert verify(prep.verify_reference_dtb, muted_table).startswith('rejected:')
         assert verify(prep.verify_reference_dtb,
-                      dict(NODES, **{'/sound': SOUND_MUTED + ['microsoft,denali-fullio-ring-map-audit']})) \
+                      dict(NODES, **{'/sound': SOUND_REF + ['microsoft,denali-fullio-ring-map-audit']})) \
             .startswith('rejected:')
         assert verify(prep.verify_reference_dtb,
                       dict(NODES, **{'/sound': SOUND_REF + ['microsoft,denali-fullio-post-pa-test']})) \
@@ -58,8 +57,8 @@ def main() -> None:
         missing = dict(NODES)
         missing.pop('/soc@0/soundwire@6b10000/speaker@0,1')
         assert 'reference-codec' in verify(prep.verify_reference_dtb, missing)
-        assert verify(prep.verify_pa_off_dtb,
-                      dict(muted_table, **{'/sound': SOUND_MUTED + ['microsoft,denali-fullio-pa-on-smoke']})) \
+        assert verify(prep.verify_reference_dtb,
+                      dict(NODES, **{'/sound': SOUND_REF + ['microsoft,denali-fullio-pa-on-smoke']})) \
             .startswith('rejected:')
     print('Private UKI DT gates: reference markers required, fixture/audit markers rejected.')
 

@@ -1,0 +1,1052 @@
+diff --git a/drivers/soundwire/qcom.c b/drivers/soundwire/qcom.c
+index a4cb628..5e526f6 100644
+--- a/drivers/soundwire/qcom.c
++++ b/drivers/soundwire/qcom.c
+@@ -213,7 +213,14 @@ struct qcom_swrm_ctrl {
+ 	int cols_index;
+ 	int rows_index;
+ 	unsigned long port_mask;
++	bool cps_wake_active;
++	u32 cps_saved_route;
++	u32 cps_saved_pcm;
+ 	u32 intr_mask;
++	bool fullio_link_gate;
++	int fullio_link_error; /* First failure, sticky for the controller lifetime. */
++	bool fullio_pm_incomplete; /* Sticky; also read by the transfer path. */
++	unsigned long fullio_seen_attached;
+ 	u8 rcmd_id;
+ 	u8 wcmd_id;
+ 	/* Port numbers are 1 - 14 */
+@@ -532,6 +539,13 @@ static bool swrm_wait_for_wr_fifo_done(struct qcom_swrm_ctrl *ctrl)
+ 	return false;
+ }
+ 
++static void qcom_swrm_fullio_latch_link_error(struct qcom_swrm_ctrl *ctrl, int error)
++{
++	if (ctrl->fullio_link_gate && error < 0 &&
++	    !cmpxchg(&ctrl->fullio_link_error, 0, error))
++		dev_err(ctrl->dev, "FullIO SoundWire new streams locked: first link error %d\n", error);
++}
++
+ static int qcom_swrm_cmd_fifo_wr_cmd(struct qcom_swrm_ctrl *ctrl, u8 cmd_data,
+ 				     u8 dev_addr, u16 reg_addr)
+ {
+@@ -562,17 +576,28 @@ static int qcom_swrm_cmd_fifo_wr_cmd(struct qcom_swrm_ctrl *ctrl, u8 cmd_data,
+ 		usleep_range(150, 155);
+ 
+ 	if (cmd_id == SWR_BROADCAST_CMD_ID) {
+-		swrm_wait_for_wr_fifo_done(ctrl);
++		bool drained = swrm_wait_for_wr_fifo_done(ctrl);
++
+ 		/*
+ 		 * sleep for 10ms for MSM soundwire variant to allow broadcast
+ 		 * command to complete.
+ 		 */
+ 		ret = wait_for_completion_timeout(&ctrl->broadcast,
+ 						  msecs_to_jiffies(TIMEOUT_MS));
+-		if (!ret)
++		if (!ret) {
++			if (ctrl->fullio_link_gate) {
++				dev_warn_ratelimited(ctrl->dev,
++					"FullIO broadcast timeout: reg=%#x fifo_drained=%d\n",
++					reg_addr, drained);
++				/* No later ACK can make this controller safe for new
++				 * streams. Leave teardown transfers available.
++				 */
++				qcom_swrm_fullio_latch_link_error(ctrl, -ETIMEDOUT);
++			}
+ 			ret = SDW_CMD_IGNORED;
+-		else
++		} else {
+ 			ret = SDW_CMD_OK;
++		}
+ 
+ 	} else {
+ 		ret = SDW_CMD_OK;
+@@ -633,6 +658,55 @@ static int qcom_swrm_cmd_fifo_rd_cmd(struct qcom_swrm_ctrl *ctrl,
+ 	return SDW_CMD_IGNORED;
+ }
+ 
++static int qcom_swrm_fullio_new_stream_ok(struct qcom_swrm_ctrl *ctrl)
++{
++	return READ_ONCE(ctrl->fullio_link_error) ? -ENOTRECOVERABLE : 0;
++}
++
++static bool qcom_swrm_fullio_pm_audit(struct qcom_swrm_ctrl *ctrl)
++{
++	return !ctrl->clock_stop_not_supported &&
++	       of_machine_is_compatible("microsoft,denali") &&
++	       of_property_read_bool(ctrl->dev->of_node, "qcom,denali-fullio-pm-transition-audit");
++}
++
++/* Do not confuse an empty initial bus or a codec ALERT with detach.
++ * Once a slot has been attached on this scoped controller, its loss is
++ * sticky even if a later event enumerates it again.
++ */
++static void qcom_swrm_fullio_observe_slots(struct qcom_swrm_ctrl *ctrl, u32 slots)
++{
++	unsigned int i;
++
++	if (!ctrl->fullio_link_gate)
++		return;
++	for (i = 1; i <= SDW_MAX_DEVICES; i++) {
++		u32 status = (slots >> (i * SWRM_MCP_SLV_STATUS_SZ)) & SWRM_MCP_SLV_STATUS_MASK;
++
++		if (status == SDW_SLAVE_ATTACHED)
++			set_bit(i, &ctrl->fullio_seen_attached);
++		else if (status == SDW_SLAVE_UNATTACHED && test_bit(i, &ctrl->fullio_seen_attached))
++			qcom_swrm_fullio_latch_link_error(ctrl, -ENODEV);
++	}
++}
++
++/* The core's exit helper can return zero after skipping every slave.
++ * Keep resume/cleanup semantics, but do not admit a new FullIO stream
++ * on a controller that no longer sees its previously attached slots.
++ */
++static void qcom_swrm_fullio_check_resumed_slots(struct qcom_swrm_ctrl *ctrl)
++{
++	u32 slots;
++
++	if (!ctrl->fullio_link_gate)
++		return;
++	if (ctrl->reg_read(ctrl, SWRM_MCP_SLV_STATUS, &slots) != SDW_CMD_OK) {
++		qcom_swrm_fullio_latch_link_error(ctrl, -EIO);
++		return;
++	}
++	qcom_swrm_fullio_observe_slots(ctrl, slots);
++}
++
+ static int qcom_swrm_get_alert_slave_dev_num(struct qcom_swrm_ctrl *ctrl)
+ {
+ 	u32 val, status;
+@@ -644,6 +718,9 @@ static int qcom_swrm_get_alert_slave_dev_num(struct qcom_swrm_ctrl *ctrl)
+ 		status = (val >> (dev_num * SWRM_MCP_SLV_STATUS_SZ));
+ 
+ 		if ((status & SWRM_MCP_SLV_STATUS_MASK) == SDW_SLAVE_ALERT) {
++			if (qcom_swrm_fullio_pm_audit(ctrl))
++				dev_info_ratelimited(ctrl->dev, "FullIO PM transition alert: dev=%d slaves=0x%08x\n",
++						     dev_num, val);
+ 			ctrl->status[dev_num] = status & SWRM_MCP_SLV_STATUS_MASK;
+ 			return dev_num;
+ 		}
+@@ -657,7 +734,9 @@ static void qcom_swrm_get_device_status(struct qcom_swrm_ctrl *ctrl)
+ 	u32 val;
+ 	int i;
+ 
+-	ctrl->reg_read(ctrl, SWRM_MCP_SLV_STATUS, &val);
++	if (ctrl->reg_read(ctrl, SWRM_MCP_SLV_STATUS, &val) != SDW_CMD_OK)
++		return;
++	qcom_swrm_fullio_observe_slots(ctrl, val);
+ 	ctrl->slave_status = val;
+ 
+ 	for (i = 1; i <= SDW_MAX_DEVICES; i++) {
+@@ -785,6 +864,20 @@ static irqreturn_t qcom_swrm_irq_handler(int irq, void *dev_id)
+ 	intr_sts_masked = intr_sts & ctrl->intr_mask;
+ 
+ 	do {
++		/* Capture raw slot state before lower numbered IRQ cases can
++		 * enumerate slaves, update cached status, or clear the IRQ.
++		 */
++		if ((intr_sts_masked & SWRM_INTERRUPT_STATUS_MASTER_CLASH_DET) &&
++		    (ctrl->fullio_link_gate || qcom_swrm_fullio_pm_audit(ctrl))) {
++			u32 slots = 0;
++			int rc = ctrl->reg_read(ctrl, SWRM_MCP_SLV_STATUS, &slots);
++
++			dev_warn_ratelimited(ctrl->dev,
++				"FullIO clash snapshot: irq=%#x unmasked=%#x slots=%#x rc=%d cached=%#x pm_active=%d pm_suspended=%d\n",
++				intr_sts, intr_sts_masked, slots, rc,
++				READ_ONCE(ctrl->slave_status), pm_runtime_active(ctrl->dev),
++				pm_runtime_suspended(ctrl->dev));
++		}
+ 		for (i = 0; i < SWRM_INTERRUPT_MAX; i++) {
+ 			value = intr_sts_masked & BIT(i);
+ 			if (!value)
+@@ -809,12 +902,17 @@ static irqreturn_t qcom_swrm_irq_handler(int irq, void *dev_id)
+ 					dev_dbg(ctrl->dev, "Slave status not changed %x\n",
+ 						slave_status);
+ 				} else {
++					if (qcom_swrm_fullio_pm_audit(ctrl))
++						dev_info_ratelimited(ctrl->dev,
++							"FullIO PM transition enum: slaves=0x%08x->0x%08x\n",
++							ctrl->slave_status, slave_status);
+ 					qcom_swrm_get_device_status(ctrl);
+ 					qcom_swrm_enumerate(&ctrl->bus);
+ 					sdw_handle_slave_status(&ctrl->bus, ctrl->status);
+ 				}
+ 				break;
+ 			case SWRM_INTERRUPT_STATUS_MASTER_CLASH_DET:
++				qcom_swrm_fullio_latch_link_error(ctrl, -EIO);
+ 				dev_err_ratelimited(ctrl->dev,
+ 						"%s: SWR bus clsh detected\n",
+ 						__func__);
+@@ -882,6 +980,10 @@ static irqreturn_t qcom_swrm_irq_handler(int irq, void *dev_id)
+ 			case SWRM_INTERRUPT_STATUS_BUS_RESET_FINISHED_V2:
+ 				break;
+ 			case SWRM_INTERRUPT_STATUS_CLK_STOP_FINISHED_V2:
++				if (ctrl->version >= SWRM_VERSION_2_0_0 && qcom_swrm_fullio_pm_audit(ctrl))
++					dev_info_ratelimited(ctrl->dev,
++						"FullIO PM transition clock-stop-finished-irq: raw_irq=0x%08x\n",
++						intr_sts);
+ 				break;
+ 			case SWRM_INTERRUPT_STATUS_EXT_CLK_STOP_WAKEUP:
+ 				break;
+@@ -915,6 +1017,31 @@ static irqreturn_t qcom_swrm_irq_handler(int irq, void *dev_id)
+ 	return ret;
+ }
+ 
++static int swrm_fullio_wait_for_frame_stop(struct qcom_swrm_ctrl *ctrl)
++{
++	const int max_reads = 30;
++	u32 status;
++	int i, ret;
++
++	/* ClockStopNow's command ACK does not describe controller frame state.
++	 * Keep iface enabled until the frame generator is observed stopped.
++	 */
++	for (i = 0; i < max_reads; i++) {
++		ret = ctrl->reg_read(ctrl, SWRM_COMP_STATUS, &status);
++		if (ret != SDW_CMD_OK)
++			return ret < 0 ? ret : -EIO;
++		if (!(status & SWRM_FRM_GEN_ENABLED)) {
++			dev_info_ratelimited(ctrl->dev,
++					     "FullIO frame generator stopped before iface gate: reads=%d status=%#x\n",
++					     i + 1, status);
++			return 0;
++		}
++		if (i + 1 < max_reads)
++			usleep_range(1000, 1100);
++	}
++	return -ETIMEDOUT;
++}
++
+ static bool swrm_wait_for_frame_gen_enabled(struct qcom_swrm_ctrl *ctrl)
+ {
+ 	int retry = SWRM_LINK_STATUS_RETRY_CNT;
+@@ -1033,6 +1160,11 @@ static enum sdw_command_response qcom_swrm_xfer_msg(struct sdw_bus *bus,
+ 	struct qcom_swrm_ctrl *ctrl = to_qcom_sdw(bus);
+ 	int ret, i, len;
+ 
++	/* PM retains iface/IRQ ownership after an incomplete transition.
++	 * That does not make the bus usable for codec replay or enumeration.
++	 */
++	if (READ_ONCE(ctrl->fullio_pm_incomplete))
++		return SDW_CMD_FAIL_OTHER;
+ 	if (msg->page) {
+ 		if (ctrl->page1_cache[msg->dev_num] != msg->addr_page1) {
+ 			ret = qcom_swrm_cmd_fifo_wr_cmd(ctrl, msg->addr_page1,
+@@ -1105,6 +1237,98 @@ static int qcom_swrm_port_params(struct sdw_bus *bus,
+ 				p_params->bps - 1);
+ }
+ 
++#define DENALI_CPS_WAKE_ROUTE_REG 0x105c
++#define DENALI_CPS_WAKE_PCM_REG   0x1d54
++
++static bool qcom_swrm_integrated_sidechain_audit(struct qcom_swrm_ctrl *ctrl)
++{
++	struct device_node *node = ctrl->dev->of_node;
++
++	return ctrl->bus.controller_id == MASTER_ID_WSA &&
++	       of_machine_is_compatible("microsoft,denali") &&
++	       of_property_read_bool(node, "qcom,denali-fullio-feedback") &&
++	       !of_property_read_bool(node, "qcom,denali-fullio-feedback-capture-test") &&
++	       of_property_read_bool(node, "qcom,denali-fullio-sidechain-audit");
++}
++
++static bool qcom_swrm_cps_wake_probe(struct qcom_swrm_ctrl *ctrl)
++{
++	return qcom_swrm_integrated_sidechain_audit(ctrl) ||
++	       (ctrl->bus.controller_id == MASTER_ID_WSA &&
++		of_machine_is_compatible("microsoft,denali") &&
++		of_property_read_bool(ctrl->dev->of_node, "qcom,denali-fullio-feedback-capture-test") &&
++		of_property_read_bool(ctrl->dev->of_node, "qcom,denali-cps-probe-wake-test"));
++}
++
++static bool qcom_swrm_audit_active_offset2(struct qcom_swrm_ctrl *ctrl, unsigned int port)
++{
++	if (qcom_swrm_integrated_sidechain_audit(ctrl))
++		return port == 10 || port == 11 || port == 13;
++	return port == 13 && qcom_swrm_cps_wake_probe(ctrl) &&
++	       of_property_read_bool(ctrl->dev->of_node, "qcom,denali-cps-probe-active-offset2-test");
++}
++
++static int qcom_swrm_restore_cps_wake(struct qcom_swrm_ctrl *ctrl)
++{
++	int pcm, route;
++	u32 value;
++
++	if (!ctrl->cps_wake_active)
++		return 0;
++	pcm = ctrl->reg_write(ctrl, DENALI_CPS_WAKE_PCM_REG, ctrl->cps_saved_pcm);
++	route = ctrl->reg_write(ctrl, DENALI_CPS_WAKE_ROUTE_REG, ctrl->cps_saved_route);
++	if (qcom_swrm_integrated_sidechain_audit(ctrl)) {
++		if (!pcm) {
++			pcm = ctrl->reg_read(ctrl, DENALI_CPS_WAKE_PCM_REG, &value);
++			if (!pcm && value != ctrl->cps_saved_pcm)
++				pcm = -EIO;
++		}
++		if (!route) {
++			route = ctrl->reg_read(ctrl, DENALI_CPS_WAKE_ROUTE_REG, &value);
++			if (!route && value != ctrl->cps_saved_route)
++				route = -EIO;
++		}
++	}
++	if (pcm || route) {
++		dev_err(ctrl->dev, "CPS probe wake restore failed: %d/%d\n", pcm, route);
++		return pcm ?: route;
++	}
++	ctrl->cps_wake_active = false;
++	if (qcom_swrm_integrated_sidechain_audit(ctrl))
++		dev_info_ratelimited(ctrl->dev, "FullIO CPS wake registers restored and verified\n");
++	return 0;
++}
++
++static int qcom_swrm_apply_cps_wake(struct qcom_swrm_ctrl *ctrl)
++{
++	u32 route, pcm;
++	int ret;
++
++	if (!ctrl->cps_wake_active) {
++		ret = ctrl->reg_read(ctrl, DENALI_CPS_WAKE_ROUTE_REG, &ctrl->cps_saved_route);
++		if (ret)
++			return ret;
++		ret = ctrl->reg_read(ctrl, DENALI_CPS_WAKE_PCM_REG, &ctrl->cps_saved_pcm);
++		if (ret)
++			return ret;
++		ctrl->cps_wake_active = true;
++	}
++	ret = ctrl->reg_write(ctrl, DENALI_CPS_WAKE_ROUTE_REG, 0x0005000f);
++	if (!ret)
++		ret = ctrl->reg_write(ctrl, DENALI_CPS_WAKE_PCM_REG, 0x3);
++	if (!ret)
++		ret = ctrl->reg_read(ctrl, DENALI_CPS_WAKE_ROUTE_REG, &route);
++	if (!ret)
++		ret = ctrl->reg_read(ctrl, DENALI_CPS_WAKE_PCM_REG, &pcm);
++	if (!ret && (route != 0x0005000f || pcm != 0x3))
++		ret = -EIO;
++	if (ret)
++		qcom_swrm_restore_cps_wake(ctrl);
++	else
++		dev_info_ratelimited(ctrl->dev, "CPS probe route and DP13 PCM wake readback verified\n");
++	return ret;
++}
++
+ static int qcom_swrm_transport_params(struct sdw_bus *bus,
+ 				      struct sdw_transport_params *params,
+ 				      enum sdw_reg_bank bank)
+@@ -1119,6 +1343,12 @@ static int qcom_swrm_transport_params(struct sdw_bus *bus,
+ 
+ 	pcfg = &ctrl->pconfig[params->port_num];
+ 
++	if (params->port_num == 13 && qcom_swrm_cps_wake_probe(ctrl)) {
++		ret = qcom_swrm_apply_cps_wake(ctrl);
++		if (ret)
++			goto err;
++	}
++
+ 	value = pcfg->off1 << SWRM_DP_PORT_CTRL_OFFSET1_SHFT;
+ 	value |= pcfg->off2 << SWRM_DP_PORT_CTRL_OFFSET2_SHFT;
+ 	value |= pcfg->si & 0xff;
+@@ -1193,6 +1423,28 @@ static int qcom_swrm_port_enable(struct sdw_bus *bus,
+ 
+ 	reg = SWRM_DPn_PORT_CTRL_BANK(offset, enable_ch->port_num, bank);
+ 
++	if (enable_ch->enable && qcom_swrm_audit_active_offset2(ctrl, enable_ch->port_num)) {
++		u32 check;
++		int ret;
++
++		ret = ctrl->reg_read(ctrl, reg, &val);
++		if (ret)
++			return ret;
++		val &= ~(0xffU << SWRM_DP_PORT_CTRL_OFFSET2_SHFT);
++		val |= enable_ch->ch_mask << SWRM_DP_PORT_CTRL_EN_CHAN_SHFT;
++		ret = ctrl->reg_write(ctrl, reg, val);
++		if (ret)
++			return ret;
++		ret = ctrl->reg_read(ctrl, reg, &check);
++		if (ret)
++			return ret;
++		if (check != val)
++			return -EIO;
++		dev_info_ratelimited(ctrl->dev, "FullIO DP%u bank %u active Offset2=0 verified\n",
++				     enable_ch->port_num, bank);
++		return 0;
++	}
++
+ 	ctrl->reg_read(ctrl, reg, &val);
+ 
+ 	if (enable_ch->enable)
+@@ -1288,6 +1540,9 @@ static void qcom_swrm_stream_free_ports(struct qcom_swrm_ctrl *ctrl,
+ 	mutex_lock(&ctrl->port_lock);
+ 
+ 	list_for_each_entry(m_rt, &stream->master_list, stream_node) {
++		if (&ctrl->bus != m_rt->bus)
++			continue;
++
+ 		port_mask = &ctrl->port_mask;
+ 		list_for_each_entry(p_rt, &m_rt->port_list, port_node)
+ 			clear_bit(p_rt->num, port_mask);
+@@ -1296,6 +1551,20 @@ static void qcom_swrm_stream_free_ports(struct qcom_swrm_ctrl *ctrl,
+ 	mutex_unlock(&ctrl->port_lock);
+ }
+ 
++static int qcom_swrm_select_master_port(const unsigned long *mask,
++				       unsigned int maxport, unsigned int mapped)
++{
++	unsigned int port;
++
++	/* Explicit maps are 1-based; maxport is a valid mapped port. */
++	if (mapped)
++		return mapped <= maxport ? (int)mapped : -EBUSY;
++
++	/* Unlike an explicit map, bitmap search returns maxport on exhaustion. */
++	port = find_first_zero_bit(mask, maxport);
++	return port < maxport ? (int)port : -EBUSY;
++}
++
+ static int qcom_swrm_stream_alloc_ports(struct qcom_swrm_ctrl *ctrl,
+ 					struct sdw_stream_runtime *stream,
+ 				       struct snd_pcm_hw_params *params,
+@@ -1344,15 +1613,10 @@ static int qcom_swrm_stream_alloc_ports(struct qcom_swrm_ctrl *ctrl,
+ 			slave = s_rt->slave;
+ 			list_for_each_entry(p_rt, &s_rt->port_list, port_node) {
+ 				m_port = slave->m_port_map[p_rt->num];
+-				/* Port numbers start from 1 - 14*/
+-				if (m_port)
+-					pn = m_port;
+-				else
+-					pn = find_first_zero_bit(port_mask, maxport);
+-
+-				if (pn >= maxport) {
+-					dev_err(ctrl->dev, "All ports busy\n");
+-					return -EBUSY;
++				pn = qcom_swrm_select_master_port(port_mask, maxport, m_port);
++				if (pn < 0) {
++					dev_err(ctrl->dev, "No usable master port\n");
++					return pn;
+ 				}
+ 				set_bit(pn, port_mask);
+ 				pconfig[nports].num = pn;
+@@ -1368,6 +1632,113 @@ static int qcom_swrm_stream_alloc_ports(struct qcom_swrm_ctrl *ctrl,
+ 	return 0;
+ }
+ 
++/* FullIO exposes the feedback as ALSA companion playback, while the
++ * physical SoundWire data flows from the codecs into the controller.
++ */
++static bool qcom_swrm_denali_feedback(struct qcom_swrm_ctrl *ctrl, int id)
++{
++	return of_machine_is_compatible("microsoft,denali") &&
++	       of_property_read_bool(ctrl->dev->of_node, "qcom,denali-fullio-feedback") &&
++	       ctrl->bus.controller_id == MASTER_ID_WSA &&
++	       ctrl->num_dout_ports == 9 && ctrl->nports >= 13 &&
++	       (id == 9 || id == 10);
++}
++
++/* A CPS master port is shared, but it must never count the same
++ * physical slave twice. This validates admission, not feedback samples.
++ */
++static int qcom_swrm_denali_feedback_source(struct sdw_bus *bus,
++					    struct sdw_slave *slave,
++					    unsigned long *seen)
++{
++	unsigned int num;
++
++	if (!slave || slave->bus != bus || slave->id.part_id != 0x0204)
++		return -EINVAL;
++	num = READ_ONCE(slave->dev_num);
++	if (!num || num > SDW_MAX_DEVICES ||
++	    READ_ONCE(slave->status) != SDW_SLAVE_ATTACHED)
++		return -ENODEV;
++	if (*seen & BIT(num))
++		return -EINVAL;
++	*seen |= BIT(num);
++	return 0;
++}
++
++static int qcom_swrm_denali_alloc_feedback(struct qcom_swrm_ctrl *ctrl,
++					  struct sdw_stream_runtime *stream,
++					  int dai_id, unsigned int rate)
++{
++	bool cps = dai_id == 10;
++	struct sdw_stream_config config = {
++		.direction = SDW_DATA_DIR_TX,
++		.ch_count = 1,
++		.frame_rate = rate,
++		.type = SDW_STREAM_PDM,
++		.bps = 1,
++	};
++	struct sdw_port_config ports[2] = {};
++	struct sdw_master_runtime *m_rt;
++	struct sdw_slave_runtime *s_rt;
++	struct sdw_port_runtime *p_rt;
++	unsigned long requested = 0, seen = 0;
++	unsigned int nports = 0, sources = 0, port, i;
++	int ret;
++
++	if (!stream || rate != (cps ? 24000 : 8000))
++		return -EINVAL;
++
++	guard(mutex)(&ctrl->port_lock);
++	list_for_each_entry(m_rt, &stream->master_list, stream_node) {
++		if (&ctrl->bus != m_rt->bus)
++			continue;
++
++		list_for_each_entry(s_rt, &m_rt->slave_rt_list, m_rt_node) {
++			if (s_rt->direction != SDW_DATA_DIR_TX ||
++			    !list_is_singular(&s_rt->port_list))
++				return -EINVAL;
++			ret = qcom_swrm_denali_feedback_source(&ctrl->bus, s_rt->slave, &seen);
++			if (ret)
++				return ret;
++			p_rt = list_first_entry(&s_rt->port_list, struct sdw_port_runtime, port_node);
++			if (p_rt->num != (cps ? 6 : 5) || p_rt->ch_mask != 3)
++				return -EINVAL;
++			port = s_rt->slave->m_port_map[p_rt->num];
++			if (cps ? port != 13 : port != 10 && port != 11)
++				return -EINVAL;
++			if (test_bit(port, &ctrl->port_mask))
++				return -EBUSY;
++			if (++sources > 2)
++				return -EINVAL;
++
++			/* CPS DP6 on both codecs shares exactly one physical master port. */
++			for (i = 0; i < nports; i++)
++				if (ports[i].num == port)
++					break;
++			if (i == nports) {
++				ports[nports++].num = port;
++				set_bit(port, &requested);
++			}
++			ports[i].ch_mask |= p_rt->ch_mask;
++		}
++	}
++
++	if (sources != 2 || nports != (cps ? 1 : 2))
++		return -EINVAL;
++
++	ret = sdw_stream_add_master(&ctrl->bus, &config, ports, nports, stream);
++	if (!ret)
++		ctrl->port_mask |= requested;
++
++	return ret;
++}
++
++static bool qcom_swrm_fullio_capture_probe(struct qcom_swrm_ctrl *ctrl)
++{
++	return of_property_read_bool(ctrl->dev->of_node,
++				     "qcom,denali-fullio-feedback-capture-test");
++}
++
+ static int qcom_swrm_hw_params(struct snd_pcm_substream *substream,
+ 			       struct snd_pcm_hw_params *params,
+ 			      struct snd_soc_dai *dai)
+@@ -1376,6 +1747,28 @@ static int qcom_swrm_hw_params(struct snd_pcm_substream *substream,
+ 	struct sdw_stream_runtime *sruntime = ctrl->sruntime[dai->id];
+ 	int ret;
+ 
++	ret = qcom_swrm_fullio_new_stream_ok(ctrl);
++	if (ret)
++		return ret;
++	if (qcom_swrm_denali_feedback(ctrl, dai->id)) {
++		if (qcom_swrm_fullio_capture_probe(ctrl)) {
++			struct snd_soc_pcm_runtime *rtd = snd_soc_substream_to_rtd(substream);
++			struct device_node *node = rtd->card->dev->of_node;
++			const char *probe;
++
++			if (substream->stream != SNDRV_PCM_STREAM_CAPTURE ||
++			    !of_property_read_bool(node, "microsoft,denali-fullio-muted-test") ||
++			    of_property_read_string(node, "microsoft,denali-fullio-feedback-probe", &probe) ||
++			    strcmp(probe, dai->id == 9 ? "vi" : "cps"))
++				return -EOPNOTSUPP;
++			return qcom_swrm_denali_alloc_feedback(ctrl, sruntime, dai->id,
++							      params_rate(params));
++		}
++		if (substream->stream == SNDRV_PCM_STREAM_PLAYBACK)
++			return qcom_swrm_denali_alloc_feedback(ctrl, sruntime, dai->id,
++							      params_rate(params));
++	}
++
+ 	ret = qcom_swrm_stream_alloc_ports(ctrl, sruntime, params,
+ 					   substream->stream);
+ 	if (ret)
+@@ -1393,6 +1786,8 @@ static int qcom_swrm_hw_free(struct snd_pcm_substream *substream,
+ 	qcom_swrm_stream_free_ports(ctrl, sruntime);
+ 	sdw_stream_remove_master(&ctrl->bus, sruntime);
+ 
++	if (dai->id == 10 && qcom_swrm_cps_wake_probe(ctrl))
++		return qcom_swrm_restore_cps_wake(ctrl);
+ 	return 0;
+ }
+ 
+@@ -1419,6 +1814,9 @@ static int qcom_swrm_startup(struct snd_pcm_substream *substream,
+ 	struct qcom_swrm_ctrl *ctrl = dev_get_drvdata(dai->dev);
+ 	int ret;
+ 
++	ret = qcom_swrm_fullio_new_stream_ok(ctrl);
++	if (ret)
++		return ret;
+ 	ret = pm_runtime_get_sync(ctrl->dev);
+ 	if (ret < 0 && ret != -EACCES) {
+ 		dev_err_ratelimited(ctrl->dev,
+@@ -1428,7 +1826,10 @@ static int qcom_swrm_startup(struct snd_pcm_substream *substream,
+ 		return ret;
+ 	}
+ 
+-	return 0;
++	ret = qcom_swrm_fullio_new_stream_ok(ctrl);
++	if (ret)
++		pm_runtime_put_autosuspend(ctrl->dev);
++	return ret;
+ }
+ 
+ static void qcom_swrm_shutdown(struct snd_pcm_substream *substream,
+@@ -1436,13 +1837,24 @@ static void qcom_swrm_shutdown(struct snd_pcm_substream *substream,
+ {
+ 	struct qcom_swrm_ctrl *ctrl = dev_get_drvdata(dai->dev);
+ 
++	if (dai->id == 10 && qcom_swrm_cps_wake_probe(ctrl))
++		qcom_swrm_restore_cps_wake(ctrl);
+ 	swrm_wait_for_wr_fifo_done(ctrl);
+ 	pm_runtime_mark_last_busy(ctrl->dev);
+ 	pm_runtime_put_autosuspend(ctrl->dev);
+ 
+ }
+ 
++static int qcom_swrm_check_open(struct snd_pcm_substream *substream,
++			       struct snd_soc_dai *dai)
++{
++	struct qcom_swrm_ctrl *ctrl = dev_get_drvdata(dai->dev);
++
++	return qcom_swrm_fullio_new_stream_ok(ctrl);
++}
++
+ static const struct snd_soc_dai_ops qcom_swrm_pdm_dai_ops = {
++	.check_open = qcom_swrm_check_open,
+ 	.hw_params = qcom_swrm_hw_params,
+ 	.hw_free = qcom_swrm_hw_free,
+ 	.startup = qcom_swrm_startup,
+@@ -1487,6 +1899,23 @@ static int qcom_swrm_register_dais(struct qcom_swrm_ctrl *ctrl)
+ 		stream->rates = SNDRV_PCM_RATE_48000;
+ 		stream->formats = SNDRV_PCM_FMTBIT_S16_LE;
+ 
++		if (qcom_swrm_denali_feedback(ctrl, i)) {
++			bool cps = i == 10;
++
++			dais[i].playback = (struct snd_soc_pcm_stream) {
++				.stream_name = cps ? "SoundWire CPS Protection" : "SoundWire VI Protection",
++				.channels_min = 1,
++				.channels_max = 1,
++				.rates = cps ? SNDRV_PCM_RATE_24000 : SNDRV_PCM_RATE_8000,
++				.formats = SNDRV_PCM_FMTBIT_S32_LE,
++			};
++			if (qcom_swrm_fullio_capture_probe(ctrl)) {
++				dais[i].capture = dais[i].playback;
++				dais[i].capture.stream_name = cps ? "SoundWire CPS Capture" :
++								   "SoundWire VI Capture";
++			}
++		}
++
+ 		dais[i].ops = &qcom_swrm_pdm_dai_ops;
+ 		dais[i].id = i;
+ 	}
+@@ -1678,6 +2107,15 @@ static int qcom_swrm_probe(struct platform_device *pdev)
+ 	clk_prepare_enable(ctrl->hclk);
+ 
+ 	ctrl->dev = dev;
++	ctrl->fullio_link_gate = of_machine_is_compatible("microsoft,denali") &&
++		of_property_read_bool(dev->of_node, "qcom,denali-fullio-feedback") &&
++		of_property_read_bool(dev->of_node, "qcom,denali-fullio-link-gate");
++	if (ctrl->fullio_link_gate &&
++	    of_property_read_bool(dev->of_node, "qcom,denali-fullio-link-gate-test")) {
++		/* Synthetic policy denial only; never touch the bus or IRQ state. */
++		dev_info(dev, "FullIO test: seed new-stream denial without a hardware fault\n");
++		qcom_swrm_fullio_latch_link_error(ctrl, -ECANCELED);
++	}
+ 	dev_set_drvdata(&pdev->dev, ctrl);
+ 	mutex_init(&ctrl->port_lock);
+ 	init_completion(&ctrl->broadcast);
+@@ -1790,17 +2228,56 @@ static void qcom_swrm_remove(struct platform_device *pdev)
+ 	clk_disable_unprepare(ctrl->hclk);
+ }
+ 
++/*
++ * Observe the original transition; never clear, suppress or retry a clash
++ * from the diagnostic. The status registers are distinct from IRQ CLEAR.
++ */
++static void swrm_fullio_pm_snapshot(struct qcom_swrm_ctrl *ctrl,
++				    const char *stage, int transition_ret)
++{
++	u32 irq_status, frame_status, slave_status;
++	int irq_ret, frame_ret, slave_ret;
++
++	if (!qcom_swrm_fullio_pm_audit(ctrl))
++		return;
++
++	irq_ret = ctrl->reg_read(ctrl, ctrl->reg_layout[SWRM_REG_INTERRUPT_STATUS],
++				 &irq_status);
++	frame_ret = ctrl->reg_read(ctrl, ctrl->reg_layout[SWRM_REG_FRAME_GEN_ENABLED],
++				   &frame_status);
++	slave_ret = ctrl->reg_read(ctrl, SWRM_MCP_SLV_STATUS, &slave_status);
++	if (irq_ret || frame_ret || slave_ret) {
++		dev_warn(ctrl->dev,
++			 "FullIO PM transition %s: status unavailable irq=%d frame=%d slave=%d result=%d\n",
++			 stage, irq_ret, frame_ret, slave_ret, transition_ret);
++		return;
++	}
++	dev_info(ctrl->dev,
++		 "FullIO PM transition %s: clash=%d frame=%d result=%d slaves=0x%08x raw_irq=0x%08x\n",
++		 stage, !!(irq_status & SWRM_INTERRUPT_STATUS_MASTER_CLASH_DET),
++		 !!(frame_status & SWRM_FRM_GEN_ENABLED), transition_ret, slave_status, irq_status);
++}
++
+ static int __maybe_unused swrm_runtime_resume(struct device *dev)
+ {
+ 	struct qcom_swrm_ctrl *ctrl = dev_get_drvdata(dev);
+ 	int ret;
+ 
++	/* On FullIO preserve the suspended IRQ state if iface cannot start. */
++	if (ctrl->fullio_link_gate) {
++		ret = clk_prepare_enable(ctrl->hclk);
++		if (ret) {
++			qcom_swrm_fullio_latch_link_error(ctrl, ret);
++			return ret;
++		}
++	}
+ 	if (ctrl->wake_irq > 0) {
+ 		if (!irqd_irq_disabled(irq_get_irq_data(ctrl->wake_irq)))
+ 			disable_irq_nosync(ctrl->wake_irq);
+ 	}
+ 
+-	clk_prepare_enable(ctrl->hclk);
++	if (!ctrl->fullio_link_gate)
++		clk_prepare_enable(ctrl->hclk);
+ 	enable_irq(ctrl->irq);
+ 
+ 	if (ctrl->clock_stop_not_supported) {
+@@ -1820,43 +2297,117 @@ static int __maybe_unused swrm_runtime_resume(struct device *dev)
+ 		qcom_swrm_get_device_status(ctrl);
+ 		sdw_handle_slave_status(&ctrl->bus, ctrl->status);
+ 	} else {
+-		reset_control_reset(ctrl->audio_cgcr);
+-
++		int ee_ret = 0, start_ret, mask_ret = 0;
++
++		swrm_fullio_pm_snapshot(ctrl, "before-cgcr-reset", 0);
++		ret = reset_control_reset(ctrl->audio_cgcr);
++		swrm_fullio_pm_snapshot(ctrl, "after-cgcr-reset-before-clock-start", ret);
++		if (ctrl->fullio_link_gate && ret)
++			goto incomplete;
++
++		if (ctrl->version == SWRM_VERSION_1_7_0 || ctrl->version >= SWRM_VERSION_2_0_0) {
++			ee_ret = ctrl->reg_write(ctrl, SWRM_LINK_MANAGER_EE, ctrl->ee);
++			if (ctrl->fullio_link_gate && ee_ret) {
++				ret = ee_ret;
++				goto incomplete;
++			}
++		}
+ 		if (ctrl->version == SWRM_VERSION_1_7_0) {
+-			ctrl->reg_write(ctrl, SWRM_LINK_MANAGER_EE, ctrl->ee);
+-			ctrl->reg_write(ctrl, SWRM_MCP_BUS_CTRL,
+-					SWRM_MCP_BUS_CLK_START << ctrl->ee);
++			start_ret = ctrl->reg_write(ctrl, SWRM_MCP_BUS_CTRL,
++						    SWRM_MCP_BUS_CLK_START << ctrl->ee);
+ 		} else if (ctrl->version >= SWRM_VERSION_2_0_0) {
+-			ctrl->reg_write(ctrl, SWRM_LINK_MANAGER_EE, ctrl->ee);
+-			ctrl->reg_write(ctrl, SWRM_V2_0_CLK_CTRL +
+-					((int)ctrl->ee - SWRM_EE_CPU) *
+-					SWRM_V2_REG_EE_STRIDE,
+-					SWRM_V2_0_CLK_CTRL_CLK_START);
++			start_ret = ctrl->reg_write(ctrl, SWRM_V2_0_CLK_CTRL +
++						    ((int)ctrl->ee - SWRM_EE_CPU) *
++						    SWRM_V2_REG_EE_STRIDE,
++						    SWRM_V2_0_CLK_CTRL_CLK_START);
+ 		} else {
+-			ctrl->reg_write(ctrl, SWRM_MCP_BUS_CTRL, SWRM_MCP_BUS_CLK_START);
++			start_ret = ctrl->reg_write(ctrl, SWRM_MCP_BUS_CTRL, SWRM_MCP_BUS_CLK_START);
+ 		}
+ 
+-		ctrl->reg_write(ctrl, ctrl->reg_layout[SWRM_REG_INTERRUPT_CLEAR],
+-			SWRM_INTERRUPT_STATUS_MASTER_CLASH_DET);
++		ret = ee_ret ?: start_ret;
++		swrm_fullio_pm_snapshot(ctrl, "clock-start-before-clash-clear", ret);
++		if (ctrl->fullio_link_gate && ret)
++			goto incomplete;
++		ret = ctrl->reg_write(ctrl, ctrl->reg_layout[SWRM_REG_INTERRUPT_CLEAR],
++				      SWRM_INTERRUPT_STATUS_MASTER_CLASH_DET);
++		swrm_fullio_pm_snapshot(ctrl, "after-clash-clear-before-irq-restore", ret);
++		if (ctrl->fullio_link_gate && ret)
++			goto incomplete;
+ 
+ 		ctrl->intr_mask |= SWRM_INTERRUPT_STATUS_MASTER_CLASH_DET;
+ 		if (ctrl->version < SWRM_VERSION_2_0_0)
+-			ctrl->reg_write(ctrl,
+-					ctrl->reg_layout[SWRM_REG_INTERRUPT_MASK_ADDR],
+-					ctrl->intr_mask);
+-		ctrl->reg_write(ctrl, ctrl->reg_layout[SWRM_REG_INTERRUPT_CPU_EN],
+-				ctrl->intr_mask);
++			mask_ret = ctrl->reg_write(ctrl,
++						   ctrl->reg_layout[SWRM_REG_INTERRUPT_MASK_ADDR],
++						   ctrl->intr_mask);
++		ret = ctrl->reg_write(ctrl, ctrl->reg_layout[SWRM_REG_INTERRUPT_CPU_EN],
++				      ctrl->intr_mask);
++		ret = mask_ret ?: ret;
++		swrm_fullio_pm_snapshot(ctrl, "after-irq-restore-before-frame-wait", ret);
++		if (ctrl->fullio_link_gate && ret)
++			goto incomplete;
+ 
+ 		usleep_range(100, 105);
+-		if (!swrm_wait_for_frame_gen_enabled(ctrl))
++		if (!swrm_wait_for_frame_gen_enabled(ctrl)) {
+ 			dev_err(ctrl->dev, "link failed to connect\n");
++			ret = -ETIMEDOUT;
++			if (ctrl->fullio_link_gate)
++				goto incomplete;
++		}
++
++		swrm_fullio_pm_snapshot(ctrl, "before-exit-clock-stop", 0);
++		qcom_swrm_fullio_check_resumed_slots(ctrl);
++		ret = READ_ONCE(ctrl->fullio_link_error);
++		if (ret)
++			goto incomplete;
+ 
+ 		ret = sdw_bus_exit_clk_stop(&ctrl->bus);
+-		if (ret < 0)
++		swrm_fullio_pm_snapshot(ctrl, "after-exit-clock-stop", ret);
++		if (ret < 0) {
+ 			dev_err(ctrl->dev, "bus failed to exit clock stop %d\n", ret);
++			if (ctrl->fullio_link_gate)
++				goto incomplete;
++		}
++		qcom_swrm_fullio_check_resumed_slots(ctrl);
++		ret = READ_ONCE(ctrl->fullio_link_error);
++		if (ret)
++			goto incomplete;
+ 	}
+ 
+ 	return 0;
++
++incomplete:
++	/* Iface and IRQ ownership has already moved to the active side.
++	 * Keep that ownership for diagnosis/cleanup, but do not clock-stop
++	 * an uncertain bus again. Link admission separately stays locked.
++	 */
++	WRITE_ONCE(ctrl->fullio_pm_incomplete, true);
++	qcom_swrm_fullio_latch_link_error(ctrl, ret < 0 ? ret : -EIO);
++	return 0;
++}
++
++static int swrm_fullio_clock_stop_result(struct qcom_swrm_ctrl *ctrl, int ret)
++{
++	int error;
++
++	if (!ctrl->fullio_link_gate)
++		return ret;
++
++	/* A broadcast completion timeout can be surfaced as CMD_IGNORED
++	 * (-ENODATA) by SoundWire core. Never treat a known pair as empty.
++	 */
++	error = READ_ONCE(ctrl->fullio_link_error);
++	if (!error && ret == -ENODATA && !READ_ONCE(ctrl->fullio_seen_attached))
++		return ret;
++	error = error ?: ret;
++	if (!error)
++		return 0;
++
++	if (error == -ENODATA)
++		error = -ENODEV;
++	WRITE_ONCE(ctrl->fullio_pm_incomplete, true);
++	qcom_swrm_fullio_latch_link_error(ctrl, error);
++	error = READ_ONCE(ctrl->fullio_link_error);
++	return error == -ENODATA ? -ENODEV : error;
+ }
+ 
+ static int __maybe_unused swrm_runtime_suspend(struct device *dev)
+@@ -1864,7 +2415,16 @@ static int __maybe_unused swrm_runtime_suspend(struct device *dev)
+ 	struct qcom_swrm_ctrl *ctrl = dev_get_drvdata(dev);
+ 	int ret;
+ 
+-	swrm_wait_for_wr_fifo_done(ctrl);
++	if (READ_ONCE(ctrl->fullio_pm_incomplete))
++		return -EBUSY;
++	ret = READ_ONCE(ctrl->fullio_link_error);
++	if (ret)
++		return ret;
++	if (!swrm_wait_for_wr_fifo_done(ctrl) && ctrl->fullio_link_gate) {
++		/* Keep the IRQ/clock ownership unchanged, and do not retry here. */
++		qcom_swrm_fullio_latch_link_error(ctrl, -ETIMEDOUT);
++		return -ETIMEDOUT;
++	}
+ 	if (!ctrl->clock_stop_not_supported) {
+ 		/* Mask bus clash interrupt */
+ 		ctrl->intr_mask &= ~SWRM_INTERRUPT_STATUS_MASTER_CLASH_DET;
+@@ -1875,17 +2435,30 @@ static int __maybe_unused swrm_runtime_suspend(struct device *dev)
+ 		ctrl->reg_write(ctrl, ctrl->reg_layout[SWRM_REG_INTERRUPT_CPU_EN],
+ 				ctrl->intr_mask);
+ 		/* Prepare slaves for clock stop */
+-		ret = sdw_bus_prep_clk_stop(&ctrl->bus);
++		ret = swrm_fullio_clock_stop_result(ctrl, sdw_bus_prep_clk_stop(&ctrl->bus));
+ 		if (ret < 0 && ret != -ENODATA) {
+ 			dev_err(dev, "prepare clock stop failed %d", ret);
+ 			return ret;
+ 		}
+ 
+ 		ret = sdw_bus_clk_stop(&ctrl->bus);
++		swrm_fullio_pm_snapshot(ctrl, "after-enter-clock-stop", ret);
++		ret = swrm_fullio_clock_stop_result(ctrl, ret);
+ 		if (ret < 0 && ret != -ENODATA) {
+ 			dev_err(dev, "bus clock stop failed %d", ret);
+ 			return ret;
+ 		}
++		/* An ignored command on a never-seen bus has no frame proof. */
++		if (!ret && ctrl->fullio_link_gate &&
++		    of_property_read_bool(dev->of_node, "qcom,denali-fullio-wait-frame-stop")) {
++			ret = swrm_fullio_wait_for_frame_stop(ctrl);
++			/* A failed status read cannot prove an empty bus. */
++			ret = swrm_fullio_clock_stop_result(ctrl, ret == -ENODATA ? -EIO : ret);
++			if (ret) {
++				dev_err(dev, "FullIO frame stop unverified; iface kept on: %d\n", ret);
++				return ret;
++			}
++		}
+ 	}
+ 
+ 	disable_irq(ctrl->irq);
+diff --git a/drivers/soundwire/stream.c b/drivers/soundwire/stream.c
+index 31db368..e48ce10 100644
+--- a/drivers/soundwire/stream.c
++++ b/drivers/soundwire/stream.c
+@@ -62,6 +62,57 @@ int sdw_find_row_index(int row)
+ }
+ EXPORT_SYMBOL(sdw_find_row_index);
+ 
++static int sdw_program_simple_ext(struct sdw_bus *bus, struct sdw_slave *slave,
++				  struct sdw_transport_params *t_params,
++				  u32 registers)
++{
++	u32 blockctrl3, samplectrl2, hctrl, offsetctrl2;
++	u16 wbuf;
++	int ret;
++
++	if (bus->params.next_bank) {
++		blockctrl3 = SDW_DPN_BLOCKCTRL3_B1(t_params->port_num);
++		samplectrl2 = SDW_DPN_SAMPLECTRL2_B1(t_params->port_num);
++		hctrl = SDW_DPN_HCTRL_B1(t_params->port_num);
++		offsetctrl2 = SDW_DPN_OFFSETCTRL2_B1(t_params->port_num);
++	} else {
++		blockctrl3 = SDW_DPN_BLOCKCTRL3_B0(t_params->port_num);
++		samplectrl2 = SDW_DPN_SAMPLECTRL2_B0(t_params->port_num);
++		hctrl = SDW_DPN_HCTRL_B0(t_params->port_num);
++		offsetctrl2 = SDW_DPN_OFFSETCTRL2_B0(t_params->port_num);
++	}
++
++	if (registers & SDW_DPN_SIMPLE_TRANSPORT_BLOCKCTRL3) {
++		ret = sdw_write_no_pm(slave, blockctrl3, t_params->blk_pkg_mode);
++		if (ret < 0)
++			return ret;
++	}
++
++	if (registers & SDW_DPN_SIMPLE_TRANSPORT_SAMPLECTRL2) {
++		wbuf = FIELD_GET(SDW_DPN_SAMPLECTRL_HIGH,
++				 t_params->sample_interval - 1);
++		ret = sdw_write_no_pm(slave, samplectrl2, wbuf);
++		if (ret < 0)
++			return ret;
++	}
++
++	if (registers & SDW_DPN_SIMPLE_TRANSPORT_HCTRL) {
++		wbuf = FIELD_PREP(SDW_DPN_HCTRL_HSTART, t_params->hstart);
++		wbuf |= FIELD_PREP(SDW_DPN_HCTRL_HSTOP, t_params->hstop);
++		ret = sdw_write_no_pm(slave, hctrl, wbuf);
++		if (ret < 0)
++			return ret;
++	}
++
++	if (registers & SDW_DPN_SIMPLE_TRANSPORT_OFFSETCTRL2) {
++		ret = sdw_write_no_pm(slave, offsetctrl2, t_params->offset2);
++		if (ret < 0)
++			return ret;
++	}
++
++	return 0;
++}
++
+ static int _sdw_program_slave_port_params(struct sdw_bus *bus,
+ 					  struct sdw_slave *slave,
+ 					  struct sdw_transport_params *t_params,
+@@ -139,6 +190,8 @@ static int sdw_program_slave_port_params(struct sdw_bus *bus,
+ 	enum sdw_dpn_type port_type;
+ 	bool read_only_wordlength;
+ 	int ret;
++	u32 simple_transport_registers = 0;
++	u8 offset1 = t_params->offset1;
+ 	u8 wbuf;
+ 
+ 	if (s_rt->slave->is_mockup_device)
+@@ -154,6 +207,11 @@ static int sdw_program_slave_port_params(struct sdw_bus *bus,
+ 
+ 		read_only_wordlength = dpn_prop->read_only_wordlength;
+ 		port_type = dpn_prop->type;
++		if (port_type == SDW_DPN_SIMPLE) {
++			simple_transport_registers = dpn_prop->simple_transport_registers;
++			if (dpn_prop->override_offset1)
++				offset1 = dpn_prop->offset1;
++		}
+ 	} else {
+ 		read_only_wordlength = false;
+ 		port_type = SDW_DPN_FULL;
+@@ -209,7 +267,7 @@ static int sdw_program_slave_port_params(struct sdw_bus *bus,
+ 	}
+ 
+ 	/* Program DPN_OffsetCtrl1 registers */
+-	ret = sdw_write_no_pm(s_rt->slave, addr4, t_params->offset1);
++	ret = sdw_write_no_pm(s_rt->slave, addr4, offset1);
+ 	if (ret < 0) {
+ 		dev_err(&s_rt->slave->dev,
+ 			"DPN_OffsetCtrl1 register write failed for port %d\n",
+@@ -248,6 +306,10 @@ static int sdw_program_slave_port_params(struct sdw_bus *bus,
+ 				t_params->port_num);
+ 	}
+ 
++	if (simple_transport_registers)
++		return sdw_program_simple_ext(bus, s_rt->slave, t_params,
++						 simple_transport_registers);
++
+ 	return ret;
+ }
+ 
+diff --git a/include/linux/soundwire/sdw.h b/include/linux/soundwire/sdw.h
+index f710e59..dcc9d37 100644
+--- a/include/linux/soundwire/sdw.h
++++ b/include/linux/soundwire/sdw.h
+@@ -274,6 +274,11 @@ struct sdw_dp0_prop {
+ 	u32 *lane_list;
+ };
+ 
++#define SDW_DPN_SIMPLE_TRANSPORT_BLOCKCTRL3	BIT(0)
++#define SDW_DPN_SIMPLE_TRANSPORT_SAMPLECTRL2	BIT(1)
++#define SDW_DPN_SIMPLE_TRANSPORT_HCTRL		BIT(2)
++#define SDW_DPN_SIMPLE_TRANSPORT_OFFSETCTRL2	BIT(3)
++
+ /**
+  * struct sdw_dpn_prop - Data Port DPn properties
+  * @num: port number
+@@ -303,6 +308,9 @@ struct sdw_dp0_prop {
+  * @port_encoding: Payload Channel Sample encoding schemes supported
+  * @block_pack_mode: Type of block port mode supported
+  * @read_only_wordlength: Read Only wordlength field in DPN_BlockCtrl1 register
++ * @simple_transport_registers: Optional banked registers of a SIMPLE port
++ * @override_offset1: Use the slave-specific OffsetCtrl1 value
++ * @offset1: Slave OffsetCtrl1 when override_offset1 is set
+  * @simple_ch_prep_sm: If the port supports simplified channel prepare state
+  * machine
+  */
+@@ -330,6 +338,9 @@ struct sdw_dpn_prop {
+ 	bool block_pack_mode;
+ 	bool read_only_wordlength;
+ 	bool simple_ch_prep_sm;
++	u32 simple_transport_registers;
++	bool override_offset1;
++	u8 offset1;
+ };
+ 
+ /**

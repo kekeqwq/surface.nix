@@ -1,0 +1,230 @@
+diff --git a/include/sound/soc-dai.h b/include/sound/soc-dai.h
+index aeac0de..79f4cb4 100644
+--- a/include/sound/soc-dai.h
++++ b/include/sound/soc-dai.h
+@@ -330,6 +330,8 @@ struct snd_soc_dai_ops {
+ 	 * ALSA PCM audio operations - all optional.
+ 	 * Called by soc-core during audio PCM operations.
+ 	 */
++	/* Side-effect-free admission check, before pinctrl and runtime PM. */
++	int (*check_open)(struct snd_pcm_substream *, struct snd_soc_dai *);
+ 	int (*startup)(struct snd_pcm_substream *,
+ 		struct snd_soc_dai *);
+ 	void (*shutdown)(struct snd_pcm_substream *,
+diff --git a/sound/soc/qcom/x1e80100.c b/sound/soc/qcom/x1e80100.c
+index c927672..84dd6b6 100644
+--- a/sound/soc/qcom/x1e80100.c
++++ b/sound/soc/qcom/x1e80100.c
+@@ -3,15 +3,18 @@
+ 
+ #include <dt-bindings/sound/qcom,q6afe.h>
+ #include <linux/module.h>
++#include <linux/of.h>
+ #include <linux/platform_device.h>
+ #include <linux/soundwire/sdw.h>
+ #include <sound/pcm.h>
+ #include <sound/jack.h>
++#include <sound/pcm_params.h>
+ #include <sound/soc.h>
+ #include <sound/soc-dapm.h>
+ 
+ #include "common.h"
+ #include "qdsp6/q6afe.h"
++#include "qdsp6/q6apm.h"
+ #include "qdsp6/q6dsp-common.h"
+ #include "sdw.h"
+ 
+@@ -23,6 +26,29 @@ struct x1e80100_snd_data {
+ 	bool jack_setup;
+ };
+ 
++static int x1e80100_fullio_mix_cap(struct snd_soc_card *card)
++{
++	static const char * const controls[] = {
++		"WSA WSA_RX0_MIX Digital Volume",
++		"WSA WSA_RX1_MIX Digital Volume",
++	};
++	size_t i;
++	int ret;
++
++	if (!of_machine_is_compatible("microsoft,denali") ||
++	    !of_property_read_bool(card->dev->of_node, "microsoft,denali-fullio-muted-test"))
++		return 0;
++
++	/* S8 mixer values are offset by 84; unity is 84, not signed zero. */
++	for (i = 0; i < ARRAY_SIZE(controls); i++) {
++		ret = snd_soc_limit_volume(card, controls[i], 84);
++		if (ret)
++			return dev_err_probe(card->dev, ret, "cannot cap %s\n", controls[i]);
++	}
++
++	return 0;
++}
++
+ static int x1e80100_snd_init(struct snd_soc_pcm_runtime *rtd)
+ {
+ 	struct x1e80100_snd_data *data = snd_soc_card_get_drvdata(rtd->card);
+@@ -30,6 +56,7 @@ static int x1e80100_snd_init(struct snd_soc_pcm_runtime *rtd)
+ 	struct snd_soc_card *card = rtd->card;
+ 	struct snd_soc_jack *dp_jack = NULL;
+ 	int dp_pcm_id = 0;
++	int ret;
+ 
+ 	switch (cpu_dai->id) {
+ 	case WSA_CODEC_DMA_RX_0:
+@@ -43,12 +70,23 @@ static int x1e80100_snd_init(struct snd_soc_pcm_runtime *rtd)
+ 		snd_soc_limit_volume(card, "WSA WSA_RX1 Digital Volume", 81);
+ 		snd_soc_limit_volume(card, "WSA2 WSA_RX0 Digital Volume", 81);
+ 		snd_soc_limit_volume(card, "WSA2 WSA_RX1 Digital Volume", 81);
+-		snd_soc_limit_volume(card, "SpkrLeft PA Volume", 6);
+-		snd_soc_limit_volume(card, "SpkrRight PA Volume", 6);
++		/* The protected reference route validates PA Volume 24 on both
++		 * amps with live VI/CPS. Keep the upstream damage cap when that
++		 * route is not explicitly selected.
++		 */
++		if (!of_machine_is_compatible("microsoft,denali") ||
++		    !of_property_read_bool(card->dev->of_node,
++					  "microsoft,denali-fullio-reference-render")) {
++			snd_soc_limit_volume(card, "SpkrLeft PA Volume", 6);
++			snd_soc_limit_volume(card, "SpkrRight PA Volume", 6);
++		}
+ 		snd_soc_limit_volume(card, "WooferLeft PA Volume", 6);
+ 		snd_soc_limit_volume(card, "TweeterLeft PA Volume", 6);
+ 		snd_soc_limit_volume(card, "WooferRight PA Volume", 6);
+ 		snd_soc_limit_volume(card, "TweeterRight PA Volume", 6);
++		ret = x1e80100_fullio_mix_cap(card);
++		if (ret)
++			return ret;
+ 		break;
+ 	case DISPLAY_PORT_RX_0:
+ 		dp_pcm_id = 0;
+@@ -94,6 +132,19 @@ static int x1e80100_be_hw_params_fixup(struct snd_soc_pcm_runtime *rtd,
+ 	struct snd_interval *channels = hw_param_interval(params,
+ 							  SNDRV_PCM_HW_PARAM_CHANNELS);
+ 
++	/* FullIO sidechains are not ordinary 48 kHz multimedia streams. */
++	if (of_machine_is_compatible("microsoft,denali") &&
++	    (cpu_dai->id == WSA_CODEC_DMA_TX_0 ||
++	     cpu_dai->id == WSA_CODEC_DMA_TX_1)) {
++		struct snd_mask *format = hw_param_mask(params, SNDRV_PCM_HW_PARAM_FORMAT);
++
++		rate->min = rate->max = cpu_dai->id == WSA_CODEC_DMA_TX_0 ? 8000 : 24000;
++		channels->min = channels->max = 2;
++		snd_mask_none(format);
++		snd_mask_set_format(format, SNDRV_PCM_FORMAT_S32_LE);
++		return 0;
++	}
++
+ 	rate->min = rate->max = 48000;
+ 	switch (cpu_dai->id) {
+ 	case TX_CODEC_DMA_TX_0:
+@@ -137,6 +188,51 @@ static int x1e80100_snd_hw_map_channels(unsigned int *ch_map, int num)
+ 	return 0;
+ }
+ 
++#if IS_REACHABLE(CONFIG_SND_SOC_LPASS_WSA_MACRO)
++int wsa_macro_fullio_clock_off_for_feedback(struct snd_soc_card *card);
++#else
++static int wsa_macro_fullio_clock_off_for_feedback(struct snd_soc_card *card)
++{
++	return -EOPNOTSUPP;
++}
++#endif
++
++static void x1e80100_fullio_feedback(struct snd_pcm_substream *substream, bool enabled)
++{
++	struct snd_soc_pcm_runtime *rtd = snd_soc_substream_to_rtd(substream);
++	struct snd_soc_dai *cpu_dai = snd_soc_rtd_to_cpu(rtd, 0);
++	const char *model = NULL;
++	int ret;
++
++	if (!of_machine_is_compatible("microsoft,denali") ||
++	    of_property_read_string(rtd->card->dev->of_node, "model", &model) ||
++	    strcmp(model, "X1E80100-Microsoft-Surface-Pro-11-FullIO-v19c0"))
++		return;
++
++	switch (cpu_dai->id) {
++	case WSA_CODEC_DMA_TX_0:
++		q6apm_fullio_set_transport(cpu_dai->dev, Q6APM_FULLIO_VI, enabled);
++		break;
++	case WSA_CODEC_DMA_TX_1:
++		q6apm_fullio_set_transport(cpu_dai->dev, Q6APM_FULLIO_CPS, enabled);
++		break;
++	default:
++		return;
++	}
++
++	/* Revoke the graph's transport epoch before touching clocks. The
++	 * machine caller still performs hw_free/shutdown on an error here.
++	 */
++	if (!enabled &&
++	    (of_property_read_bool(rtd->card->dev->of_node, "microsoft,denali-fullio-post-pa-test") ||
++	     of_property_read_bool(rtd->card->dev->of_node, "microsoft,denali-fullio-clock-off-audit"))) {
++		ret = wsa_macro_fullio_clock_off_for_feedback(rtd->card);
++		if (ret)
++			dev_err_ratelimited(rtd->card->dev,
++					    "FullIO clock shutdown/audit failed at feedback teardown: %d\n", ret);
++	}
++}
++
+ static int x1e80100_snd_prepare(struct snd_pcm_substream *substream)
+ {
+ 	struct snd_soc_pcm_runtime *rtd = snd_soc_substream_to_rtd(substream);
+@@ -162,7 +258,14 @@ static int x1e80100_snd_prepare(struct snd_pcm_substream *substream)
+ 		break;
+ 	}
+ 
+-	return qcom_snd_sdw_prepare(substream, &data->stream_prepared[cpu_dai->id]);
++	ret = qcom_snd_sdw_prepare(substream, &data->stream_prepared[cpu_dai->id]);
++	/* The generic helper also succeeds without a stream. Check that a
++	 * real SoundWire runtime did reach the enabled state.
++	 */
++	x1e80100_fullio_feedback(substream,
++				 !ret && data->stream_prepared[cpu_dai->id] &&
++				 !IS_ERR_OR_NULL(qcom_snd_sdw_get_stream(substream)));
++	return ret;
+ }
+ 
+ static int x1e80100_snd_hw_free(struct snd_pcm_substream *substream)
+@@ -171,12 +274,19 @@ static int x1e80100_snd_hw_free(struct snd_pcm_substream *substream)
+ 	struct x1e80100_snd_data *data = snd_soc_card_get_drvdata(rtd->card);
+ 	struct snd_soc_dai *cpu_dai = snd_soc_rtd_to_cpu(rtd, 0);
+ 
++	x1e80100_fullio_feedback(substream, false);
+ 	return qcom_snd_sdw_hw_free(substream, &data->stream_prepared[cpu_dai->id]);
+ }
+ 
++static void x1e80100_snd_shutdown(struct snd_pcm_substream *substream)
++{
++	x1e80100_fullio_feedback(substream, false);
++	qcom_snd_sdw_shutdown(substream);
++}
++
+ static const struct snd_soc_ops x1e80100_be_ops = {
+ 	.startup = qcom_snd_sdw_startup,
+-	.shutdown = qcom_snd_sdw_shutdown,
++	.shutdown = x1e80100_snd_shutdown,
+ 	.hw_free = x1e80100_snd_hw_free,
+ 	.prepare = x1e80100_snd_prepare,
+ };
+diff --git a/sound/soc/soc-pcm.c b/sound/soc/soc-pcm.c
+index ef8ccf5..b90ac46 100644
+--- a/sound/soc/soc-pcm.c
++++ b/sound/soc/soc-pcm.c
+@@ -880,6 +880,16 @@ static int __soc_pcm_open(struct snd_soc_pcm_runtime *rtd,
+ 
+ 	snd_soc_dpcm_mutex_assert_held(rtd);
+ 
++	/* No open state has been acquired yet; do not run rollback on denial. */
++	for_each_rtd_dais(rtd, i, dai) {
++		if (!snd_soc_dai_stream_valid(dai, substream->stream) ||
++		    !dai->driver->ops || !dai->driver->ops->check_open)
++			continue;
++		ret = dai->driver->ops->check_open(substream, dai);
++		if (ret < 0)
++			return soc_pcm_ret(rtd, ret);
++	}
++
+ 	for_each_rtd_components(rtd, i, component)
+ 		pinctrl_pm_select_default_state(component->dev);
+ 

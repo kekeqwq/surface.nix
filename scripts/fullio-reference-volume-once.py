@@ -2,7 +2,7 @@
 """Apply one fixed reference endpoint volume/mute transaction.
 
 Drives the FullIO endpoint controls introduced by
-sp11-fullio-native-endpoint-controls.patch: the pinned v19c final
+audioreach-fullio.patch: the pinned v19c final
 VOL_CTRL (Q28 per channel) followed by its exact GainStep calibration
 delta, then the reviewed mute selector. This arms the protected route
 for a controlled listening check; it does not run the UbiG/Stage-B live

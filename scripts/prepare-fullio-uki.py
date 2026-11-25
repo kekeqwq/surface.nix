@@ -1,9 +1,5 @@
 #!/usr/bin/env python3
-"""Build a verified FullIO test UKI privately; never touch the ESP.
-
-The muted mode stages a PA-off fixture; the reference mode stages the
-protected reference-render fixture after verifying its exact DT markers.
-"""
+"""Stage the protected FullIO reference UKI privately after verifying its DTB."""
 
 import argparse
 import importlib.util
@@ -14,17 +10,8 @@ import subprocess
 import tempfile
 
 
-RELEASE_SUFFIXES = ("-surface-fullio-muted-test", "-surface-fullio-feedback-probe")
+REFERENCE_RELEASE_SUFFIX = "-surface-fullio-muted-test"
 ZAP = "qcom/x1e80100/microsoft/qcdxkmsuc8380.mbn"
-
-
-def verify_pa_off_dtb(dtb, fdtget):
-    properties = set(subprocess.check_output([fdtget, "-p", dtb, "/sound"], text=True).splitlines())
-    if "microsoft,denali-fullio-muted-test" not in properties:
-        raise ValueError("DTB is missing the FullIO muted marker")
-    forbidden = {"microsoft,denali-fullio-post-pa-test", "microsoft,denali-fullio-pa-on-smoke"}
-    if unsafe := properties & forbidden:
-        raise ValueError(f"DTB carries PA-enabling markers: {', '.join(sorted(unsafe))}")
 
 
 def verify_reference_dtb(dtb, fdtget):
@@ -55,8 +42,6 @@ def main():
     cli.add_argument("system", type=Path, help="built candidate toplevel")
     cli.add_argument("private_firmware", type=Path)
     cli.add_argument("stage_parent", type=Path, help="private directory off the ESP")
-    cli.add_argument("--mode", choices=("muted", "reference"), default="muted",
-                     help="muted PA-off fixture (default) or protected reference-render fixture")
     cli.add_argument("--fdtget", default="fdtget", help="DTB reader from dtc (default: fdtget on PATH)")
     args = cli.parse_args()
     os.umask(0o077)
@@ -78,17 +63,14 @@ def main():
         cli.error("expected an unbooted candidate from the local Nix store")
     pieces = candidate / "surface-boot"
     version = (pieces / "uname").read_text().strip()
-    if not version.endswith(RELEASE_SUFFIXES):
-        cli.error("candidate is not a muted FullIO build")
-    # The suffix is shared by historical PA-on candidates. Verify the exact
-    # binary DTB that private_uki() will embed before creating any output.
+    if not version.endswith(REFERENCE_RELEASE_SUFFIX):
+        cli.error("candidate does not have the expected FullIO kernel release")
+    # The suffix is also used by retired experiments. Require the protected
+    # render DTB, not just a matching release string.
     try:
-        if args.mode == "reference":
-            verify_reference_dtb(pieces / "dtb", args.fdtget)
-        else:
-            verify_pa_off_dtb(pieces / "dtb", args.fdtget)
+        verify_reference_dtb(pieces / "dtb", args.fdtget)
     except (OSError, subprocess.CalledProcessError, ValueError) as exc:
-        cli.error(f"cannot verify {args.mode} fixture DTB: {exc}")
+        cli.error(f"cannot verify reference fixture DTB: {exc}")
     line = Path("/proc/cmdline").read_text().strip()
     match = re.findall(r"(?:^|\s)init=(\S+)", line)
     if match != [str(active / "init")] or "firmware_class.path=/surface-firmware" not in line.split():
@@ -99,10 +81,10 @@ def main():
     installer = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(installer)
     with tempfile.TemporaryDirectory(prefix=".build-", dir=parent) as tmp:
-        stage = Path(tmp) / f"fullio-{args.mode}.efi"
+        stage = Path(tmp) / "fullio-reference.efi"
         installer.private_uki(here / "inspect-efi-payload.py", pieces, line, firmware, [], stage, candidate)
         # Publish only through an exclusive hardlink; no existing UKI is replaced.
-        output = parent / f"fullio-{args.mode}.efi"
+        output = parent / stage.name
         stage.chmod(0o600)
         os.link(stage, output)
     print(f"Verified private UKI: {output} (not installed or selected)")

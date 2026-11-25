@@ -2,9 +2,9 @@
 # Native build only. Never changes a profile, switch or running system.
 set -euo pipefail
 s=${1:?pass native fixture work directory}
-fixture=${2:-fullio-link-gate-test}
+[[ $# == 1 ]]
 [[ $(hostname -s) == surface && $(uname -m) == aarch64 && $(id -un) == keke ]]
-[[ $s =~ ^/home/keke/\.local/state/fullio-[a-zA-Z0-9-]+$ && -f $s/hardware/flake.nix && $fixture =~ ^fullio-[a-z0-9-]+$ ]]
+[[ $s =~ ^/home/keke/\.local/state/fullio-[a-zA-Z0-9-]+$ && -f $s/hardware/flake.nix ]]
 [[ ! -e $s/status && ! -e $s/system ]]
 [[ $(id -un) == keke && -d $HOME/Repos/flakes && -f $s/booted-system ]]
 trap 'rc=$?; printf "%s\n" "$rc" > "$s/status"; exit "$rc"' EXIT
@@ -21,9 +21,9 @@ default_before=$(sudo_run bootctl status --no-pager | awk '/^Default Boot Loader
 [[ $default_before == nixos-3aae9950e05724a6f75ac7703476b7b4d3ceb0f8ea5bba8665aace82d3a98a62.conf ]]
 src=$(readlink -e "$s/hardware")
 [[ $src =~ ^/home/keke/\.local/state/fullio-[a-zA-Z0-9-]+/hardware$ ]]
-apply="c: (c.extendModules { modules = [ (builtins.getFlake \"path:$src\").nixosModules.$fixture ]; }).config.system.build.toplevel.drvPath"
+apply="c: (c.extendModules { modules = [ (builtins.getFlake \"path:$src\").nixosModules.fullio-reference-render ]; }).config.system.build.toplevel.drvPath"
 drv=$(nix eval "path:$HOME/Repos/flakes#nixosConfigurations.surface" --no-write-lock-file --impure --apply "$apply" --raw)
-printf 'Native %s derivation: %s\n' "$fixture" "$drv"
+printf 'Native FullIO reference derivation: %s\n' "$drv"
 [[ $drv =~ ^/nix/store/[a-z0-9]{32}-nixos-system-surface-[a-zA-Z0-9._-]+\.drv$ ]]
 nix build -L -v "$drv^out" --out-link "$s/system"
 sys=$(readlink -e "$s/system")

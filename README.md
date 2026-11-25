@@ -13,7 +13,7 @@ Opt-in NixOS hardware support for the **Surface Pro 11 Denali non-5G OLED** (Sna
 }
 ```
 
-Set `nixpkgs.hostPlatform` to `aarch64-linux`. Follow the consuming flake's `nixpkgs` input. The default and only kernel is kernel.org `next-20261120` with the audited Denali Kconfig and isolated SPI-HID/QSPI touch queue. The module supplies the OLED DTB, native device firmware, touch, and ARM64 zboot UKIs. The host owns its partitions, accounts, and desktop. `surface.devices.denali.niriOutputs` is an optional value to pass into an existing Niri configuration, not a compositor installation.
+Set `nixpkgs.hostPlatform` to `aarch64-linux`. Follow the consuming flake's `nixpkgs` input. The default kernel is kernel.org `next-20261120` with the audited Denali Kconfig and isolated SPI-HID/QSPI touch queue. The module supplies the OLED DTB, native device firmware, touch, and ARM64 zboot UKIs. The host owns its partitions, accounts, and desktop. `surface.devices.denali.niriOutputs` is an optional value to pass into an existing Niri configuration, not a compositor installation.
 
 ## Private firmware
 
@@ -39,6 +39,25 @@ locally administered address. On UART controller add, the module waits for
 firmware setup and supplies the address only if the controller needs one.
 BlueZ still owns power policy and pairing. This does not modify Wi-Fi or
 unrelated Bluetooth adapters.
+
+## Protected internal speakers (opt-in)
+
+`nixosModules.fullio-reference-render` is the only FullIO profile. It extends
+`nixosModules.default` on ARM64 Denali with the pinned v19c topology and
+Golden v33 protected stereo route, and keeps MicArray available to the
+desktop. The endpoint is set to −3 dB; use the desktop slider for normal
+changes. The profile does not start an acoustic capture service.
+
+This profile is still validated as a private one-shot boot, not a replacement
+for the default kernel or Gen20 recovery entry. On the test host,
+`scripts/build-fullio-fixture.sh` builds only, `scripts/prepare-fullio-uki.py`
+stages the reference UKI outside the ESP, and
+`scripts/arm-fullio-reference-once.sh` performs the recovery preflight before
+arming it. Do not put the private UKI in Git or the Nix store. See the
+[listening checkpoint](docs/audio-protection-audit.md#listening-checkpoint--2026-11-25)
+for evidence and remaining limits. The six kernel patches live in
+[`pkgs/patches/fullio`](pkgs/patches/fullio); earlier experiment entry points
+are available in Git history, not as current flake outputs.
 
 ## Validation and development
 

@@ -1,0 +1,1789 @@
+diff --git a/sound/soc/codecs/lpass-wsa-macro.c b/sound/soc/codecs/lpass-wsa-macro.c
+index 2b63954..2c2f63f 100644
+--- a/sound/soc/codecs/lpass-wsa-macro.c
++++ b/sound/soc/codecs/lpass-wsa-macro.c
+@@ -373,6 +373,7 @@ enum {
+ 	WSA_MACRO_AIF_MIX1_PB,
+ 	WSA_MACRO_AIF_VI,
+ 	WSA_MACRO_AIF_ECHO,
++	WSA_MACRO_AIF_CPS,
+ 	WSA_MACRO_MAX_DAIS,
+ };
+ 
+@@ -397,6 +398,9 @@ struct wsa_reg_layout {
+ };
+ 
+ struct wsa_macro {
++	struct mutex fullio_clock_lock;
++	bool fullio_clock_pm;
++	bool fullio_clock_fault;
+ 	struct device *dev;
+ 	int comp_enabled[WSA_MACRO_COMP_MAX];
+ 	int ec_hq[WSA_MACRO_RX1 + 1];
+@@ -1332,6 +1336,18 @@ static int wsa_macro_hw_params(struct snd_pcm_substream *substream,
+ 	struct wsa_macro *wsa = snd_soc_component_get_drvdata(component);
+ 	int ret;
+ 
++	if (dai->id == WSA_MACRO_AIF_VI) {
++		wsa->pcm_rate_vi = params_rate(params);
++		return 0;
++	}
++
++	/* CPS is already framed by the WSA8845 SoundWire DP6 source.  This
++	 * logical macro endpoint only carries it to WSA_CODEC_DMA_TX_1 and must
++	 * not reprogram the VI sensing rate/state machine.
++	 */
++	if (dai->id == WSA_MACRO_AIF_CPS)
++		return 0;
++
+ 	switch (substream->stream) {
+ 	case SNDRV_PCM_STREAM_PLAYBACK:
+ 		ret = wsa_macro_set_interpolator_rate(dai, params_rate(params));
+@@ -1343,9 +1359,6 @@ static int wsa_macro_hw_params(struct snd_pcm_substream *substream,
+ 		}
+ 		break;
+ 	case SNDRV_PCM_STREAM_CAPTURE:
+-		if (dai->id == WSA_MACRO_AIF_VI)
+-			wsa->pcm_rate_vi = params_rate(params);
+-
+ 		break;
+ 	default:
+ 		break;
+@@ -1379,6 +1392,10 @@ static int wsa_macro_get_channel_map(const struct snd_soc_dai *dai,
+ 		*rx_slot = mask;
+ 		*rx_num = cnt;
+ 		break;
++	case WSA_MACRO_AIF_CPS:
++		*tx_num = 2;
++		*tx_slot = GENMASK(1, 0);
++		break;
+ 	case WSA_MACRO_AIF_ECHO:
+ 		val = snd_soc_component_read(component, CDC_WSA_RX_INP_MUX_RX_MIX_CFG0);
+ 		if (val & WSA_MACRO_EC_MIX_TX1_MASK) {
+@@ -1436,6 +1453,19 @@ static struct snd_soc_dai_driver wsa_macro_dai[] = {
+ 	{
+ 		.name = "wsa_macro_vifeedback",
+ 		.id = WSA_MACRO_AIF_VI,
++		.playback = {
++			/*
++			 * Companion playback semantics make VI feedback start
++			 * atomically with the protected render graph.
++			 */
++			.stream_name = "WSA_AIF_VI Protection",
++			.rates = SNDRV_PCM_RATE_8000,
++			.formats = SNDRV_PCM_FMTBIT_S32_LE,
++			.rate_max = 8000,
++			.rate_min = 8000,
++			.channels_min = 1,
++			.channels_max = 4,
++		},
+ 		.capture = {
+ 			.stream_name = "WSA_AIF_VI Capture",
+ 			.rates = SNDRV_PCM_RATE_8000 | SNDRV_PCM_RATE_48000,
+@@ -1461,6 +1491,29 @@ static struct snd_soc_dai_driver wsa_macro_dai[] = {
+ 		},
+ 		.ops = &wsa_macro_dai_ops,
+ 	},
++	{
++		.name = "wsa_macro_cps",
++		.id = WSA_MACRO_AIF_CPS,
++		.playback = {
++			.stream_name = "WSA_AIF_CPS Protection",
++			.rates = SNDRV_PCM_RATE_24000,
++			.formats = SNDRV_PCM_FMTBIT_S32_LE,
++			.rate_max = 24000,
++			.rate_min = 24000,
++			.channels_min = 2,
++			.channels_max = 2,
++		},
++		.capture = {
++			.stream_name = "WSA_AIF_CPS Capture",
++			.rates = SNDRV_PCM_RATE_24000,
++			.formats = SNDRV_PCM_FMTBIT_S32_LE,
++			.rate_max = 24000,
++			.rate_min = 24000,
++			.channels_min = 2,
++			.channels_max = 2,
++		},
++		.ops = &wsa_macro_dai_ops,
++	},
+ };
+ 
+ static void wsa_macro_mclk_enable(struct wsa_macro *wsa, bool mclk_enable)
+@@ -1548,6 +1601,316 @@ static void wsa_macro_enable_disable_vi_sense(struct snd_soc_component *componen
+ 	}
+ }
+ 
++static const struct snd_soc_component_driver wsa_macro_component_drv;
++static const unsigned int fullio_tx_regs[] = {
++	CDC_WSA_TX0_SPKR_PROT_PATH_CTL, CDC_WSA_TX1_SPKR_PROT_PATH_CTL,
++	CDC_WSA_TX2_SPKR_PROT_PATH_CTL, CDC_WSA_TX3_SPKR_PROT_PATH_CTL,
++};
++
++static int wsa_macro_fullio_tx_update(struct wsa_macro *wsa, unsigned int first,
++				     unsigned int end, unsigned int mask,
++				     unsigned int value, bool exhaustive)
++{
++	int first_error = 0, ret;
++	unsigned int i, actual;
++
++	for (i = first; i < end; i++) {
++		ret = regmap_update_bits(wsa->regmap, fullio_tx_regs[i], mask, value);
++		if (!ret)
++			ret = regmap_read_bypassed(wsa->regmap, fullio_tx_regs[i], &actual);
++		if (!ret && (actual & mask) != value)
++			ret = -EIO;
++		if (ret && !first_error)
++			first_error = ret;
++		if (ret && !exhaustive)
++			break;
++	}
++	return first_error;
++}
++
++static bool wsa_macro_fullio_post_pa_probe(struct snd_soc_component *component)
++{
++	return component->card && of_machine_is_compatible("microsoft,denali") &&
++	       of_property_read_bool(component->card->dev->of_node,
++				     "microsoft,denali-fullio-post-pa-test");
++}
++
++static bool wsa_macro_fullio_reference_route(struct snd_soc_card *card)
++{
++	return card && of_machine_is_compatible("microsoft,denali") &&
++	       of_property_read_bool(card->dev->of_node, "microsoft,denali-fullio-reference-render") &&
++	       !of_property_read_bool(card->dev->of_node, "microsoft,denali-fullio-muted-test");
++}
++
++static bool wsa_macro_fullio_clock_audit(struct snd_soc_card *card)
++{
++	return card && of_machine_is_compatible("microsoft,denali") &&
++	       of_property_read_bool(card->dev->of_node, "microsoft,denali-fullio-clock-off-audit");
++}
++
++/* Golden v33 applies this at the producer after enabling the VI paths.
++ * Do not substitute a downstream channel swap: that would double-correct.
++ */
++static int wsa_macro_fullio_v33_vi_order(struct wsa_macro *wsa)
++{
++	unsigned int actual;
++	int ret;
++
++	/* Force a write even if the cached value already equals 0x03. */
++	ret = regmap_write(wsa->regmap, CDC_WSA_TOP_TOP_CFG1, 0x03);
++	if (ret)
++		return ret;
++	ret = regmap_read_bypassed(wsa->regmap, CDC_WSA_TOP_TOP_CFG1, &actual);
++	if (ret)
++		return ret;
++	return actual == 0x03 ? 0 : -EIO;
++}
++
++static int wsa_macro_fullio_start_pair(struct wsa_macro *wsa, unsigned int first)
++{
++	unsigned int end = first + 2;
++	int ret;
++
++	ret = wsa_macro_fullio_tx_update(wsa, first, end, CDC_WSA_TX_SPKR_PROT_RESET_MASK,
++					 CDC_WSA_TX_SPKR_PROT_RESET, false);
++	if (!ret)
++		ret = wsa_macro_fullio_tx_update(wsa, first, end, CDC_WSA_TX_SPKR_PROT_PCM_RATE_MASK,
++						 CDC_WSA_TX_SPKR_PROT_PCM_RATE_8K, false);
++	if (!ret)
++		ret = wsa_macro_fullio_tx_update(wsa, first, end, CDC_WSA_TX_SPKR_PROT_CLK_EN_MASK,
++						 CDC_WSA_TX_SPKR_PROT_CLK_ENABLE, false);
++	if (!ret)
++		ret = wsa_macro_fullio_tx_update(wsa, first, end, CDC_WSA_TX_SPKR_PROT_RESET_MASK,
++						 CDC_WSA_TX_SPKR_PROT_NO_RESET, false);
++	return ret ?: wsa_macro_fullio_v33_vi_order(wsa);
++}
++
++/* Only a future card-local coordinator can supply hardware/mute verification.
++ * There is deliberately no caller and no board opt-in in this patch.
++ */
++static int wsa_macro_fullio_verify_clocks_off_locked(struct wsa_macro *wsa);
++
++static int wsa_macro_fullio_tx_clocks(struct snd_soc_component *component, bool enable,
++				     int (*verify_ready)(void *ctx), void *ctx)
++{
++	struct wsa_macro *wsa = snd_soc_component_get_drvdata(component);
++	int ret, cleanup;
++	guard(mutex)(&wsa->fullio_clock_lock);
++	if (!enable && !wsa->fullio_clock_pm)
++		return wsa_macro_fullio_verify_clocks_off_locked(wsa);
++	if (enable) {
++		if (wsa_macro_fullio_clock_audit(component->card) || !verify_ready || wsa->fullio_clock_fault)
++			return -EPERM;
++		ret = verify_ready(ctx);
++		if (ret)
++			return ret;
++		if (wsa->fullio_clock_pm)
++			return -EBUSY;
++		ret = pm_runtime_resume_and_get(wsa->dev);
++		if (ret < 0)
++			return ret;
++		ret = verify_ready(ctx);
++		if (ret) {
++			/* No TX lane was touched; drop only this transient vote. */
++			pm_runtime_put_autosuspend(wsa->dev);
++			return ret;
++		}
++		wsa->fullio_clock_pm = true;
++		ret = wsa_macro_fullio_start_pair(wsa, 0);
++		if (!ret)
++			ret = verify_ready(ctx);
++		if (!ret)
++			ret = wsa_macro_fullio_start_pair(wsa, 2);
++		if (!ret)
++			ret = verify_ready(ctx);
++		if (!ret)
++			return 0;
++	} else {
++		ret = 0;
++	}
++
++	cleanup = wsa_macro_fullio_tx_update(wsa, 0, ARRAY_SIZE(fullio_tx_regs),
++					     CDC_WSA_TX_SPKR_PROT_RESET_MASK |
++					     CDC_WSA_TX_SPKR_PROT_CLK_EN_MASK,
++					     CDC_WSA_TX_SPKR_PROT_RESET, true);
++	if (cleanup) {
++		wsa->fullio_clock_fault = true;
++		dev_err(wsa->dev, "FullIO protection clock shutdown unverified: %d\n", cleanup);
++		return ret ?: cleanup;
++	}
++	wsa->fullio_clock_pm = false;
++	pm_runtime_put_autosuspend(wsa->dev);
++	return ret;
++}
++int wsa_macro_fullio_protclk(struct snd_soc_component *component, bool enable,
++			    int (*verify_ready)(void *ctx), void *ctx);
++int wsa_macro_fullio_protclk(struct snd_soc_component *component, bool enable,
++			    int (*verify_ready)(void *ctx), void *ctx)
++{
++	if (!component || component->driver != &wsa_macro_component_drv ||
++	    !wsa_macro_fullio_post_pa_probe(component))
++		return -EOPNOTSUPP;
++	return wsa_macro_fullio_tx_clocks(component, enable, verify_ready, ctx);
++}
++EXPORT_SYMBOL_GPL(wsa_macro_fullio_protclk);
++
++/* No clock-control writes in the PA-off audit. Read all four lanes so
++ * an unexpected enabling path is visible even when the DSP stays silent.
++ */
++static int wsa_macro_fullio_verify_clocks_off_locked(struct wsa_macro *wsa)
++{
++	unsigned int i, value, on = 0;
++	int ret;
++
++	lockdep_assert_held(&wsa->fullio_clock_lock);
++	if (wsa->fullio_clock_pm || wsa->fullio_clock_fault)
++		return -EBUSY;
++	ret = pm_runtime_resume_and_get(wsa->dev);
++	if (ret < 0)
++		return ret;
++	for (i = 0; i < ARRAY_SIZE(fullio_tx_regs); i++) {
++		ret = regmap_read_bypassed(wsa->regmap, fullio_tx_regs[i], &value);
++		if (ret)
++			break;
++		if (value & CDC_WSA_TX_SPKR_PROT_CLK_EN_MASK)
++			on |= BIT(i);
++	}
++	pm_runtime_mark_last_busy(wsa->dev);
++	pm_runtime_put_autosuspend(wsa->dev);
++	if (ret)
++		return ret;
++	if (on) {
++		dev_err_ratelimited(wsa->dev, "FullIO clock-off audit found enabled TX lanes: %#x\n", on);
++		return -EBUSY;
++	}
++	dev_info_ratelimited(wsa->dev, "FullIO clock-off audit: TX0-TX3 hardware readback off\n");
++	return 0;
++}
++
++static int wsa_macro_fullio_verify_clocks_off(struct snd_soc_component *owner)
++{
++	struct wsa_macro *wsa = snd_soc_component_get_drvdata(owner);
++
++	guard(mutex)(&wsa->fullio_clock_lock);
++	return wsa_macro_fullio_verify_clocks_off_locked(wsa);
++}
++
++/* Resolve clock ownership from the card's playback link, not global state. */
++static struct snd_soc_component *
++wsa_macro_fullio_clock_owner(struct snd_soc_card *card,
++			     struct snd_soc_component *left, struct snd_soc_component *right)
++{
++	struct snd_soc_pcm_runtime *rtd, *target = NULL;
++	struct snd_soc_component *owner = NULL;
++	struct snd_soc_dai *codec;
++	unsigned int left_count = 0, right_count = 0;
++	int i;
++
++	for_each_card_rtds(card, rtd) {
++		if (strcmp(rtd->dai_link->name, "WSA Playback"))
++			continue;
++		if (target)
++			return ERR_PTR(-EEXIST);
++		target = rtd;
++	}
++	if (!target)
++		return ERR_PTR(-ENODEV);
++	for_each_rtd_codec_dais(target, i, codec) {
++		if (codec->component == left)
++			left_count++;
++		if (codec->component == right)
++			right_count++;
++		if (codec->component->driver != &wsa_macro_component_drv)
++			continue;
++		if (owner)
++			return ERR_PTR(-EEXIST);
++		owner = codec->component;
++	}
++	if ((left && left_count != 1) || (right && right_count != 1) ||
++	    !owner || owner->card != card)
++		return ERR_PTR(-ENODEV);
++	return owner;
++}
++
++static struct snd_soc_component *
++wsa_macro_fullio_reference_owner(struct snd_soc_component *left,
++				 struct snd_soc_component *right)
++{
++	struct snd_soc_card *card = left ? left->card : NULL;
++
++	if (!wsa_macro_fullio_reference_route(card) || !right || right == left || right->card != card)
++		return ERR_PTR(-EOPNOTSUPP);
++	return wsa_macro_fullio_clock_owner(card, left, right);
++}
++
++int wsa_macro_fullio_verify_pair_clocks_off(struct snd_soc_component *left,
++					    struct snd_soc_component *right);
++int wsa_macro_fullio_verify_pair_clocks_off(struct snd_soc_component *left,
++					    struct snd_soc_component *right)
++{
++	struct snd_soc_component *owner = wsa_macro_fullio_reference_owner(left, right);
++
++	return IS_ERR(owner) ? PTR_ERR(owner) : wsa_macro_fullio_verify_clocks_off(owner);
++}
++EXPORT_SYMBOL_GPL(wsa_macro_fullio_verify_pair_clocks_off);
++
++int wsa_macro_fullio_clock_on_for_pair(struct snd_soc_component *left,
++				      struct snd_soc_component *right,
++				      int (*verify)(void *), void *context);
++int wsa_macro_fullio_clock_on_for_pair(struct snd_soc_component *left,
++				      struct snd_soc_component *right,
++				      int (*verify)(void *), void *context)
++{
++	struct snd_soc_component *owner = wsa_macro_fullio_reference_owner(left, right);
++
++	if (IS_ERR(owner))
++		return PTR_ERR(owner);
++	if (!verify)
++		return -EPERM;
++	return wsa_macro_fullio_tx_clocks(owner, true, verify, context);
++}
++EXPORT_SYMBOL_GPL(wsa_macro_fullio_clock_on_for_pair);
++
++static int wsa_macro_fullio_clock_off_on_card(struct snd_soc_card *card,
++					     struct snd_soc_component *amp)
++{
++	struct snd_soc_component *owner = wsa_macro_fullio_clock_owner(card, amp, NULL);
++
++	if (IS_ERR(owner))
++		return PTR_ERR(owner);
++	if (wsa_macro_fullio_clock_audit(card))
++		return wsa_macro_fullio_verify_clocks_off(owner);
++	return wsa_macro_fullio_tx_clocks(owner, false, NULL, NULL);
++}
++
++/* Call from the PCM lifetime, never inside SoundWire status notification. */
++int wsa_macro_fullio_clock_off_for_pa(struct snd_soc_component *amp);
++int wsa_macro_fullio_clock_off_for_pa(struct snd_soc_component *amp)
++{
++	struct snd_soc_card *card = amp->card;
++	bool audit = wsa_macro_fullio_clock_audit(card) &&
++		of_property_read_bool(card->dev->of_node, "microsoft,denali-fullio-muted-test") &&
++		of_property_read_bool(card->dev->of_node, "microsoft,denali-fullio-pa-stop-audit");
++
++	if (!wsa_macro_fullio_post_pa_probe(amp) && !audit &&
++	    !wsa_macro_fullio_reference_route(card))
++		return -EOPNOTSUPP;
++	/* The clock-off marker makes the audit a read-only operation. */
++	return wsa_macro_fullio_clock_off_on_card(card, amp);
++}
++EXPORT_SYMBOL_GPL(wsa_macro_fullio_clock_off_for_pa);
++
++int wsa_macro_fullio_clock_off_for_feedback(struct snd_soc_card *card);
++int wsa_macro_fullio_clock_off_for_feedback(struct snd_soc_card *card)
++{
++	if (!card || !of_machine_is_compatible("microsoft,denali") ||
++	    (!of_property_read_bool(card->dev->of_node, "microsoft,denali-fullio-post-pa-test") &&
++	     !wsa_macro_fullio_clock_audit(card) && !wsa_macro_fullio_reference_route(card)))
++		return -EOPNOTSUPP;
++	return wsa_macro_fullio_clock_off_on_card(card, NULL);
++}
++EXPORT_SYMBOL_GPL(wsa_macro_fullio_clock_off_for_feedback);
++
+ static void wsa_macro_enable_disable_vi_feedback(struct snd_soc_component *component,
+ 						 bool enable, u32 rate)
+ {
+@@ -1582,6 +1945,11 @@ static int wsa_macro_enable_vi_feedback(struct snd_soc_dapm_widget *w,
+ 	struct wsa_macro *wsa = snd_soc_component_get_drvdata(component);
+ 	u32 rate_val;
+ 
++	/* Reference protection clocks belong to the paired PA lifecycle. */
++	if (wsa_macro_fullio_post_pa_probe(component) || wsa_macro_fullio_clock_audit(component->card) ||
++	    wsa_macro_fullio_reference_route(component->card))
++		return 0;
++
+ 	switch (wsa->pcm_rate_vi) {
+ 	case 8000:
+ 		rate_val = CDC_WSA_TX_SPKR_PROT_PCM_RATE_8K;
+@@ -2369,8 +2737,18 @@ static const struct snd_soc_dapm_widget wsa_macro_dapm_widgets[] = {
+ 			       SND_SOC_NOPM, WSA_MACRO_AIF_VI, 0,
+ 			       wsa_macro_enable_vi_feedback,
+ 			       SND_SOC_DAPM_POST_PMU | SND_SOC_DAPM_POST_PMD),
++	SND_SOC_DAPM_AIF_IN_E("WSA AIF_VI Protection",
++			      "WSA_AIF_VI Protection", 0,
++			      SND_SOC_NOPM, WSA_MACRO_AIF_VI, 0,
++			      wsa_macro_enable_vi_feedback,
++			      SND_SOC_DAPM_POST_PMU | SND_SOC_DAPM_POST_PMD),
+ 	SND_SOC_DAPM_AIF_OUT("WSA AIF_ECHO", "WSA_AIF_ECHO Capture", 0,
+ 			     SND_SOC_NOPM, 0, 0),
++	SND_SOC_DAPM_AIF_OUT("WSA AIF_CPS Capture", "WSA_AIF_CPS Capture", 0,
++			     SND_SOC_NOPM, 0, 0),
++	SND_SOC_DAPM_AIF_IN("WSA AIF_CPS Protection",
++			    "WSA_AIF_CPS Protection", 0,
++			    SND_SOC_NOPM, 0, 0),
+ 
+ 	SND_SOC_DAPM_MIXER("WSA_AIF_VI Mixer", SND_SOC_NOPM, WSA_MACRO_AIF_VI,
+ 			   0, aif_vi_mixer, ARRAY_SIZE(aif_vi_mixer)),
+@@ -2433,6 +2811,7 @@ static const struct snd_soc_dapm_widget wsa_macro_dapm_widgets[] = {
+ 			     SND_SOC_DAPM_POST_PMD),
+ 
+ 	SND_SOC_DAPM_INPUT("VIINPUT_WSA"),
++	SND_SOC_DAPM_INPUT("CPSINPUT_WSA"),
+ 	SND_SOC_DAPM_OUTPUT("WSA_SPK1 OUT"),
+ 	SND_SOC_DAPM_OUTPUT("WSA_SPK2 OUT"),
+ 
+@@ -2474,6 +2853,14 @@ static const struct snd_soc_dapm_route wsa_audio_map[] = {
+ 	{"WSA AIF_VI", NULL, "WSA_AIF_VI Mixer"},
+ 	{"WSA AIF_VI", NULL, "WSA_MCLK"},
+ 
++	/* CPS feedback is a distinct transport from VI; only the shared macro
++	 * clock is required here.  DP6 framing is programmed by SoundWire.
++	 */
++	{"WSA AIF_CPS Capture", NULL, "CPSINPUT_WSA"},
++	{"WSA AIF_CPS Capture", NULL, "WSA_MCLK"},
++	{"WSA AIF_CPS Protection", NULL, "CPSINPUT_WSA"},
++	{"WSA AIF_CPS Protection", NULL, "WSA_MCLK"},
++
+ 	{"WSA RX_MIX EC0_MUX", "RX_MIX_TX0", "WSA_RX INT0 SEC MIX"},
+ 	{"WSA RX_MIX EC1_MUX", "RX_MIX_TX0", "WSA_RX INT0 SEC MIX"},
+ 	{"WSA RX_MIX EC0_MUX", "RX_MIX_TX1", "WSA_RX INT1 SEC MIX"},
+@@ -2746,6 +3133,7 @@ static int wsa_macro_probe(struct platform_device *pdev)
+ 	wsa = devm_kzalloc_obj(dev, *wsa);
+ 	if (!wsa)
+ 		return -ENOMEM;
++	mutex_init(&wsa->fullio_clock_lock);
+ 
+ 	wsa->macro = devm_clk_get_optional(dev, "macro");
+ 	if (IS_ERR(wsa->macro))
+diff --git a/sound/soc/codecs/wsa884x.c b/sound/soc/codecs/wsa884x.c
+index f58ce92..43a374e 100644
+--- a/sound/soc/codecs/wsa884x.c
++++ b/sound/soc/codecs/wsa884x.c
+@@ -4,6 +4,7 @@
+  * Copyright (c) 2023, Linaro Ltd.
+  */
+ 
++#include <linux/atomic.h>
+ #include <linux/bitfield.h>
+ #include <linux/cleanup.h>
+ #include <linux/device.h>
+@@ -13,8 +14,12 @@
+ #include <linux/kernel.h>
+ #include <linux/module.h>
+ #include <linux/mutex.h>
++#include <linux/of.h>
+ #include <linux/pm_runtime.h>
++#include <linux/property.h>
+ #include <linux/regmap.h>
++#include <linux/spinlock.h>
++#include <linux/workqueue.h>
+ #include <linux/regulator/consumer.h>
+ #include <linux/reset.h>
+ #include <linux/slab.h>
+@@ -726,19 +731,34 @@
+ #define WSA884X_LOW_TEMP_THRESHOLD	WSA884X_T1_TEMP
+ #define WSA884X_HIGH_TEMP_THRESHOLD	WSA884X_T2_TEMP
+ 
++enum wsa884x_dai_id {
++	WSA884X_DAI_PLAYBACK,
++	WSA884X_DAI_VI,
++	WSA884X_DAI_CPS,
++	WSA884X_NUM_DAIS,
++};
++
+ struct wsa884x_priv {
+ 	struct regmap *regmap;
+ 	struct device *dev;
+ 	struct regulator_bulk_data supplies[WSA884X_SUPPLIES_NUM];
+ 	struct sdw_slave *slave;
+ 	struct sdw_stream_config sconfig;
+-	struct sdw_stream_runtime *sruntime;
+-	struct sdw_port_config port_config[WSA884X_MAX_SWR_PORTS];
++	struct sdw_stream_runtime *sruntime[WSA884X_NUM_DAIS];
++	struct sdw_stream_runtime *attached[WSA884X_NUM_DAIS];
++	struct sdw_dpn_prop feedback_ports[2];
++	bool feedback_enabled;
++	bool fullio_reference_codec;
++	bool fullio_cold_failed;
++	bool fullio_sink_bank_observed;
++	atomic64_t fullio_pa_epoch;
++	spinlock_t fullio_fault_lock;
++	struct work_struct *fullio_fault_work; /* Protected by fullio_fault_lock. */
++	atomic_t fullio_pa_teardowns;
+ 	struct gpio_desc *sd_n;
+ 	struct reset_control *sd_reset;
+ 	bool port_prepared[WSA884X_MAX_SWR_PORTS];
+ 	bool port_enable[WSA884X_MAX_SWR_PORTS];
+-	int active_ports;
+ 	int dev_mode;
+ 	bool hw_init;
+ 	/*
+@@ -873,6 +893,21 @@ static struct sdw_dpn_prop wsa884x_sink_dpn_prop[WSA884X_MAX_SWR_PORTS] = {
+ 	}
+ };
+ 
++static const struct sdw_dpn_prop wsa884x_fullio_cps_port = {
++	.num = WSA884X_PORT_CPS + 1,
++	.type = SDW_DPN_SIMPLE,
++	.min_ch = 1,
++	.max_ch = 2,
++	.simple_ch_prep_sm = true,
++	/* CPS DP6 BlockCtrl1 is writable and Windows programs the
++	 * master-derived 0x18 word-length value on both slaves.
++	 */
++	.read_only_wordlength = false,
++	.simple_transport_registers = SDW_DPN_SIMPLE_TRANSPORT_BLOCKCTRL3 |
++				      SDW_DPN_SIMPLE_TRANSPORT_SAMPLECTRL2 |
++				      SDW_DPN_SIMPLE_TRANSPORT_HCTRL,
++};
++
+ static const struct sdw_port_config wsa884x_pconfig[WSA884X_MAX_SWR_PORTS] = {
+ 	[WSA884X_PORT_DAC] = {
+ 		.num = WSA884X_PORT_DAC + 1,
+@@ -1510,6 +1545,115 @@ static void wsa884x_set_gain_parameters(struct wsa884x_priv *wsa884x)
+ 	}
+ }
+ 
++/* Reference Golden v32/v33 cold transaction, prior to any PA enable. */
++static const struct reg_sequence wsa884x_fullio_cold_init[] = {
++	{ WSA884X_PWRSTG_DBG, 0x0c },
++	{ WSA884X_PDRV_HS_CTL, 0x5a },
++	{ WSA884X_SWR_RESET_EN, 0x07 },
++	{ WSA884X_INTR_MASK0, 0xff },
++	{ WSA884X_INTR_MASK1, 0x03 },
++	{ WSA884X_PA_FSM_BYP_CTL, 0x00 },
++	{ WSA884X_VBAT_SNS, 0x20 },
++	{ WSA884X_CKWD_CTL_1, 0x1b },
++	{ WSA884X_CDC_SPK_DSM_A2_0, 0x0a },
++	{ WSA884X_CDC_SPK_DSM_A2_1, 0x08 },
++	{ WSA884X_CDC_SPK_DSM_A3_0, 0xf3 },
++	{ WSA884X_CDC_SPK_DSM_A3_1, 0x07 },
++	{ WSA884X_CDC_SPK_DSM_A4_0, 0x79 },
++	{ WSA884X_CDC_SPK_DSM_A4_1, 0x02 },
++	{ WSA884X_CDC_SPK_DSM_A5_0, 0x0b },
++	{ WSA884X_CDC_SPK_DSM_A5_1, 0x02 },
++	{ WSA884X_CDC_SPK_DSM_A6_0, 0x8a },
++	{ WSA884X_CDC_SPK_DSM_A7_0, 0x9b },
++	{ WSA884X_CDC_SPK_DSM_C_0, 0x68 },
++	{ WSA884X_CDC_SPK_DSM_C_2, 0xf2 },
++	{ WSA884X_CDC_SPK_DSM_C_3, 0x20 },
++	{ WSA884X_CDC_SPK_DSM_R1, 0x83 },
++	{ WSA884X_CDC_SPK_DSM_R2, 0x7f },
++	{ WSA884X_CDC_SPK_DSM_R3, 0x9d },
++	{ WSA884X_CDC_SPK_DSM_R4, 0x82 },
++	{ WSA884X_CDC_SPK_DSM_R5, 0x8b },
++	{ WSA884X_CDC_SPK_DSM_R6, 0x9b },
++	{ WSA884X_CDC_SPK_DSM_R7, 0x3f },
++	{ WSA884X_DRE_IDLE_DET_CTL, 0x0f },
++	{ WSA884X_PDM_WD_CTL, 0x01 },
++	{ WSA884X_DRE_CTL_0, 0xf0 },
++	{ WSA884X_DRE_CTL_1, 0x00 },
++	{ WSA884X_BOP_DEGLITCH_CTL, 0x11 },
++	{ WSA884X_VBAT_CAL_CTL, 0x05 },
++	{ WSA884X_VBAT_THRM_FLT_CTL, 0x79 },
++	{ WSA884X_GAIN_RAMPING_MIN, 0x0e },
++	{ WSA884X_CLSH_CTL_0, 0x00 },
++	{ WSA884X_CLSH_V_HD_PA, 0x13 },
++	{ WSA884X_CLSH_SOFT_MAX, 0xff },
++	{ WSA884X_ANA_WO_CTL_0, 0x9d },
++	{ WSA884X_ANA_WO_CTL_1, 0x00 },
++	{ WSA884X_OTP_REG_38, 0x08 },
++	{ WSA884X_OTP_REG_40, 0x20 },
++	{ WSA884X_REF_CTRL, 0xd1 },
++	{ WSA884X_UVLO_PROG, 0x33 },
++	{ WSA884X_UVLO_PROG1, 0x60 },
++	{ WSA884X_BOP1_PROG, 0x22 },
++	{ WSA884X_BOP2_PROG, 0x44 },
++	{ WSA884X_ZX_CTRL1, 0xf8 },
++	{ WSA884X_STB_CTRL1, 0x6a },
++	{ WSA884X_ILIM_CTRL1, 0xe3 },
++	{ WSA884X_CURRENT_LIMIT, 0xd4 },
++	{ WSA884X_TOP_CTRL1, 0xd2 },
++	{ WSA884X_OCP_CTL, 0xf6 },
++	{ WSA884X_DAC_VCM_CTRL_REG2, 0x06 },
++	{ WSA884X_DAC_VCM_CTRL_REG3, 0x14 },
++	{ WSA884X_DAC_VCM_CTRL_REG4, 0x19 },
++	{ WSA884X_DAC_VCM_CTRL_REG5, 0x1b },
++	{ WSA884X_DAC_VCM_CTRL_REG6, 0x1c },
++	{ WSA884X_DAC_VCM_CTRL_REG7, 0x02 },
++	{ WSA884X_CKWD_CTL_1, 0x13 },
++	{ WSA884X_PWRSTAGE_CTRL2, 0xf1 },
++	{ WSA884X_CURRENT_LIMIT, 0x44 },
++};
++
++static int wsa884x_fullio_cold_start(struct wsa884x_priv *amp)
++{
++	unsigned int value;
++	int ret;
++
++	/* The reference lifecycle re-runs the cold table after every SoundWire
++	 * attach (idle clock collapse is routine). Only a failed table — which
++	 * leaves partially written analog state — is never retried.
++	 */
++	if (amp->fullio_cold_failed)
++		return -ENOTRECOVERABLE;
++
++	/* VPHX is diagnostic on this fixed 2S Denali hardware: the reference
++	 * logs a mismatch and applies the table anyway. Never dead-end the
++	 * codec on a status-read race at SoundWire re-attach.
++	 */
++	ret = regmap_read_bypassed(amp->regmap, WSA884X_VPHX_SYS_EN_STATUS, &value);
++	if (ret || value != 0x02)
++		dev_warn(amp->dev, "FullIO cold setup: VPHX status %#x (read %d), applying the 2S reference table\n",
++			 value, ret);
++	ret = regmap_read_bypassed(amp->regmap, WSA884X_PA_FSM_EN, &value);
++	if (ret || (value & WSA884X_PA_FSM_EN_GLOBAL_PA_EN_MASK))
++		return ret ?: -EBUSY;
++
++	for (unsigned int i = 0; i < ARRAY_SIZE(wsa884x_fullio_cold_init); ++i) {
++		const struct reg_sequence *entry = &wsa884x_fullio_cold_init[i];
++
++		ret = regmap_write(amp->regmap, entry->reg, entry->def);
++		if (ret) {
++			amp->fullio_cold_failed = true;
++			return ret;
++		}
++	}
++	ret = regmap_read_bypassed(amp->regmap, WSA884X_PA_FSM_EN, &value);
++	if (ret || (value & WSA884X_PA_FSM_EN_GLOBAL_PA_EN_MASK)) {
++		amp->fullio_cold_failed = true;
++		return ret ?: -EIO;
++	}
++	WRITE_ONCE(amp->hw_init, true);
++	return 0;
++}
++
+ static void wsa884x_init(struct wsa884x_priv *wsa884x)
+ {
+ 	unsigned int wo_ctl_0;
+@@ -1538,14 +1682,34 @@ static void wsa884x_init(struct wsa884x_priv *wsa884x)
+ 	wsa884x->hw_init = true;
+ }
+ 
++/* SoundWire delivers status under bus locks. Publish work only; never
++ * run a regmap, clock or PCM transaction from this notification.
++ */
++static bool wsa884x_fullio_queue_fault(struct wsa884x_priv *amp)
++{
++	unsigned long flags;
++	bool armed;
++
++	spin_lock_irqsave(&amp->fullio_fault_lock, flags);
++	armed = amp->fullio_fault_work != NULL;
++	if (armed)
++		schedule_work(amp->fullio_fault_work);
++	spin_unlock_irqrestore(&amp->fullio_fault_lock, flags);
++	return armed;
++}
++
+ static int wsa884x_update_status(struct sdw_slave *slave,
+ 				 enum sdw_slave_status status)
+ {
+ 	struct wsa884x_priv *wsa884x = dev_get_drvdata(&slave->dev);
+ 	int ret;
+ 
++	if (wsa884x->feedback_enabled && status != SDW_SLAVE_ATTACHED) {
++		atomic64_inc_return(&wsa884x->fullio_pa_epoch);
++		wsa884x_fullio_queue_fault(wsa884x);
++	}
+ 	if (status == SDW_SLAVE_UNATTACHED) {
+-		wsa884x->hw_init = false;
++		WRITE_ONCE(wsa884x->hw_init, false);
+ 		regcache_cache_only(wsa884x->regmap, true);
+ 		regcache_mark_dirty(wsa884x->regmap);
+ 		return 0;
+@@ -1557,11 +1721,20 @@ static int wsa884x_update_status(struct sdw_slave *slave,
+ 	regcache_cache_only(wsa884x->regmap, false);
+ 	ret = regcache_sync(wsa884x->regmap);
+ 	if (ret < 0) {
++		if (wsa884x->fullio_reference_codec)
++			wsa884x->fullio_cold_failed = true;
+ 		dev_err(&slave->dev, "Cannot sync regmap cache\n");
+ 		return ret;
+ 	}
+ 
+-	wsa884x_init(wsa884x);
++	if (wsa884x->fullio_reference_codec) {
++		ret = wsa884x_fullio_cold_start(wsa884x);
++		if (ret)
++			return dev_err_probe(&slave->dev, ret, "FullIO reference cold setup unverified\n");
++		dev_info(&slave->dev, "FullIO reference cold setup confirmed with PA off\n");
++	} else {
++		wsa884x_init(wsa884x);
++	}
+ 
+ 	return 0;
+ }
+@@ -1631,6 +1804,17 @@ static int wsa884x_set_swr_port(struct snd_kcontrol *kcontrol,
+ 	struct soc_mixer_control *mixer = (struct soc_mixer_control *)kcontrol->private_value;
+ 	int portidx = mixer->reg;
+ 
++	/* A DT-enabled CPS path is board wiring, not an optional userspace
++	 * route. alsa-restore may replay a state that predates CPS support;
++	 * keep the firmware-selected sidechain enabled.
++	 */
++	if (portidx == WSA884X_PORT_CPS && wsa884x->feedback_enabled) {
++		if (wsa884x->port_enable[portidx])
++			return 0;
++		wsa884x->port_enable[portidx] = true;
++		return 1;
++	}
++
+ 	if (ucontrol->value.integer.value[0]) {
+ 		if (wsa884x->port_enable[portidx])
+ 			return 0;
+@@ -1694,6 +1878,61 @@ static void wsa884x_spkr_post_pmu(struct snd_soc_component *component,
+ 				      curr_limit);
+ }
+ 
++/*
++ * Sample the stock codec guard configuration with the physical PA off.
++ * Do not wake the bus, change any register, or infer watchdog trip time.
++ */
++static void wsa884x_fullio_audit_guard(struct snd_soc_component *component,
++				      struct wsa884x_priv *amp, bool powered)
++{
++	struct device_node *sound = component->card ? component->card->dev->of_node : NULL;
++	unsigned int before, after, wd, limit;
++	s64 epoch;
++	int ret;
++
++	if (!amp->feedback_enabled || !of_machine_is_compatible("microsoft,denali") ||
++	    !of_property_read_bool(sound, "microsoft,denali-fullio-muted-test") ||
++	    !of_property_read_bool(sound, "microsoft,denali-fullio-clock-off-audit") ||
++	    !of_property_read_bool(sound, "microsoft,denali-fullio-pa-off-guard-audit") ||
++	    of_property_read_bool(sound, "microsoft,denali-fullio-post-pa-test"))
++		return;
++
++	ret = pm_runtime_get_if_active(amp->dev);
++	if (ret <= 0)
++		goto failed;
++	epoch = atomic64_read_acquire(&amp->fullio_pa_epoch);
++	if (READ_ONCE(amp->slave->status) != SDW_SLAVE_ATTACHED ||
++	    atomic_read_acquire(&amp->fullio_pa_teardowns)) {
++		ret = -EAGAIN;
++		goto put;
++	}
++	ret = regmap_read_bypassed(amp->regmap, WSA884X_PA_FSM_EN, &before);
++	if (!ret && (before & WSA884X_PA_FSM_EN_GLOBAL_PA_EN_MASK))
++		ret = -EBUSY;
++	if (!ret)
++		ret = regmap_read_bypassed(amp->regmap, WSA884X_PDM_WD_CTL, &wd);
++	if (!ret)
++		ret = regmap_read_bypassed(amp->regmap, WSA884X_CURRENT_LIMIT, &limit);
++	if (!ret)
++		ret = regmap_read_bypassed(amp->regmap, WSA884X_PA_FSM_EN, &after);
++	if (!ret && (after != before || READ_ONCE(amp->slave->status) != SDW_SLAVE_ATTACHED ||
++		     atomic_read_acquire(&amp->fullio_pa_teardowns) ||
++		     atomic64_read_acquire(&amp->fullio_pa_epoch) != epoch))
++		ret = -EAGAIN;
++	if (!ret && !!(wd & WSA884X_PDM_WD_CTL_PDM_WD_EN_MASK) != powered)
++		ret = -EIO;
++	if (!ret)
++		dev_info(amp->dev, "FullIO PA-off codec guard: route=%s PDM_WD_CTL=0x%02x CURRENT_LIMIT=0x%02x\n",
++			 powered ? "on" : "off", wd, limit);
++put:
++	pm_runtime_put_autosuspend(amp->dev);
++	if (!ret)
++		return;
++failed:
++	dev_warn(amp->dev, "FullIO PA-off codec guard unverified: route=%s ret=%d\n",
++		 powered ? "on" : "off", ret ?: -EAGAIN);
++}
++
+ static int wsa884x_spkr_event(struct snd_soc_dapm_widget *w,
+ 			      struct snd_kcontrol *kcontrol, int event)
+ {
+@@ -1710,6 +1949,7 @@ static int wsa884x_spkr_event(struct snd_soc_dapm_widget *w,
+ 		snd_soc_component_write_field(component, WSA884X_PDM_WD_CTL,
+ 					      WSA884X_PDM_WD_CTL_PDM_WD_EN_MASK,
+ 					      0x1);
++		wsa884x_fullio_audit_guard(component, wsa884x, true);
+ 
+ 		break;
+ 	case SND_SOC_DAPM_PRE_PMD:
+@@ -1719,6 +1959,7 @@ static int wsa884x_spkr_event(struct snd_soc_dapm_widget *w,
+ 
+ 		scoped_guard(mutex, &wsa884x->sp_lock)
+ 			wsa884x->pa_on = false;
++		wsa884x_fullio_audit_guard(component, wsa884x, false);
+ 		break;
+ 	}
+ 
+@@ -1767,51 +2008,710 @@ static const struct snd_soc_component_driver wsa884x_component_drv = {
+ 	.num_dapm_routes = ARRAY_SIZE(wsa884x_audio_map),
+ };
+ 
+-static int wsa884x_hw_params(struct snd_pcm_substream *substream,
+-			     struct snd_pcm_hw_params *params,
+-			     struct snd_soc_dai *dai)
++struct wsa884x_fullio_pa_snapshot {
++	unsigned int enable, sta0, sta1, err0, err1, pdm_wd;
++	unsigned int dre0, dre1, vphx;
++	bool gain_sampled, vphx_sampled, sink_sampled;
++	u8 sink_bank;
++	s64 epoch;
++};
++
++static int wsa884x_fullio_read_sink_bank(struct wsa884x_priv *amp,
++					 struct wsa884x_fullio_pa_snapshot *snapshot)
+ {
+-	struct wsa884x_priv *wsa884x = dev_get_drvdata(dai->dev);
+-	int i;
++	struct sdw_slave *slave = amp->slave;
++	unsigned int bank, dp;
++	int ret;
+ 
+-	wsa884x->active_ports = 0;
+-	for (i = 0; i < WSA884X_MAX_SWR_PORTS; i++) {
+-		if (!wsa884x->port_enable[i])
+-			continue;
++	if (READ_ONCE(amp->fullio_sink_bank_observed))
++		return 0;
++	for (dp = 0; dp < 3; dp++)
++		if (!READ_ONCE(amp->port_prepared[dp]))
++			return 0; /* No active triplet to observe yet. */
++	bank = READ_ONCE(slave->bus->params.curr_bank);
++	for (dp = 1; dp <= 3; dp++) {
++		u32 reg = bank ? SDW_DPN_CHANNELEN_B1(dp) : SDW_DPN_CHANNELEN_B0(dp);
++
++		ret = sdw_read_no_pm(slave, reg);
++		if (ret < 0)
++			return ret;
++		if (!(ret & BIT(0)))
++			return 0; /* Prepared, not active yet. */
++		if (dp == 1)
++			reg = bank ? SDW_DPN_BLOCKCTRL3_B1(dp) : SDW_DPN_BLOCKCTRL3_B0(dp);
++		else
++			reg = bank ? SDW_DPN_OFFSETCTRL2_B1(dp) : SDW_DPN_OFFSETCTRL2_B0(dp);
++		ret = sdw_read_no_pm(slave, reg);
++		if (ret < 0)
++			return ret;
++		if (ret != (dp == 1 ? 0 : dp == 2 ? 7 : 0x1f))
++			return -EIO;
++	}
++	if (bank != READ_ONCE(slave->bus->params.curr_bank))
++		return -EAGAIN;
++	snapshot->sink_bank = bank;
++	snapshot->sink_sampled = true;
++	return 0;
++}
++
++/* Return a hardware snapshot, not a software-mute flag or PA-up claim. */
++static int wsa884x_fullio_read_pa(struct snd_soc_component *component, bool read_faults,
++				 struct wsa884x_fullio_pa_snapshot *result)
++{
++	struct wsa884x_fullio_pa_snapshot snapshot = {};
++	struct wsa884x_priv *wsa884x;
++	struct device_node *sound;
++	unsigned int before;
++	int ret;
+ 
+-		wsa884x->port_config[wsa884x->active_ports] = wsa884x_pconfig[i];
+-		wsa884x->active_ports++;
++	if (!component || component->driver != &wsa884x_component_drv)
++		return -ENODEV;
++	wsa884x = dev_get_drvdata(component->dev);
++	if (!wsa884x || !wsa884x->feedback_enabled)
++		return -ENODEV;
++
++	ret = pm_runtime_resume_and_get(wsa884x->dev);
++	if (ret < 0)
++		return ret;
++	snapshot.epoch = atomic64_read_acquire(&wsa884x->fullio_pa_epoch);
++	if (atomic_read_acquire(&wsa884x->fullio_pa_teardowns)) {
++		ret = -EAGAIN;
++		goto put;
++	}
++	if (READ_ONCE(wsa884x->slave->status) != SDW_SLAVE_ATTACHED) {
++		ret = -ENODEV;
++		goto put;
++	}
++	ret = regmap_read_bypassed(wsa884x->regmap, WSA884X_PA_FSM_EN, &before);
++	if (!ret)
++		ret = regmap_read_bypassed(wsa884x->regmap, WSA884X_PA_FSM_STA0, &snapshot.sta0);
++	if (!ret)
++		ret = regmap_read_bypassed(wsa884x->regmap, WSA884X_PA_FSM_STA1, &snapshot.sta1);
++	if (!ret && read_faults)
++		ret = regmap_read_bypassed(wsa884x->regmap, WSA884X_PA_FSM_ERR_COND0, &snapshot.err0);
++	if (!ret && read_faults)
++		ret = regmap_read_bypassed(wsa884x->regmap, WSA884X_PA_FSM_ERR_COND1, &snapshot.err1);
++	if (!ret && read_faults)
++		ret = regmap_read_bypassed(wsa884x->regmap, WSA884X_PDM_WD_CTL, &snapshot.pdm_wd);
++	if (!ret && read_faults)
++		ret = regmap_read_bypassed(wsa884x->regmap, WSA884X_VPHX_SYS_EN_STATUS, &snapshot.vphx);
++	sound = component->card ? component->card->dev->of_node : NULL;
++	if (!ret && !read_faults && !(before & WSA884X_PA_FSM_EN_GLOBAL_PA_EN_MASK) &&
++	    of_machine_is_compatible("microsoft,denali") &&
++	    of_property_read_bool(sound, "microsoft,denali-fullio-muted-test") &&
++	    of_property_read_bool(sound, "microsoft,denali-fullio-clock-off-audit") &&
++	    of_property_read_bool(sound, "microsoft,denali-fullio-vphx-audit") &&
++	    !of_property_read_bool(sound, "microsoft,denali-fullio-dsp-start-audit") &&
++	    !of_property_read_bool(sound, "microsoft,denali-fullio-post-pa-test")) {
++		ret = regmap_read_bypassed(wsa884x->regmap, WSA884X_VPHX_SYS_EN_STATUS,
++					   &snapshot.vphx);
++		snapshot.vphx_sampled = !ret;
++		if (!ret && of_property_read_bool(sound, "microsoft,denali-fullio-sink-bank-audit"))
++			ret = wsa884x_fullio_read_sink_bank(wsa884x, &snapshot);
++	}
++	if (!ret && !read_faults && !(before & WSA884X_PA_FSM_EN_GLOBAL_PA_EN_MASK) &&
++	    of_machine_is_compatible("microsoft,denali") &&
++	    of_property_read_bool(sound, "microsoft,denali-fullio-muted-test") &&
++	    of_property_read_bool(sound, "microsoft,denali-fullio-clock-off-audit") &&
++	    of_property_read_bool(sound, "microsoft,denali-fullio-pa-off-gain-audit") &&
++	    !of_property_read_bool(sound, "microsoft,denali-fullio-post-pa-test")) {
++		ret = regmap_read_bypassed(wsa884x->regmap, WSA884X_DRE_CTL_0, &snapshot.dre0);
++		if (!ret)
++			ret = regmap_read_bypassed(wsa884x->regmap, WSA884X_DRE_CTL_1, &snapshot.dre1);
++		snapshot.gain_sampled = !ret;
+ 	}
++	if (!ret)
++		ret = regmap_read_bypassed(wsa884x->regmap, WSA884X_PA_FSM_EN, &snapshot.enable);
++	if (!ret && READ_ONCE(wsa884x->slave->status) != SDW_SLAVE_ATTACHED)
++		ret = -ENODEV;
++	/* Never publish a snapshot that straddled a delivered status change
++	 * or PA teardown, even if the sampled enable values are identical.
++	 */
++	if (!ret && (before != snapshot.enable ||
++		     atomic_read_acquire(&wsa884x->fullio_pa_teardowns) ||
++		     snapshot.epoch != atomic64_read_acquire(&wsa884x->fullio_pa_epoch)))
++		ret = -EAGAIN;
++	if (!ret) {
++		if (snapshot.sink_sampled)
++			WRITE_ONCE(wsa884x->fullio_sink_bank_observed, true);
++		*result = snapshot;
++	}
++put:
++	pm_runtime_mark_last_busy(wsa884x->dev);
++	pm_runtime_put_autosuspend(wsa884x->dev);
++	return ret;
++}
+ 
+-	wsa884x->sconfig.frame_rate = params_rate(params);
++/* The pinned reference observed 0x2f with a working channel and 0x2a
++ * with an enabled but silent channel. This is a diagnostic allowlist,
++ * not a documented FSM enumeration or evidence of working protection.
++ */
++static int wsa884x_fullio_check_ready(const struct wsa884x_fullio_pa_snapshot *snapshot)
++{
++	if (snapshot->sta1 || snapshot->err0 || snapshot->err1)
++		return -EIO;
++	/* Golden records 0x2f on a working channel and 0x2a on an enabled but
++	 * still silent one. Both are valid PA-ready observations; anything else
++	 * is not evidence of readiness.
++	 */
++	if (!(snapshot->enable & WSA884X_PA_FSM_EN_GLOBAL_PA_EN_MASK) ||
++	    (snapshot->sta0 != 0x2f && snapshot->sta0 != 0x2a))
++		return -EAGAIN;
++	/* Denali reference selects the 2S profile only with VPHX status 2. */
++	if (snapshot->vphx != 0x02)
++		return -EIO;
++	/* Match the reference watchdog configuration, not a cutoff guarantee. */
++	if ((snapshot->pdm_wd & (WSA884X_PDM_WD_CTL_PDM_WD_EN_MASK |
++				 WSA884X_PDM_WD_CTL_HOLD_OFF_MASK |
++				 WSA884X_PDM_WD_CTL_TIME_OUT_SEL_MASK)) !=
++	    WSA884X_PDM_WD_CTL_PDM_WD_EN_MASK)
++		return -EIO;
++	return 0;
++}
++
++int wsa884x_fullio_pa_ready(struct snd_soc_component *component, s64 *epoch);
++int wsa884x_fullio_pa_ready(struct snd_soc_component *component, s64 *epoch)
++{
++	struct wsa884x_fullio_pa_snapshot snapshot;
++	int ret = wsa884x_fullio_read_pa(component, true, &snapshot);
+ 
+-	return sdw_stream_add_slave(wsa884x->slave, &wsa884x->sconfig,
+-				    wsa884x->port_config, wsa884x->active_ports,
+-				    wsa884x->sruntime);
++	if (!ret)
++		ret = wsa884x_fullio_check_ready(&snapshot);
++	if (!ret)
++		*epoch = snapshot.epoch;
++	return ret;
++}
++EXPORT_SYMBOL_GPL(wsa884x_fullio_pa_ready);
++
++int wsa884x_fullio_pa_off(struct snd_soc_component *component);
++int wsa884x_fullio_pa_off(struct snd_soc_component *component)
++{
++	struct wsa884x_fullio_pa_snapshot snapshot;
++	int ret = wsa884x_fullio_read_pa(component, false, &snapshot);
++
++	if (ret)
++		return ret;
++	dev_dbg(component->dev, "FullIO PA snapshot: en=%#x state=%#x/%#x\n",
++		snapshot.enable, snapshot.sta0, snapshot.sta1);
++	if (snapshot.sink_sampled)
++		dev_info(component->dev,
++			 "FullIO PA-off sink bank %u: enabled DP1 BlockCtrl3=0x00 DP2 Offset2=0x07 DP3 Offset2=0x1f verified\n",
++			 snapshot.sink_bank);
++	if (snapshot.vphx_sampled)
++		dev_info(component->dev, "FullIO PA-off VPHX_STATUS=%#x\n", snapshot.vphx);
++	if (snapshot.gain_sampled)
++		dev_info(component->dev,
++			 "FullIO PA-off gain snapshot: DRE0=%#x DRE1=%#x CSR_GAIN=%u CSR_GAIN_EN=%u\n",
++			 snapshot.dre0, snapshot.dre1,
++			 (unsigned int)FIELD_GET(WSA884X_DRE_CTL_1_CSR_GAIN_MASK, snapshot.dre1),
++			 !!(snapshot.dre1 & WSA884X_DRE_CTL_1_CSR_GAIN_EN_MASK));
++	return snapshot.enable & WSA884X_PA_FSM_EN_GLOBAL_PA_EN_MASK ? -EBUSY : 0;
++}
++EXPORT_SYMBOL_GPL(wsa884x_fullio_pa_off);
++
++static int wsa884x_hw_params(struct snd_pcm_substream *substream,
++			    struct snd_pcm_hw_params *params,
++			    struct snd_soc_dai *dai)
++{
++	struct wsa884x_priv *wsa884x = dev_get_drvdata(dai->dev);
++	struct sdw_port_config ports[WSA884X_MAX_SWR_PORTS];
++	struct sdw_stream_config config = wsa884x->sconfig;
++	int count = 0;
++	int i, ret;
++
++	if (wsa884x->fullio_reference_codec && !READ_ONCE(wsa884x->hw_init))
++		return -ENODEV;
++	if (!wsa884x->sruntime[dai->id])
++		return -EINVAL;
++	if (wsa884x->attached[dai->id])
++		return -EBUSY;
++
++	if (dai->id == WSA884X_DAI_PLAYBACK) {
++		for (i = 0; i < WSA884X_MAX_SWR_PORTS; i++) {
++			if (!wsa884x->port_enable[i])
++				continue;
++			if (wsa884x->feedback_enabled && i > WSA884X_PORT_BOOST)
++				continue;
++			ports[count++] = wsa884x_pconfig[i];
++		}
++	} else if (wsa884x->feedback_enabled) {
++		i = dai->id == WSA884X_DAI_VI ? WSA884X_PORT_VISENSE : WSA884X_PORT_CPS;
++		if (!wsa884x->port_enable[i])
++			return -ENODEV;
++		ports[count++] = wsa884x_pconfig[i];
++		config.direction = SDW_DATA_DIR_TX;
++	} else {
++		return -ENODEV;
++	}
++
++	config.frame_rate = params_rate(params);
++	ret = sdw_stream_add_slave(wsa884x->slave, &config, ports, count,
++				   wsa884x->sruntime[dai->id]);
++	if (!ret)
++		wsa884x->attached[dai->id] = wsa884x->sruntime[dai->id];
++	return ret;
+ }
+ 
+ static int wsa884x_hw_free(struct snd_pcm_substream *substream,
+-			   struct snd_soc_dai *dai)
++			  struct snd_soc_dai *dai)
+ {
+ 	struct wsa884x_priv *wsa884x = dev_get_drvdata(dai->dev);
+ 
+-	sdw_stream_remove_slave(wsa884x->slave, wsa884x->sruntime);
++	if (wsa884x->attached[dai->id]) {
++		sdw_stream_remove_slave(wsa884x->slave, wsa884x->attached[dai->id]);
++		wsa884x->attached[dai->id] = NULL;
++	}
++	return 0;
++}
++
++#if IS_REACHABLE(CONFIG_SND_SOC_LPASS_WSA_MACRO)
++int wsa_macro_fullio_verify_pair_clocks_off(struct snd_soc_component *left,
++					    struct snd_soc_component *right);
++int wsa_macro_fullio_clock_on_for_pair(struct snd_soc_component *left,
++				      struct snd_soc_component *right,
++				      int (*verify)(void *), void *context);
++int wsa_macro_fullio_clock_off_for_pa(struct snd_soc_component *amp);
++#else
++static int wsa_macro_fullio_verify_pair_clocks_off(struct snd_soc_component *left,
++						  struct snd_soc_component *right)
++{
++	return -EOPNOTSUPP;
++}
++
++static int wsa_macro_fullio_clock_on_for_pair(struct snd_soc_component *left,
++					    struct snd_soc_component *right,
++					    int (*verify)(void *), void *context)
++{
++	return -EOPNOTSUPP;
++}
++
++static int wsa_macro_fullio_clock_off_for_pa(struct snd_soc_component *amp)
++{
++	return -EOPNOTSUPP;
++}
++#endif
++
++/* The reference STOP is ordered, beginning with PA off. Continue the
++ * remaining containment writes on error and report the first failure.
++ */
++static int wsa884x_fullio_reference_stop(struct wsa884x_priv *amp)
++{
++	static const struct reg_sequence sequence[] = {
++		{ WSA884X_PA_FSM_EN, 0x00 },
++		{ WSA884X_INTR_MASK0, 0xff },
++		{ WSA884X_INTR_MASK1, 0x03 },
++		{ WSA884X_INTR_CLEAR0, 0xff },
++		{ WSA884X_INTR_CLEAR1, 0x03 },
++		{ WSA884X_CLSH_CTL_0, 0x00 },
++	};
++	int first = 0;
++
++	for (unsigned int i = 0; i < ARRAY_SIZE(sequence); ++i) {
++		int ret = regmap_write(amp->regmap, sequence[i].reg, sequence[i].def);
++
++		if (!first && ret)
++			first = ret;
++	}
++	return first;
++}
++
++/* Never invoked from an IRQ or a SoundWire status notifier. Check
++ * readback even if the PA write failed; failure is not proof of PA off.
++ */
++static int wsa884x_fullio_verified_stop(struct snd_soc_component *component,
++					struct wsa884x_priv *amp)
++{
++	unsigned int value;
++	int pa, verify, clock;
++	s64 epoch;
++
++	atomic_inc_return(&amp->fullio_pa_teardowns);
++	epoch = atomic64_inc_return(&amp->fullio_pa_epoch);
++	clock = wsa_macro_fullio_clock_off_for_pa(component);
++
++	/* Keep the gain cap in force even if the PA-off write fails. */
++	if (amp->fullio_reference_codec)
++		pa = wsa884x_fullio_reference_stop(amp);
++	else
++		pa = regmap_write_bits(amp->regmap, WSA884X_PA_FSM_EN,
++				       WSA884X_PA_FSM_EN_GLOBAL_PA_EN_MASK, 0);
++	verify = regmap_read_bypassed(amp->regmap, WSA884X_PA_FSM_EN, &value);
++	if (!verify && (value & WSA884X_PA_FSM_EN_GLOBAL_PA_EN_MASK))
++		verify = -EBUSY;
++	if (!verify && READ_ONCE(amp->slave->status) != SDW_SLAVE_ATTACHED)
++		verify = -ENODEV;
++	if (!verify && epoch != atomic64_read_acquire(&amp->fullio_pa_epoch))
++		verify = -ESTALE;
++	atomic_dec_return(&amp->fullio_pa_teardowns);
++	if (clock || pa < 0 || verify)
++		dev_err_ratelimited(component->dev,
++			"FullIO PA shutdown not fully verified: clock=%d PA=%d readback=%d\n",
++			clock, pa, verify);
++	if (amp->fullio_reference_codec) {
++		if (clock || pa || verify)
++			WRITE_ONCE(amp->hw_init, false);
++		return clock ?: pa ?: verify;
++	}
++	return verify ?: (pa < 0 ? pa : clock);
++}
++
++/* Startup settle before PA_FSM_EN. The measured startup crack is a
++ * charge step at PA enable; the output stage now pre-biases first.
++ * Runtime-tunable so hardware A/B measurements need no rebuild.
++ */
++static unsigned int wsa884x_pa_settle_us = 20000;
++module_param_named(pa_settle_us, wsa884x_pa_settle_us, uint, 0644);
++MODULE_PARM_DESC(pa_settle_us, "boost settle in us before PA enable (capped at 1000000)");
++
++static int wsa884x_fullio_reference_start(struct wsa884x_priv *amp)
++{
++	static const struct reg_sequence sequence[] = {
++		{ WSA884X_ISENSE2, 0x07 },
++		{ WSA884X_VSENSE1, 0x67 },
++		{ WSA884X_INTR_MASK0, 0x90 },
++		{ WSA884X_INTR_MASK1, 0x00 },
++		{ WSA884X_CLSH_CTL_0, 0x67 },
++		{ WSA884X_PWRSTG_DBG, 0x08 },
++		{ WSA884X_PDRV_HS_CTL, 0x52 },
++		{ WSA884X_PA_FSM_EN, 0x01 },
++		{ WSA884X_PWRSTG_DBG, 0x0c },
++		{ WSA884X_PDRV_HS_CTL, 0x5a },
++	};
++	int ret;
++
++	for (unsigned int i = 0; i < ARRAY_SIZE(sequence); ++i) {
++		/* Let the boost and half-drive output stage settle before the PA
++		 * connects the speaker. The measured startup crack is a charge
++		 * step at PA_FSM_EN with the previous back-to-back ordering.
++		 */
++		if (sequence[i].reg == WSA884X_PA_FSM_EN) {
++			unsigned int settle = min(wsa884x_pa_settle_us, 1000000U);
++
++			usleep_range(settle, settle + 500);
++		}
++		ret = regmap_write(amp->regmap, sequence[i].reg, sequence[i].def);
++		if (ret)
++			return ret;
++	}
++	usleep_range(1000, 1100);
++	return 0;
++}
++
++struct wsa884x_fullio_start_pair {
++	struct snd_soc_component *codec[2];
++	struct wsa884x_priv *amp[2];
++	s64 epoch[2];
++	int (*verify_graph)(void *);
++	void *context;
++};
++
++static int wsa884x_fullio_verify_transport(struct wsa884x_priv *amp)
++{
++	if (!READ_ONCE(amp->hw_init) || READ_ONCE(amp->slave->status) != SDW_SLAVE_ATTACHED)
++		return -ENODEV;
++	for (unsigned int i = WSA884X_DAI_PLAYBACK; i <= WSA884X_DAI_CPS; ++i) {
++		struct sdw_stream_runtime *transport = READ_ONCE(amp->attached[i]);
++
++		if (!transport || READ_ONCE(transport->state) != SDW_STREAM_ENABLED)
++			return -EPIPE;
++	}
++	return 0;
++}
++
++static int wsa884x_fullio_check_pair(struct wsa884x_fullio_start_pair *pair)
++{
++	int ret = pair->verify_graph(pair->context);
++
++	if (ret)
++		return ret < 0 ? ret : -EPROTO;
++	for (unsigned int i = 0; i < ARRAY_SIZE(pair->amp); ++i) {
++		ret = wsa884x_fullio_verify_transport(pair->amp[i]);
++		if (ret)
++			return ret;
++		if (atomic64_read_acquire(&pair->amp[i]->fullio_pa_epoch) != pair->epoch[i])
++			return -ESTALE;
++	}
++	return 0;
++}
+ 
++static int wsa884x_fullio_verify_pair_ready(void *arg)
++{
++	struct wsa884x_fullio_start_pair *pair = arg;
++	s64 epoch;
++	int ret;
++
++	ret = wsa884x_fullio_check_pair(pair);
++	if (ret)
++		return ret;
++	for (unsigned int i = 0; i < 4; ++i) {
++		unsigned int side = i % 2;
++
++		ret = wsa884x_fullio_pa_ready(pair->codec[side], &epoch);
++		if (ret || epoch != pair->epoch[side])
++			return ret ?: -ESTALE;
++	}
++	return wsa884x_fullio_check_pair(pair);
++}
++
++static int wsa884x_fullio_wait_pair_ready(struct wsa884x_fullio_start_pair *pair)
++{
++	int ret = -EAGAIN;
++
++	/* Bounded read-only settling poll; no command is re-sent. */
++	for (unsigned int attempt = 0; attempt < 5 && ret == -EAGAIN; ++attempt) {
++		if (attempt)
++			usleep_range(2000, 3000);
++		ret = wsa884x_fullio_verify_pair_ready(pair);
++	}
++	return ret;
++}
++
++/* Caller owns the PCM lifetime and supplies the current muted DSP graph
++ * and feedback epoch proof. This is not an ALSA digital-unmute fallback.
++ */
++int wsa884x_fullio_start_pair(struct snd_soc_component *left,
++			     struct snd_soc_component *right,
++			     int (*verify_graph)(void *), void *context, int *stop_error);
++int wsa884x_fullio_start_pair(struct snd_soc_component *left,
++			     struct snd_soc_component *right,
++			     int (*verify_graph)(void *), void *context, int *stop_error)
++{
++	struct wsa884x_fullio_start_pair pair = {
++		.codec = { left, right }, .verify_graph = verify_graph, .context = context,
++	};
++	struct device_node *node;
++	struct wsa884x_fullio_pa_snapshot snapshot;
++	unsigned int refs = 0;
++	int ret;
++
++	if (!stop_error)
++		return -EINVAL;
++	*stop_error = 0;
++	if (!IS_REACHABLE(CONFIG_SND_SOC_LPASS_WSA_MACRO) || !verify_graph || !left || !right ||
++	    !left->card || right->card != left->card || left->dev == right->dev ||
++	    left->driver != &wsa884x_component_drv || right->driver != &wsa884x_component_drv ||
++	    !left->name_prefix || strcmp(left->name_prefix, "SpkrLeft") ||
++	    !right->name_prefix || strcmp(right->name_prefix, "SpkrRight") ||
++	    !of_machine_is_compatible("microsoft,denali"))
++		return -EPERM;
++	node = left->card->dev->of_node;
++	if (!of_property_read_bool(node, "microsoft,denali-fullio-reference-render") ||
++	    of_property_read_bool(node, "microsoft,denali-fullio-muted-test"))
++		return -EPERM;
++	for (unsigned int i = 0; i < ARRAY_SIZE(pair.amp); ++i) {
++		pair.amp[i] = dev_get_drvdata(pair.codec[i]->dev);
++		if (!pair.amp[i] || !pair.amp[i]->fullio_reference_codec)
++			return -EPERM;
++	}
++
++	guard(mutex)(&pair.amp[0]->sp_lock);
++	mutex_lock_nested(&pair.amp[1]->sp_lock, SINGLE_DEPTH_NESTING);
++	for (unsigned int i = 0; i < ARRAY_SIZE(pair.amp); ++i) {
++		ret = pm_runtime_resume_and_get(pair.amp[i]->dev);
++		if (ret < 0)
++			goto out;
++		refs++;
++		ret = wsa884x_fullio_read_pa(pair.codec[i], true, &snapshot);
++		if (ret)
++			goto out;
++		if ((snapshot.enable & WSA884X_PA_FSM_EN_GLOBAL_PA_EN_MASK) || snapshot.sta1 ||
++		    snapshot.err0 || snapshot.err1 || snapshot.vphx != 0x02) {
++			ret = -EIO;
++			goto out;
++		}
++		pair.epoch[i] = snapshot.epoch;
++	}
++	ret = wsa_macro_fullio_verify_pair_clocks_off(left, right);
++	if (!ret)
++		ret = wsa884x_fullio_check_pair(&pair);
++	if (ret)
++		goto out;
++	ret = wsa884x_fullio_reference_start(pair.amp[0]);
++	if (!ret)
++		ret = wsa884x_fullio_check_pair(&pair);
++	if (!ret)
++		ret = wsa884x_fullio_reference_start(pair.amp[1]);
++	if (!ret)
++		ret = wsa884x_fullio_wait_pair_ready(&pair);
++	if (!ret)
++		ret = wsa_macro_fullio_clock_on_for_pair(left, right,
++						       wsa884x_fullio_verify_pair_ready, &pair);
++	if (ret) {
++		int stop_left, stop_right;
++
++		/* Either amp may have reached PA-on even on a bus error. */
++		stop_left = wsa884x_fullio_verified_stop(left, pair.amp[0]);
++		stop_right = wsa884x_fullio_verified_stop(right, pair.amp[1]);
++		*stop_error = stop_left ?: stop_right;
++	}
++out:
++	while (refs) {
++		struct device *dev = pair.amp[--refs]->dev;
++
++		pm_runtime_mark_last_busy(dev);
++		pm_runtime_put_autosuspend(dev);
++	}
++	mutex_unlock(&pair.amp[1]->sp_lock);
++	return ret;
++}
++EXPORT_SYMBOL_GPL(wsa884x_fullio_start_pair);
++
++static bool wsa884x_fullio_pa_stop_audit(struct snd_soc_component *component)
++{
++	struct device_node *sound = component->card ? component->card->dev->of_node : NULL;
++
++	return of_machine_is_compatible("microsoft,denali") &&
++	       of_property_read_bool(sound, "microsoft,denali-fullio-muted-test") &&
++	       of_property_read_bool(sound, "microsoft,denali-fullio-clock-off-audit") &&
++	       of_property_read_bool(sound, "microsoft,denali-fullio-pa-stop-audit") &&
++	       !of_property_read_bool(sound, "microsoft,denali-fullio-post-pa-test");
++}
++
++/* Deliberate test call while the muted playback link still owns its
++ * transport. An ALSA prepare that fails may never reach codec mute.
++ */
++int wsa884x_fullio_stop_audit(struct snd_soc_component *component);
++int wsa884x_fullio_stop_audit(struct snd_soc_component *component)
++{
++	struct wsa884x_priv *amp;
++	unsigned int dre_before = 0, dre_after;
++	int ret, before;
++	bool check_cap;
++	u64 epoch;
++
++	if (!component || component->driver != &wsa884x_component_drv ||
++	    !wsa884x_fullio_pa_stop_audit(component))
++		return -EOPNOTSUPP;
++	amp = dev_get_drvdata(component->dev);
++	if (!amp || !amp->feedback_enabled)
++		return -ENODEV;
++	ret = pm_runtime_resume_and_get(amp->dev);
++	if (ret < 0)
++		return ret;
++	check_cap = of_property_read_bool(component->card->dev->of_node,
++					  "microsoft,denali-fullio-pa-off-gain-audit");
++	epoch = atomic64_read_acquire(&amp->fullio_pa_epoch);
++	before = wsa884x_fullio_pa_off(component);
++	if (!before && check_cap)
++		before = regmap_read_bypassed(amp->regmap, WSA884X_DRE_CTL_1, &dre_before);
++	/* Always attempt shutdown even if the precheck cannot prove PA off. */
++	ret = wsa884x_fullio_verified_stop(component, amp);
++	if (!ret && !before && check_cap) {
++		ret = regmap_read_bypassed(amp->regmap, WSA884X_DRE_CTL_1, &dre_after);
++		if (!ret && (epoch + 1 != (u64)atomic64_read_acquire(&amp->fullio_pa_epoch) ||
++			     READ_ONCE(amp->slave->status) != SDW_SLAVE_ATTACHED))
++			ret = -ESTALE;
++		if (!ret && (dre_after != dre_before ||
++			     !(dre_after & WSA884X_DRE_CTL_1_CSR_GAIN_EN_MASK)))
++			ret = -EIO;
++		if (!ret)
++			dev_info(component->dev, "FullIO PA-off DRE cap retained: before=%#x after=%#x\n",
++				 dre_before, dre_after);
++	}
++	pm_runtime_mark_last_busy(amp->dev);
++	pm_runtime_put_autosuspend(amp->dev);
++	if (before || ret)
++		return before ?: ret;
++	dev_info(component->dev, "FullIO PA-off teardown verified; clock audit and PA readback passed\n");
+ 	return 0;
+ }
++EXPORT_SYMBOL_GPL(wsa884x_fullio_stop_audit);
++
++static struct wsa884x_priv *wsa884x_fullio_fault_audit_amp(struct snd_soc_component *component)
++{
++	struct wsa884x_priv *amp;
++
++	if (!component || component->driver != &wsa884x_component_drv ||
++	    !wsa884x_fullio_pa_stop_audit(component) ||
++	    !of_property_read_bool(component->card->dev->of_node,
++				   "microsoft,denali-fullio-pa-off-fault-worker"))
++		return NULL;
++	amp = dev_get_drvdata(component->dev);
++	return amp && amp->feedback_enabled ? amp : NULL;
++}
++
++/* The caller owns the playback-link lifetime and must disarm both codecs
++ * before flushing/freeing its work. No code in the callback owns the work.
++ */
++int wsa884x_fullio_fault_watch(struct snd_soc_component *component,
++			      struct work_struct *work, bool arm);
++int wsa884x_fullio_fault_watch(struct snd_soc_component *component,
++			      struct work_struct *work, bool arm)
++{
++	struct wsa884x_priv *amp = wsa884x_fullio_fault_audit_amp(component);
++	unsigned long flags;
++	int ret = 0;
++
++	if (!amp || !work)
++		return -EOPNOTSUPP;
++	spin_lock_irqsave(&amp->fullio_fault_lock, flags);
++	if (arm) {
++		if (amp->fullio_fault_work)
++			ret = -EBUSY;
++		else if (READ_ONCE(amp->slave->status) != SDW_SLAVE_ATTACHED)
++			ret = -ENODEV;
++		else
++			amp->fullio_fault_work = work;
++	} else if (amp->fullio_fault_work == work) {
++		amp->fullio_fault_work = NULL;
++	} else {
++		ret = -ESTALE;
++	}
++	spin_unlock_irqrestore(&amp->fullio_fault_lock, flags);
++	return ret;
++}
++EXPORT_SYMBOL_GPL(wsa884x_fullio_fault_watch);
++
++int wsa884x_fullio_fault_inject(struct snd_soc_component *component);
++int wsa884x_fullio_fault_inject(struct snd_soc_component *component)
++{
++	struct wsa884x_priv *amp = wsa884x_fullio_fault_audit_amp(component);
++
++	/* Exercise notification only. Never manufacture a SoundWire state. */
++	return amp && wsa884x_fullio_queue_fault(amp) ? 0 : -EOPNOTSUPP;
++}
++EXPORT_SYMBOL_GPL(wsa884x_fullio_fault_inject);
+ 
+ static int wsa884x_mute_stream(struct snd_soc_dai *dai, int mute, int stream)
+ {
+ 	struct snd_soc_component *component = dai->component;
++	struct wsa884x_priv *wsa884x = dev_get_drvdata(dai->dev);
++
++	if (dai->id != WSA884X_DAI_PLAYBACK)
++		return 0;
++
++	/* The reference PA lifecycle is card-coordinated: the FullIO FE owner
++	 * turns both PAs on together after its graph proof. Per-amp unmute here
++	 * would enable one amplifier without the pair or protection clocks.
++	 */
++	if (!mute && wsa884x->feedback_enabled) {
++		if (wsa884x->fullio_reference_codec)
++			return 0;
++		return -EPERM;
++	}
+ 
+ 	if (mute) {
+-		snd_soc_component_write_field(component, WSA884X_DRE_CTL_1,
+-					      WSA884X_DRE_CTL_1_CSR_GAIN_EN_MASK,
+-					      0x0);
++		if (wsa884x->feedback_enabled) {
++			if (wsa884x->fullio_reference_codec) {
++				guard(mutex)(&wsa884x->sp_lock);
++				return wsa884x_fullio_verified_stop(component, wsa884x);
++			}
++			if (component->card && of_machine_is_compatible("microsoft,denali") &&
++			     of_property_read_bool(component->card->dev->of_node,
++						   "microsoft,denali-fullio-post-pa-test"))
++				return wsa884x_fullio_verified_stop(component, wsa884x);
++			atomic_inc_return(&wsa884x->fullio_pa_teardowns);
++			atomic64_inc_return(&wsa884x->fullio_pa_epoch);
++		} else {
++			snd_soc_component_write_field(component, WSA884X_DRE_CTL_1,
++						      WSA884X_DRE_CTL_1_CSR_GAIN_EN_MASK,
++						      0x0);
++		}
+ 		snd_soc_component_write_field(component, WSA884X_PA_FSM_EN,
+ 					      WSA884X_PA_FSM_EN_GLOBAL_PA_EN_MASK,
+ 					      0x0);
+-
++		if (wsa884x->feedback_enabled)
++			atomic_dec_return(&wsa884x->fullio_pa_teardowns);
+ 	} else {
+ 		snd_soc_component_write_field(component, WSA884X_DRE_CTL_1,
+ 					      WSA884X_DRE_CTL_1_CSR_GAIN_EN_MASK,
+@@ -1829,7 +2729,7 @@ static int wsa884x_set_stream(struct snd_soc_dai *dai,
+ {
+ 	struct wsa884x_priv *wsa884x = dev_get_drvdata(dai->dev);
+ 
+-	wsa884x->sruntime = stream;
++	wsa884x->sruntime[dai->id] = stream;
+ 
+ 	return 0;
+ }
+@@ -1845,6 +2745,7 @@ static const struct snd_soc_dai_ops wsa884x_dai_ops = {
+ static struct snd_soc_dai_driver wsa884x_dais[] = {
+ 	{
+ 		.name = "SPKR",
++		.id = WSA884X_DAI_PLAYBACK,
+ 		.playback = {
+ 			.stream_name = "SPKR Playback",
+ 			.rates = WSA884X_RATES | WSA884X_FRAC_RATES,
+@@ -1856,6 +2757,62 @@ static struct snd_soc_dai_driver wsa884x_dais[] = {
+ 		},
+ 		.ops = &wsa884x_dai_ops,
+ 	},
++	{
++		.name = "SPKR_VI",
++		.id = WSA884X_DAI_VI,
++		.playback = {
++			/*
++			 * ASoC playback semantics make this feedback backend a
++			 * companion of speaker rendering.  The SoundWire stream
++			 * itself is slave-to-master (SDW_DATA_DIR_TX).
++			 */
++			.stream_name = "SPKR VI Protection",
++			.rates = SNDRV_PCM_RATE_8000,
++			.formats = SNDRV_PCM_FMTBIT_S32_LE,
++			.rate_min = 8000,
++			.rate_max = 8000,
++			.channels_min = 1,
++			.channels_max = 1,
++		},
++		.capture = {
++			/*
++			 * ASoC playback semantics make this feedback backend a
++			 * companion of speaker rendering.  The SoundWire stream
++			 * itself is slave-to-master (SDW_DATA_DIR_TX).
++			 */
++			.stream_name = "SPKR VI Capture",
++			.rates = SNDRV_PCM_RATE_8000,
++			.formats = SNDRV_PCM_FMTBIT_S32_LE,
++			.rate_min = 8000,
++			.rate_max = 8000,
++			.channels_min = 1,
++			.channels_max = 1,
++		},
++		.ops = &wsa884x_dai_ops,
++	},
++	{
++		.name = "SPKR_CPS",
++		.id = WSA884X_DAI_CPS,
++		.playback = {
++			.stream_name = "SPKR CPS Protection",
++			.rates = SNDRV_PCM_RATE_24000,
++			.formats = SNDRV_PCM_FMTBIT_S32_LE,
++			.rate_min = 24000,
++			.rate_max = 24000,
++			.channels_min = 1,
++			.channels_max = 1,
++		},
++		.capture = {
++			.stream_name = "SPKR CPS Capture",
++			.rates = SNDRV_PCM_RATE_24000,
++			.formats = SNDRV_PCM_FMTBIT_S32_LE,
++			.rate_min = 24000,
++			.rate_max = 24000,
++			.channels_min = 1,
++			.channels_max = 1,
++		},
++		.ops = &wsa884x_dai_ops,
++	},
+ };
+ 
+ static int wsa884x_get_temp(struct wsa884x_priv *wsa884x, long *temp)
+@@ -2039,12 +2996,41 @@ static int wsa884x_get_reset(struct device *dev, struct wsa884x_priv *wsa884x)
+ 	return 0;
+ }
+ 
++static void wsa884x_runtime_disable(void *data)
++{
++	struct device *dev = data;
++
++	pm_runtime_disable(dev);
++	pm_runtime_dont_use_autosuspend(dev);
++}
++
++static int wsa884x_fullio_init_sink_fields(struct wsa884x_priv *amp)
++{
++	struct sdw_dpn_prop *ports;
++
++	amp->slave->prop.sink_dpn_prop = wsa884x_sink_dpn_prop;
++	if (!amp->feedback_enabled || !of_machine_is_compatible("microsoft,denali"))
++		return 0;
++
++	/* The board schedule supplies the actual values, not an init table. */
++	ports = devm_kmemdup(amp->dev, wsa884x_sink_dpn_prop,
++			    sizeof(wsa884x_sink_dpn_prop), GFP_KERNEL);
++	if (!ports)
++		return -ENOMEM;
++	ports[WSA884X_PORT_DAC].simple_transport_registers |= SDW_DPN_SIMPLE_TRANSPORT_BLOCKCTRL3;
++	ports[WSA884X_PORT_COMP].simple_transport_registers |= SDW_DPN_SIMPLE_TRANSPORT_OFFSETCTRL2;
++	ports[WSA884X_PORT_BOOST].simple_transport_registers |= SDW_DPN_SIMPLE_TRANSPORT_OFFSETCTRL2;
++	amp->slave->prop.sink_dpn_prop = ports;
++	return 0;
++}
++
+ static int wsa884x_probe(struct sdw_slave *pdev,
+ 			 const struct sdw_device_id *id)
+ {
+ 	struct device *dev = &pdev->dev;
+ 	struct wsa884x_priv *wsa884x;
+ 	unsigned int i;
++	u32 offset;
+ 	int ret;
+ 
+ 	wsa884x = devm_kzalloc_obj(dev, *wsa884x);
+@@ -2052,6 +3038,28 @@ static int wsa884x_probe(struct sdw_slave *pdev,
+ 		return -ENOMEM;
+ 
+ 	mutex_init(&wsa884x->sp_lock);
++	atomic64_set(&wsa884x->fullio_pa_epoch, 0);
++	spin_lock_init(&wsa884x->fullio_fault_lock);
++	atomic_set(&wsa884x->fullio_pa_teardowns, 0);
++
++	if (device_property_read_bool(dev, "qcom,enable-cps")) {
++		ret = device_property_read_u32(dev, "qcom,cps-offset1", &offset);
++		if (ret || offset > U8_MAX)
++			return dev_err_probe(dev, ret ?: -ERANGE, "invalid CPS offset\n");
++		/* DP5 already has the upstream two-channel capability. */
++		wsa884x->feedback_ports[0] = wsa884x_sink_dpn_prop[WSA884X_PORT_VISENSE];
++		wsa884x->feedback_ports[1] = wsa884x_fullio_cps_port;
++		wsa884x->feedback_ports[1].override_offset1 = true;
++		wsa884x->feedback_ports[1].offset1 = offset;
++		wsa884x->feedback_enabled = true;
++	}
++	wsa884x->fullio_reference_codec = device_property_read_bool(dev, "qcom,denali-fullio-reference-codec");
++	if (wsa884x->fullio_reference_codec &&
++	    (!of_machine_is_compatible("microsoft,denali") || !wsa884x->feedback_enabled))
++		return dev_err_probe(dev, -EINVAL, "FullIO cold setup requires Denali feedback hardware\n");
++	/* A DT-enabled CPS sidechain is board wiring, not an optional route. */
++	if (wsa884x->feedback_enabled)
++		wsa884x->port_enable[WSA884X_PORT_CPS] = true;
+ 
+ 	for (i = 0; i < WSA884X_SUPPLIES_NUM; i++)
+ 		wsa884x->supplies[i].supply = wsa884x_supply_name[i];
+@@ -2092,8 +3100,18 @@ static int wsa884x_probe(struct sdw_slave *pdev,
+ 		dev_dbg(dev, "Static Port mapping not specified\n");
+ 
+ 	pdev->prop.sink_ports = GENMASK(WSA884X_MAX_SWR_PORTS - 1, 0);
++	if (wsa884x->feedback_enabled) {
++		pdev->prop.sink_ports = BIT(WSA884X_PORT_DAC + 1) |
++			BIT(WSA884X_PORT_COMP + 1) | BIT(WSA884X_PORT_BOOST + 1) |
++			BIT(WSA884X_PORT_PBR + 1);
++		pdev->prop.source_ports = BIT(WSA884X_PORT_VISENSE + 1) |
++			BIT(WSA884X_PORT_CPS + 1);
++		pdev->prop.src_dpn_prop = wsa884x->feedback_ports;
++	}
+ 	pdev->prop.simple_clk_stop_capable = true;
+-	pdev->prop.sink_dpn_prop = wsa884x_sink_dpn_prop;
++	ret = wsa884x_fullio_init_sink_fields(wsa884x);
++	if (ret)
++		return ret;
+ 	pdev->prop.scp_int1_mask = SDW_SCP_INT1_BUS_CLASH | SDW_SCP_INT1_PARITY;
+ 
+ 	wsa884x_reset_deassert(wsa884x);
+@@ -2125,29 +3143,33 @@ static int wsa884x_probe(struct sdw_slave *pdev,
+ 	pm_runtime_use_autosuspend(dev);
+ 	pm_runtime_mark_last_busy(dev);
+ 	pm_runtime_set_active(dev);
+-	ret = devm_pm_runtime_enable(dev);
++	pm_runtime_enable(dev);
++	ret = devm_add_action_or_reset(dev, wsa884x_runtime_disable, dev);
+ 	if (ret)
+ 		return ret;
+ 
+ 	return devm_snd_soc_register_component(dev,
+ 					       &wsa884x_component_drv,
+ 					       wsa884x_dais,
+-					       ARRAY_SIZE(wsa884x_dais));
++					       wsa884x->feedback_enabled ?
++					       ARRAY_SIZE(wsa884x_dais) : 1);
+ }
+ 
+ static int wsa884x_runtime_suspend(struct device *dev)
+ {
+-	struct regmap *regmap = dev_get_regmap(dev, NULL);
++	struct wsa884x_priv *wsa884x = dev_get_drvdata(dev);
+ 
+-	regcache_cache_only(regmap, true);
+-	regcache_mark_dirty(regmap);
++	/* The devres lookup list can already be detached during unbind. */
++	regcache_cache_only(wsa884x->regmap, true);
++	regcache_mark_dirty(wsa884x->regmap);
+ 
+ 	return 0;
+ }
+ 
+ static int wsa884x_runtime_resume(struct device *dev)
+ {
+-	struct regmap *regmap = dev_get_regmap(dev, NULL);
++	struct wsa884x_priv *wsa884x = dev_get_drvdata(dev);
++	struct regmap *regmap = wsa884x->regmap;
+ 	int ret;
+ 
+ 	regcache_cache_only(regmap, false);
