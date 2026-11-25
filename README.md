@@ -15,6 +15,20 @@ Opt-in NixOS hardware support for the **Surface Pro 11 Denali non-5G OLED** (Sna
 
 Set `nixpkgs.hostPlatform` to `aarch64-linux`. Follow the consuming flake's `nixpkgs` input. The default kernel is kernel.org `next-20261124` with the audited Denali Kconfig and isolated SPI-HID/QSPI touch queue. The module supplies the OLED DTB, native device firmware, touch, and ARM64 zboot UKIs. The host owns its partitions, accounts, and desktop. `surface.devices.denali.niriOutputs` is an optional value to pass into an existing Niri configuration, not a compositor installation.
 
+## Installer image
+
+`nix build .#surface-live-iso` produces a text-only aarch64 ISO. It uses the
+aligned zboot UKI and appended EFI partition that this firmware can boot. It
+includes NetworkManager, Git, and the secret-lab disk tools (`parted`,
+`btrfs-progs`, `cryptsetup`, `libfido2`). The console uses the built-in
+`TER16x32` font. There is no desktop.
+
+Root SSH accepts an empty password from any source. Boot it only on a trusted
+network, and do not reuse that access on an installed system. The image does
+not contain private GPU or audio firmware and does not modify an existing
+installation. GitHub Actions builds it on `ubuntu-24.04-arm` when the live
+files change, or when the workflow is started manually.
+
 ## Private firmware
 
 Before building a boot entry, provision the owner-held firmware on the **root filesystem** in a root-managed directory, not in the flake, Nix store, or a public cache. Populate the applicable paths under the configured directory:

@@ -13,8 +13,12 @@
         overlays = [ overlay ];
       };
       kernel = pkgs.surfacePackages.surfaceNext;
+      live = nixpkgs.lib.nixosSystem {
+        modules = [ ./live/default.nix ];
+      };
       packages = {
         default = kernel;
+        surface-live-iso = live.config.system.build.surfaceLiveIso;
         fullio-reference-topology = pkgs.callPackage ./pkgs/fullio-topology.nix { };
         fullio-reference-volume = pkgs.callPackage ./pkgs/fullio-reference-volume.nix { };
         fullio-reference-kernel = kernel.override {
@@ -42,7 +46,28 @@
       overlays.default = overlay;
       nixosModules.default = ./modules/denali.nix;
       nixosModules.fullio-reference-render = import ./modules/denali/fullio-reference-render.nix packages;
+      nixosConfigurations.surface-live = live;
       packages.${system} = packages;
+      checks.${system}.surface-live-config = pkgs.runCommand "surface-live-config" {
+        contract = builtins.toJSON {
+          networkmanager = live.config.networking.networkmanager.enable;
+          ssh = live.config.services.openssh.enable;
+          root = live.config.services.openssh.settings.PermitRootLogin;
+          empty = live.config.services.openssh.settings.PermitEmptyPasswords;
+          font = live.config.boot.kernelParams;
+          tools = map (pkg: pkg.pname or pkg.name) live.config.environment.systemPackages;
+        };
+      } ''
+        printf '%s\n' "$contract" > "$out"
+        grep -q '"networkmanager":true' "$out"
+        grep -q '"ssh":true' "$out"
+        grep -q '"root":"yes"' "$out"
+        grep -q '"empty":true' "$out"
+        grep -q TER16x32 "$out"
+        for tool in git parted gptfdisk dosfstools btrfs-progs cryptsetup libfido2 python3 iw usbutils; do
+          grep -q "\"$tool\"" "$out"
+        done
+      '';
       devShells.${system}.surface-next = pkgs.mkShell {
         inputsFrom = [ kernel ];
         nativeBuildInputs = [ pkgs.util-linux ];
