@@ -17,8 +17,15 @@ def source_contract(alsa, apr, soc, dai, apm):
     assert group.index('mutex_lock_nested(&s->self_group.mutex') < group.index('ops->do_action')
     assert group.index('spin_lock_nested(&s->self_group.lock') < group.index('ops->do_action')
     ordered = ('ops->do_action(s, state)', 'ops->undo_action(s1, state)',
-               'ops->post_action(s, state)', 'mutex_unlock(&s1->self_group.mutex)')
-    assert (positions := [group.index(anchor) for anchor in ordered]) == sorted(positions)
+               'ops->post_action(s, state)')
+    unlock = re.search(r'mutex_unlock\(&s1?->self_group\.mutex\)', group)
+    positions = [group.index(anchor) for anchor in ordered] + [unlock.start()]
+    assert positions == sorted(positions)
+    nonatomic = body(alsa, 'snd_pcm_action_nonatomic')
+    assert nonatomic.index('snd_pcm_buffer_access_lock') < nonatomic.index('snd_pcm_action_single') < \
+        nonatomic.index('snd_pcm_buffer_access_unlock')
+    assert 'snd_pcm_action_group(ops, substream, state, false)' in nonatomic
+    assert group.index('__snd_pcm_buffer_access_lock') < positions[0] < group.index('snd_pcm_buffer_access_unlock')
     assert 'if (s1 == s) /* failed stream */' in group
     assert 'SNDRV_PCM_TRIGGER_STOP' in body(alsa, 'snd_pcm_undo_start')
     assert 'SNDRV_PCM_TRIGGER_PAUSE_RELEASE' in body(alsa, 'snd_pcm_undo_pause')
