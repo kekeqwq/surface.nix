@@ -9,11 +9,13 @@ import hashlib
 import os
 from pathlib import Path
 import re
+import struct
 import subprocess
 import sys
 import tempfile
 
 ZAP = "qcom/x1e80100/microsoft/qcdxkmsuc8380.mbn"
+STORE = Path('/nix/store')
 
 
 def run(*args, **kwargs):
@@ -60,6 +62,33 @@ def private_uki(inspector, components, cmdline, firmware, extra, target, system)
             "--expect-initrd", initrd, "--expect-cmdline", cmdline, stdout=subprocess.DEVNULL)
 
 
+def pe_section(path, wanted):
+    data = path.read_bytes()
+    header = struct.unpack_from('<I', data, 0x3C)[0]
+    if data[:2] != b'MZ' or data[header:header + 4] != b'PE\0\0':
+        raise ValueError(f'{path} is not a PE image')
+    count = struct.unpack_from('<H', data, header + 6)[0]
+    first = header + 24 + struct.unpack_from('<H', data, header + 20)[0]
+    for index in range(count):
+        name, size, _, raw_size, raw = struct.unpack_from('<8sIIII', data, first + 40 * index)
+        if name.rstrip(b'\0') == wanted:
+            return data[raw:raw + min(size, raw_size)]
+    raise ValueError(f'{path} has no {wanted.decode()} section')
+
+
+def installed_system(boot, efi):
+    """Recover the generation from an entry whose stock options were already replaced."""
+    uki = boot / efi.lstrip('/')
+    sidecar = uki.with_suffix('.system')
+    if sidecar.is_file():
+        return Path(sidecar.read_text().strip())
+    cmdline = pe_section(uki, b'.cmdline').split(b'\0', 1)[0].decode()
+    match = re.search(rf'(?:^|\s)init=({re.escape(str(STORE))}/[^ /]+)/init(?:\s|$)', cmdline)
+    if not match:
+        raise ValueError(f'{uki} cmdline does not identify its generation')
+    return Path(match[1])
+
+
 def finish(inspector, boot, current, firmware):
     run("mountpoint", "-q", boot)
     entries = boot / "loader/entries"
@@ -72,12 +101,20 @@ def finish(inspector, boot, current, firmware):
     current_entry = None
     for entry in sorted(entries.glob("nixos-*.conf")):
         lines = entry.read_text().splitlines()
-        match = re.search(r"^options\s+init=(/nix/store/[^ /]+)/(?:init)(?:\s|$)", "\n".join(lines), re.M)
+        match = re.search(rf'^options\s+init=({re.escape(str(STORE))}/[^ /]+)/init(?:\s|$)', '\n'.join(lines), re.M)
         if not match:
-            # Remove stale custom entries whose old UKI no longer exists.
-            # Valid rescue entries are not named nixos-* and are preserved.
+            # A previous switch replaced the stock options with the verified UKI.
+            # Recognize that entry instead of demanding systemd-boot emit it again.
             efi = re.search(r"^efi\s+(/\S+)", "\n".join(lines), re.M)
-            if efi and not (boot / efi.group(1).lstrip("/")).is_file():
+            uki = boot / efi.group(1).lstrip('/') if efi else None
+            if uki and uki.is_file():
+                system = installed_system(boot, efi.group(1))
+                if (system / 'surface-boot').is_dir():
+                    keep.add(uki)
+                    if system == current:
+                        current_entry = entry
+                    continue
+            if efi:
                 pending.append((entry, None))
             continue
         system = Path(match[1])
@@ -107,6 +144,7 @@ def finish(inspector, boot, current, firmware):
                 staged = Path(tmp) / name
                 private_uki(inspector, components, cmdline, firmware, extra, staged, system)
                 os.replace(staged, dst)
+        dst.with_suffix('.system').write_text(str(system) + '\n')
         keep.add(dst)
         text = "\n".join([line for line in lines if line.startswith(("title ", "version ", "sort-key ", "machine-id "))]
                          + ["efi /EFI/surface/" + name]) + "\n"
