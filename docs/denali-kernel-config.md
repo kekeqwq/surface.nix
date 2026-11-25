@@ -32,11 +32,12 @@ FullIO now inherits both instead of substituting the proxy in a private config.
 The config regression check requires both. This source correction does not
 modify Gen20 or install a new default.
 
-The test host uses ext4/VFAT only. It no longer requests the default NTFS or
-initrd LVM integrations. Btrfs and disk unlock are **not** deployed or covered
-by this test. Review Kconfig and initrd dependencies again before adopting
-LUKS2, Btrfs/zstd, and a separately enrolled security key in the formal
-installation. No existing partition is converted.
+The running host still mounts ext4/VFAT only. `BTRFS_FS=m` is now built, and
+the Denali initrd retains `dm_mod`, `dm_crypt` and `btrfs`, so a later formal
+volume can be unlocked by this kernel. AES, xHCI and USB HID are already
+built in, which covers LUKS2 and a touch-only FIDO2 token. This does not
+convert `NIXOS_ROOT`, enroll a key, or make the current generation boot a
+Btrfs root. Do not point `fileSystems` at LUKS/Btrfs until that volume exists.
 
 ## Build and checks
 

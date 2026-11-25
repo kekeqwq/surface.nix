@@ -11,6 +11,8 @@
 
     # Explicit Denali initrd drivers for boot, display, input and rescue media.
     # NVMe, ext4, xHCI, usbhid and hid-generic are built into this kernel.
+    # dm-crypt and btrfs are modular so a later LUKS2/Btrfs root can unlock
+    # them from this initrd. The current host still mounts ext4.
     boot.initrd.includeDefaultModules = false;
     boot.initrd.availableKernelModules = {
       # PCIe/NVMe and USB PHYs + TCSR clock used by both USB-C ports.
@@ -29,6 +31,9 @@
       uas = true;
       sr_mod = true;
       vfat = true;
+      dm_mod = true;
+      dm_crypt = true;
+      btrfs = true;
     };
 
     boot.kernelParams = [
