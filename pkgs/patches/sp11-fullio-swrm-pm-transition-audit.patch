@@ -1,0 +1,106 @@
+Subject: [EXPERIMENT] soundwire: qcom: observe the Denali clock-stop transition
+
+The idle WSA wake reported bus clash before codec regcache replay.
+Sample latched clash, frame and slave state at existing clock-stop
+boundaries, plus slave-status IRQ transitions. Do not change IRQ mask,
+clock start, reset, PM policy, or status return behavior.
+
+--- a/drivers/soundwire/qcom.c
++++ b/drivers/soundwire/qcom.c
+@@ -636,6 +636,13 @@
+ 	return SDW_CMD_IGNORED;
+ }
+ 
++static bool qcom_swrm_fullio_pm_audit(struct qcom_swrm_ctrl *ctrl)
++{
++	return !ctrl->clock_stop_not_supported &&
++	       of_machine_is_compatible("microsoft,denali") &&
++	       of_property_read_bool(ctrl->dev->of_node, "qcom,denali-fullio-pm-transition-audit");
++}
++
+ static int qcom_swrm_get_alert_slave_dev_num(struct qcom_swrm_ctrl *ctrl)
+ {
+ 	u32 val, status;
+@@ -647,6 +654,9 @@
+ 		status = (val >> (dev_num * SWRM_MCP_SLV_STATUS_SZ));
+ 
+ 		if ((status & SWRM_MCP_SLV_STATUS_MASK) == SDW_SLAVE_ALERT) {
++			if (qcom_swrm_fullio_pm_audit(ctrl))
++				dev_info_ratelimited(ctrl->dev, "FullIO PM transition alert: dev=%d slaves=0x%08x\n",
++						     dev_num, val);
+ 			ctrl->status[dev_num] = status & SWRM_MCP_SLV_STATUS_MASK;
+ 			return dev_num;
+ 		}
+@@ -812,6 +822,10 @@
+ 					dev_dbg(ctrl->dev, "Slave status not changed %x\n",
+ 						slave_status);
+ 				} else {
++					if (qcom_swrm_fullio_pm_audit(ctrl))
++						dev_info_ratelimited(ctrl->dev,
++							"FullIO PM transition enum: slaves=0x%08x->0x%08x\n",
++							ctrl->slave_status, slave_status);
+ 					qcom_swrm_get_device_status(ctrl);
+ 					qcom_swrm_enumerate(&ctrl->bus);
+ 					sdw_handle_slave_status(&ctrl->bus, ctrl->status);
+@@ -2039,6 +2053,35 @@
+ 	clk_disable_unprepare(ctrl->hclk);
+ }
+ 
++/*
++ * Observe the original transition; never clear, suppress or retry a clash
++ * from the diagnostic. The status registers are distinct from IRQ CLEAR.
++ */
++static void swrm_fullio_pm_snapshot(struct qcom_swrm_ctrl *ctrl,
++				    const char *stage, int transition_ret)
++{
++	u32 irq_status, frame_status, slave_status;
++	int irq_ret, frame_ret, slave_ret;
++
++	if (!qcom_swrm_fullio_pm_audit(ctrl))
++		return;
++
++	irq_ret = ctrl->reg_read(ctrl, ctrl->reg_layout[SWRM_REG_INTERRUPT_STATUS],
++				 &irq_status);
++	frame_ret = ctrl->reg_read(ctrl, ctrl->reg_layout[SWRM_REG_FRAME_GEN_ENABLED],
++				   &frame_status);
++	slave_ret = ctrl->reg_read(ctrl, SWRM_MCP_SLV_STATUS, &slave_status);
++	if (irq_ret || frame_ret || slave_ret) {
++		dev_warn(ctrl->dev,
++			 "FullIO PM transition %s: status unavailable irq=%d frame=%d slave=%d result=%d\n",
++			 stage, irq_ret, frame_ret, slave_ret, transition_ret);
++		return;
++	}
++	dev_info(ctrl->dev, "FullIO PM transition %s: clash=%d frame=%d result=%d slaves=0x%08x\n",
++		 stage, !!(irq_status & SWRM_INTERRUPT_STATUS_MASTER_CLASH_DET),
++		 !!(frame_status & SWRM_FRM_GEN_ENABLED), transition_ret, slave_status);
++}
++
+ static int __maybe_unused swrm_runtime_resume(struct device *dev)
+ {
+ 	struct qcom_swrm_ctrl *ctrl = dev_get_drvdata(dev);
+@@ -2085,6 +2128,7 @@
+ 			ctrl->reg_write(ctrl, SWRM_MCP_BUS_CTRL, SWRM_MCP_BUS_CLK_START);
+ 		}
+ 
++		swrm_fullio_pm_snapshot(ctrl, "clock-start-before-clash-clear", 0);
+ 		ctrl->reg_write(ctrl, ctrl->reg_layout[SWRM_REG_INTERRUPT_CLEAR],
+ 			SWRM_INTERRUPT_STATUS_MASTER_CLASH_DET);
+ 
+@@ -2100,7 +2144,9 @@
+ 		if (!swrm_wait_for_frame_gen_enabled(ctrl))
+ 			dev_err(ctrl->dev, "link failed to connect\n");
+ 
++		swrm_fullio_pm_snapshot(ctrl, "before-exit-clock-stop", 0);
+ 		ret = sdw_bus_exit_clk_stop(&ctrl->bus);
++		swrm_fullio_pm_snapshot(ctrl, "after-exit-clock-stop", ret);
+ 		if (ret < 0)
+ 			dev_err(ctrl->dev, "bus failed to exit clock stop %d\n", ret);
+ 	}
+@@ -2131,6 +2177,7 @@
+ 		}
+ 
+ 		ret = sdw_bus_clk_stop(&ctrl->bus);
++		swrm_fullio_pm_snapshot(ctrl, "after-enter-clock-stop", ret);
+ 		if (ret < 0 && ret != -ENODATA) {
+ 			dev_err(dev, "bus clock stop failed %d", ret);
+ 			return ret;

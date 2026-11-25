@@ -1,0 +1,36 @@
+ASoC: wsa884x: settle the boost stage before reference PA enable
+
+Measured startup crack is a charge step at PA_FSM_EN with back-to-back writes. Pre-bias the output stage first (default 20 ms, capped at 1 s) with a runtime-tunable parameter for hardware A/B. The surrounding table and post-enable sequence are unchanged.
+--- a/sound/soc/codecs/wsa884x.c
++++ b/sound/soc/codecs/wsa884x.c
+@@ -2345,6 +2345,14 @@
+ 	}
+ 	return verify ?: (pa < 0 ? pa : clock);
+ }
++
++/* Startup settle before PA_FSM_EN. The measured startup crack is a
++ * charge step at PA enable; the output stage now pre-biases first.
++ * Runtime-tunable so hardware A/B measurements need no rebuild.
++ */
++static unsigned int wsa884x_pa_settle_us = 20000;
++module_param_named(pa_settle_us, wsa884x_pa_settle_us, uint, 0644);
++MODULE_PARM_DESC(pa_settle_us, "boost settle in us before PA enable (capped at 1000000)");
+ 
+ static int wsa884x_fullio_reference_start(struct wsa884x_priv *amp)
+ {
+@@ -2363,6 +2371,15 @@
+ 	int ret;
+ 
+ 	for (unsigned int i = 0; i < ARRAY_SIZE(sequence); ++i) {
++		/* Let the boost and half-drive output stage settle before the PA
++		 * connects the speaker. The measured startup crack is a charge
++		 * step at PA_FSM_EN with the previous back-to-back ordering.
++		 */
++		if (sequence[i].reg == WSA884X_PA_FSM_EN) {
++			unsigned int settle = min(wsa884x_pa_settle_us, 1000000U);
++
++			usleep_range(settle, settle + 500);
++		}
+ 		ret = regmap_write(amp->regmap, sequence[i].reg, sequence[i].def);
+ 		if (ret)
+ 			return ret;

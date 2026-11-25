@@ -1,0 +1,173 @@
+Subject: [EXPERIMENT] ASoC: q6apm: identify the FullIO graph owner
+
+Adapt the integrated backend token and graph lookup from the pinned FullIO
+reference. Do not run backend-owned graph commands on the integrated FE.
+Until the protected FE sequence is implemented, return an error rather than
+falling back to the ordinary backend graph.
+
+diff --git a/include/uapi/sound/snd_ar_tokens.h b/include/uapi/sound/snd_ar_tokens.h
+index 5dba4d6..19360c5 100755
+--- a/include/uapi/sound/snd_ar_tokens.h
++++ b/include/uapi/sound/snd_ar_tokens.h
+@@ -335,6 +335,9 @@ enum ar_event_types {
+ #define AR_AUDIO_IF_CLK_NORMAL			0
+ #define AR_AUDIO_IF_CLK_INVERTED		1
+ 
++/* Backend DAI implemented inside the owning frontend graph. */
++#define AR_TKN_U32_MODULE_INTEGRATED_BACKEND_ID	263
++
+ #define SND_SOC_AR_TPLG_MODULE_CFG_TYPE 0x01001006
+ struct audioreach_module_priv_data {
+ 	__le32 size;	/* size in bytes of the array, including all elements */
+diff --git a/sound/soc/qcom/qdsp6/audioreach.h b/sound/soc/qcom/qdsp6/audioreach.h
+index 2352264..e84f290 100644
+--- a/sound/soc/qcom/qdsp6/audioreach.h
++++ b/sound/soc/qcom/qdsp6/audioreach.h
+@@ -983,6 +983,7 @@ struct audioreach_module {
+ 	struct audioreach_container *container;
+ 	struct snd_soc_dapm_widget *widget;
+ 	struct audioreach_module_priv_data *data;
++	u32 integrated_backend_id;
+ 	struct audioreach_module_priv_data *fullio_ctrl_links;
+ };
+ 
+diff --git a/sound/soc/qcom/qdsp6/q6apm-lpass-dais.c b/sound/soc/qcom/qdsp6/q6apm-lpass-dais.c
+index c636226..0ea01ea 100644
+--- a/sound/soc/qcom/qdsp6/q6apm-lpass-dais.c
++++ b/sound/soc/qcom/qdsp6/q6apm-lpass-dais.c
+@@ -230,6 +230,21 @@ static int q6apm_lpass_dai_trigger(struct snd_pcm_substream *substream, int cmd,
+ 	return ret;
+ }
+ 
++static int q6apm_lpass_check_integrated(struct snd_soc_dai *dai)
++{
++	int owner, ret;
++
++	ret = q6apm_find_integrated_backend(dai->dev, dai->id, &owner);
++	if (ret == -ENOENT)
++		return 0;
++	if (ret)
++		return ret;
++
++	/* An integrated BE must not open or configure the FE's DSP graph. */
++	return dev_err_probe(dai->dev, -EOPNOTSUPP,
++			     "integrated backend %d is owned by graph %d\n", dai->id, owner);
++}
++
+ static int q6apm_lpass_dai_prepare(struct snd_pcm_substream *substream, struct snd_soc_dai *dai)
+ {
+ 	struct q6apm_lpass_dai_data *dai_data = dev_get_drvdata(dai->dev);
+@@ -238,6 +253,10 @@ static int q6apm_lpass_dai_prepare(struct snd_pcm_substream *substream, struct s
+ 	int graph_id = dai->id;
+ 	int rc;
+ 
++	rc = q6apm_lpass_check_integrated(dai);
++	if (rc)
++		return rc;
++
+ 	if (dai_data->is_port_started[dai->id]) {
+ 		q6apm_graph_stop(dai_data->graph[dai->id]);
+ 		dai_data->is_port_started[dai->id] = false;
+@@ -284,6 +303,11 @@ static int q6apm_lpass_dai_startup(struct snd_pcm_substream *substream, struct s
+ 	struct q6apm_lpass_dai_data *dai_data = dev_get_drvdata(dai->dev);
+ 	struct q6apm_graph *graph;
+ 	int graph_id = dai->id;
++	int ret;
++
++	ret = q6apm_lpass_check_integrated(dai);
++	if (ret)
++		return ret;
+ 
+ 	if (substream->stream == SNDRV_PCM_STREAM_CAPTURE) {
+ 		graph = q6apm_graph_open(dai->dev, NULL, dai->dev, graph_id, substream->stream);
+diff --git a/sound/soc/qcom/qdsp6/q6apm.c b/sound/soc/qcom/qdsp6/q6apm.c
+index 4cb597d..6c17f93 100644
+--- a/sound/soc/qcom/qdsp6/q6apm.c
++++ b/sound/soc/qcom/qdsp6/q6apm.c
+@@ -724,6 +724,44 @@ static int q6apm_graph_get_module_iid(struct q6apm_graph *graph, uint32_t mid)
+ 	return module->instance_id;
+ }
+ 
++/* The topology declares which FE owns a physical backend. A return value
++ * separate from the graph ID matters: graph 0 is valid.
++ */
++int q6apm_find_integrated_backend(struct device *dev, u32 backend, int *owner)
++{
++	struct q6apm *apm = dev_get_drvdata(dev->parent);
++	struct audioreach_graph_info *info;
++	struct audioreach_sub_graph *sg;
++	struct audioreach_container *container;
++	struct audioreach_module *module;
++	int id, graph = -ENOENT;
++
++	if (!apm)
++		return -ENODEV;
++	mutex_lock(&apm->lock);
++	idr_for_each_entry(&apm->graph_info_idr, info, id) {
++		list_for_each_entry(sg, &info->sg_list, node) {
++			list_for_each_entry(container, &sg->container_list, node) {
++				list_for_each_entry(module, &container->modules_list, node) {
++					if (!backend || module->integrated_backend_id != backend)
++						continue;
++					if (graph >= 0 && graph != id) {
++						mutex_unlock(&apm->lock);
++						return -EEXIST;
++					}
++					graph = id;
++				}
++			}
++		}
++	}
++	mutex_unlock(&apm->lock);
++	if (graph < 0)
++		return graph;
++	*owner = graph;
++	return 0;
++}
++EXPORT_SYMBOL_GPL(q6apm_find_integrated_backend);
++
+ struct q6apm_graph *q6apm_graph_open(struct device *dev, q6apm_cb cb,
+ 				     void *priv, int graph_id, int dir)
+ {
+diff --git a/sound/soc/qcom/qdsp6/q6apm.h b/sound/soc/qcom/qdsp6/q6apm.h
+index 9092359..2bbd85e 100644
+--- a/sound/soc/qcom/qdsp6/q6apm.h
++++ b/sound/soc/qcom/qdsp6/q6apm.h
+@@ -113,6 +113,7 @@ struct q6apm_graph {
+ };
+ 
+ /* Graph Operations */
++int q6apm_find_integrated_backend(struct device *dev, u32 backend, int *owner);
+ struct q6apm_graph *q6apm_graph_open(struct device *dev, q6apm_cb cb,
+ 				     void *priv, int graph_id, int dir);
+ int q6apm_graph_close(struct q6apm_graph *graph);
+diff --git a/sound/soc/qcom/qdsp6/topology.c b/sound/soc/qcom/qdsp6/topology.c
+index dd0b0fb..911396e 100755
+--- a/sound/soc/qcom/qdsp6/topology.c
++++ b/sound/soc/qcom/qdsp6/topology.c
+@@ -528,6 +528,7 @@ static struct audioreach_module *audioreach_parse_common_tokens(struct q6apm *ap
+ 							struct snd_soc_dapm_widget *w)
+ {
+ 	uint32_t max_ip_port = 0, max_op_port = 0;
++	u32 integrated_backend = 0;
+ 	uint32_t src_mod_op_port_id[AR_MAX_MOD_LINKS] = { 0, };
+ 	uint32_t dst_mod_inst_id[AR_MAX_MOD_LINKS] = { 0, };
+ 	uint32_t dst_mod_ip_port_id[AR_MAX_MOD_LINKS] = { 0, };
+@@ -647,6 +648,9 @@ static struct audioreach_module *audioreach_parse_common_tokens(struct q6apm *ap
+ 		case AR_TKN_U32_MODULE_DST_IN_PORT_ID7:
+ 			dst_mod_ip_port_id[7] = le32_to_cpu(mod_elem->value);
+ 			break;
++		case AR_TKN_U32_MODULE_INTEGRATED_BACKEND_ID:
++			integrated_backend = le32_to_cpu(mod_elem->value);
++			break;
+ 		default:
+ 			break;
+ 
+@@ -659,6 +663,7 @@ static struct audioreach_module *audioreach_parse_common_tokens(struct q6apm *ap
+ 		int pn, id = 0;
+ 
+ 		mod->module_id = module_id;
++		mod->integrated_backend_id = integrated_backend;
+ 		mod->max_ip_port = max_ip_port;
+ 		mod->max_op_port = max_op_port;
+ 		mod->src_mod_inst_id = src_mod_inst_id;

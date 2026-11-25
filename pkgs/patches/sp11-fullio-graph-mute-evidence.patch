@@ -1,0 +1,268 @@
+Subject: [EXPERIMENT] ASoC: scope FullIO mute evidence to one graph lifetime
+
+Commit only after validated DSP readback and DMA unmap. Invalidate on
+prepare, stop, flush, close, or transport loss (even after reattach).
+Recording evidence cannot start playback or enable protection clocks.
+
+diff --git a/sound/soc/qcom/qdsp6/q6apm-dai.c b/sound/soc/qcom/qdsp6/q6apm-dai.c
+index e289c9e..2a79c59 100644
+--- a/sound/soc/qcom/qdsp6/q6apm-dai.c
++++ b/sound/soc/qcom/qdsp6/q6apm-dai.c
+@@ -333,14 +333,14 @@ static void event_handler_compr(uint32_t opcode, uint32_t token,
+ 	}
+ }
+ 
+-static void q6apm_fullio_release_cal(struct q6apm_dai_rtd *prtd)
++static int q6apm_fullio_release_cal(struct q6apm_dai_rtd *prtd)
+ {
+ 	struct q6apm_fullio_cal_buffer *buf = prtd->fullio_cal;
+ 	struct q6apm *apm = prtd->graph->apm;
+ 	int ret = 0;
+ 
+ 	if (!buf)
+-		return;
++		return 0;
+ 	prtd->fullio_cal = NULL;
+ 	if (buf->region.handle && !buf->region.poisoned)
+ 		ret = q6apm_fullio_oob_unmap(apm, &buf->region);
+@@ -351,13 +351,14 @@ static void q6apm_fullio_release_cal(struct q6apm_dai_rtd *prtd)
+ 		 */
+ 		apm->fullio_oob_quarantine = buf;
+ 		dev_err(buf->dma_dev, "FullIO calibration buffer quarantined; reboot to reclaim\n");
+-		return;
++		return ret ?: -EIO;
+ 	}
+ 
+ 	dma_free_coherent(buf->dma_dev, FULLIO_CAL_DMA_SIZE, buf->cpu, buf->dma);
+ 	put_device(buf->dma_dev);
+ 	kfree(buf);
+ 	atomic_set(&apm->fullio_oob_claimed, 0);
++	return 0;
+ }
+ 
+ /* Only the two known Denali WSA codecs on the playback link count. */
+@@ -466,9 +467,10 @@ static int q6apm_fullio_prepare_cal(struct q6apm_dai_data *pdata,
+ {
+ 	struct q6apm_fullio_cal_buffer *buf;
+ 	struct audioreach_fullio_stages stages;
++	struct q6apm_fullio_mute_ticket ticket;
+ 	struct q6apm *apm = prtd->graph->apm;
+ 	struct device *dev = pdata->dev;
+-	int owner, ret;
++	int owner, ret, unmap_ret;
+ 
+ 	if (!of_machine_is_compatible("microsoft,denali"))
+ 		return 0;
+@@ -490,8 +492,9 @@ static int q6apm_fullio_prepare_cal(struct q6apm_dai_data *pdata,
+ 	ret = audioreach_fullio_collect_stages(prtd->graph->info, &stages);
+ 	if (ret)
+ 		return ret;
+-	if (!q6apm_fullio_transport_enabled(apm))
+-		return -EAGAIN;
++	ret = q6apm_fullio_mute_begin(prtd->graph, &ticket);
++	if (ret)
++		return ret;
+ 	ret = q6apm_fullio_both_pa_off(card);
+ 	if (ret)
+ 		return ret;
+@@ -525,12 +528,14 @@ static int q6apm_fullio_prepare_cal(struct q6apm_dai_data *pdata,
+ 	if (!ret)
+ 		ret = audioreach_fullio_calibrate(prtd->graph, &stages, &buf->region,
+ 						 buf->cpu, q6apm_fullio_both_pa_off, card);
+-	if (!ret) {
+-		dev_info(prtd->graph->dev, "FullIO muted calibration accepted; render stays disabled\n");
+-		ret = -EOPNOTSUPP;
+-	}
+-	q6apm_fullio_release_cal(prtd);
+-	return ret;
++	unmap_ret = q6apm_fullio_release_cal(prtd);
++	if (ret || unmap_ret)
++		return ret ?: unmap_ret;
++	ret = q6apm_fullio_mute_commit(prtd->graph, &ticket);
++	if (ret)
++		return ret;
++	dev_info(prtd->graph->dev, "FullIO graph-local mute verified; render stays disabled\n");
++	return -EOPNOTSUPP;
+ 
+ release_claim:
+ 	atomic_set(&apm->fullio_oob_claimed, 0);
+@@ -556,6 +561,8 @@ static int q6apm_dai_prepare(struct snd_soc_component *component,
+ 		return -EINVAL;
+ 	}
+ 
++	if (audioreach_fullio_graph(prtd->graph->info))
++		q6apm_fullio_mute_invalidate(prtd->graph);
+ 	cfg.direction = substream->stream;
+ 	cfg.sample_rate = runtime->rate;
+ 	cfg.num_channels = runtime->channels;
+diff --git a/sound/soc/qcom/qdsp6/q6apm.c b/sound/soc/qcom/qdsp6/q6apm.c
+index 0c6b406..b9930c9 100644
+--- a/sound/soc/qcom/qdsp6/q6apm.c
++++ b/sound/soc/qcom/qdsp6/q6apm.c
+@@ -37,13 +37,19 @@ void q6apm_fullio_set_transport(struct device *dev, enum q6apm_fullio_feedback p
+ 			      bool enabled)
+ {
+ 	struct q6apm *apm = dev_get_drvdata(dev->parent);
++	unsigned long flags;
+ 
+ 	if (!apm || (path != Q6APM_FULLIO_VI && path != Q6APM_FULLIO_CPS))
+ 		return;
+-	if (enabled)
++	spin_lock_irqsave(&apm->fullio_oob_lock, flags);
++	if (enabled) {
+ 		set_bit(path, &apm->fullio_transport);
+-	else
++	} else {
+ 		clear_bit(path, &apm->fullio_transport);
++		if (apm->fullio_transport_epoch != U64_MAX)
++			apm->fullio_transport_epoch++;
++	}
++	spin_unlock_irqrestore(&apm->fullio_oob_lock, flags);
+ }
+ EXPORT_SYMBOL_GPL(q6apm_fullio_set_transport);
+ 
+@@ -55,6 +61,83 @@ bool q6apm_fullio_transport_enabled(struct q6apm *apm)
+ }
+ EXPORT_SYMBOL_GPL(q6apm_fullio_transport_enabled);
+ 
++static void q6apm_fullio_mute_invalidate_locked(struct q6apm_graph *graph)
++{
++	graph->fullio_mute_verified = false;
++	if (graph->fullio_mute_epoch != U64_MAX)
++		graph->fullio_mute_epoch++;
++}
++
++void q6apm_fullio_mute_invalidate(struct q6apm_graph *graph)
++{
++	unsigned long flags;
++
++	spin_lock_irqsave(&graph->apm->fullio_oob_lock, flags);
++	q6apm_fullio_mute_invalidate_locked(graph);
++	spin_unlock_irqrestore(&graph->apm->fullio_oob_lock, flags);
++}
++EXPORT_SYMBOL_GPL(q6apm_fullio_mute_invalidate);
++
++int q6apm_fullio_mute_begin(struct q6apm_graph *graph, struct q6apm_fullio_mute_ticket *ticket)
++{
++	struct q6apm *apm = graph->apm;
++	unsigned long flags;
++	int ret = 0;
++
++	spin_lock_irqsave(&apm->fullio_oob_lock, flags);
++	q6apm_fullio_mute_invalidate_locked(graph);
++	if (graph->fullio_mute_epoch == U64_MAX || apm->fullio_transport_epoch == U64_MAX)
++		ret = -EOVERFLOW;
++	else if (!q6apm_fullio_transport_enabled(apm))
++		ret = -EAGAIN;
++	else
++		*ticket = (struct q6apm_fullio_mute_ticket) {
++			.graph = graph,
++			.graph_epoch = graph->fullio_mute_epoch,
++			.transport_epoch = apm->fullio_transport_epoch,
++		};
++	spin_unlock_irqrestore(&apm->fullio_oob_lock, flags);
++	return ret;
++}
++EXPORT_SYMBOL_GPL(q6apm_fullio_mute_begin);
++
++/* Commit only after stereo readback, PA-off checks and successful unmap. */
++int q6apm_fullio_mute_commit(struct q6apm_graph *graph,
++			   const struct q6apm_fullio_mute_ticket *ticket)
++{
++	struct q6apm *apm = graph->apm;
++	unsigned long flags;
++	int ret = -ESTALE;
++
++	spin_lock_irqsave(&apm->fullio_oob_lock, flags);
++	if (ticket->graph == graph && ticket->graph_epoch == graph->fullio_mute_epoch &&
++	    ticket->transport_epoch == apm->fullio_transport_epoch &&
++	    q6apm_fullio_transport_enabled(apm)) {
++		graph->fullio_mute_verified = true;
++		graph->fullio_mute_transport_epoch = ticket->transport_epoch;
++		ret = 0;
++	}
++	spin_unlock_irqrestore(&apm->fullio_oob_lock, flags);
++	return ret;
++}
++EXPORT_SYMBOL_GPL(q6apm_fullio_mute_commit);
++
++/* Evidence only: callers must not treat this as protection clock permission. */
++bool q6apm_fullio_mute_is_verified(struct q6apm_graph *graph)
++{
++	struct q6apm *apm = graph->apm;
++	unsigned long flags;
++	bool verified;
++
++	spin_lock_irqsave(&apm->fullio_oob_lock, flags);
++	verified = graph->fullio_mute_verified &&
++		   graph->fullio_mute_transport_epoch == apm->fullio_transport_epoch &&
++		   q6apm_fullio_transport_enabled(apm);
++	spin_unlock_irqrestore(&apm->fullio_oob_lock, flags);
++	return verified;
++}
++EXPORT_SYMBOL_GPL(q6apm_fullio_mute_is_verified);
++
+ int q6apm_send_cmd_sync(struct q6apm *apm, struct gpr_pkt *pkt,
+ 			uint32_t rsp_opcode)
+ {
+@@ -1216,6 +1299,7 @@ int q6apm_graph_close(struct q6apm_graph *graph)
+ {
+ 	struct audioreach_graph *ar_graph = graph->ar_graph;
+ 
++	q6apm_fullio_mute_invalidate(graph);
+ 	graph->ar_graph = NULL;
+ 	q6apm_release_audioreach_graph(ar_graph);
+ 	gpr_free_port(graph->port);
+@@ -1256,6 +1340,7 @@ int q6apm_graph_stop(struct q6apm_graph *graph)
+ {
+ 	struct audioreach_graph *ar_graph = graph->ar_graph;
+ 
++	q6apm_fullio_mute_invalidate(graph);
+ 	if (ar_graph->start_count == 0)
+ 		return 0;
+ 
+@@ -1268,6 +1353,7 @@ EXPORT_SYMBOL_GPL(q6apm_graph_stop);
+ 
+ int q6apm_graph_flush(struct q6apm_graph *graph)
+ {
++	q6apm_fullio_mute_invalidate(graph);
+ 	return audioreach_graph_mgmt_cmd(graph->ar_graph, APM_CMD_GRAPH_FLUSH);
+ }
+ EXPORT_SYMBOL_GPL(q6apm_graph_flush);
+diff --git a/sound/soc/qcom/qdsp6/q6apm.h b/sound/soc/qcom/qdsp6/q6apm.h
+index 0dc0e46..98c6040 100644
+--- a/sound/soc/qcom/qdsp6/q6apm.h
++++ b/sound/soc/qcom/qdsp6/q6apm.h
+@@ -68,6 +68,7 @@ struct q6apm {
+ 	/* Serializes DSP graph open, publication and final close. */
+ 	struct mutex graph_lock;
+ 	unsigned long fullio_transport;
++	u64 fullio_transport_epoch; /* Protected by fullio_oob_lock. */
+ 	/* Dedicated, token-matched OOB mapping acknowledgement. */
+ 	spinlock_t fullio_oob_lock;
+ 	struct completion fullio_oob_done;
+@@ -127,8 +128,24 @@ struct q6apm_graph {
+ 	struct mutex lock;
+ 	struct audioreach_graph *ar_graph;
+ 	struct audioreach_graph_info *info;
++	/* Mute evidence is local to this open graph; fullio_oob_lock protects it. */
++	u64 fullio_mute_epoch;
++	u64 fullio_mute_transport_epoch;
++	bool fullio_mute_verified;
+ };
+ 
++struct q6apm_fullio_mute_ticket {
++	const struct q6apm_graph *graph;
++	u64 graph_epoch;
++	u64 transport_epoch;
++};
++
++void q6apm_fullio_mute_invalidate(struct q6apm_graph *graph);
++int q6apm_fullio_mute_begin(struct q6apm_graph *graph, struct q6apm_fullio_mute_ticket *ticket);
++int q6apm_fullio_mute_commit(struct q6apm_graph *graph,
++			   const struct q6apm_fullio_mute_ticket *ticket);
++bool q6apm_fullio_mute_is_verified(struct q6apm_graph *graph);
++
+ /* Graph Operations */
+ enum q6apm_fullio_feedback {
+ 	Q6APM_FULLIO_VI,

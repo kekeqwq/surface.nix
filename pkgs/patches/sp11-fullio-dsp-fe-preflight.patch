@@ -1,0 +1,35 @@
+Subject: [EXPERIMENT] ASoC: q6apm-dai: preflight the FullIO frontend graph
+
+Require all three backends to share this graph and collect all calibration
+stages before reserving DMA. No playback or calibration commands are sent.
+
+diff --git a/sound/soc/qcom/qdsp6/q6apm-dai.c b/sound/soc/qcom/qdsp6/q6apm-dai.c
+index bd785b7..8de0024 100644
+--- a/sound/soc/qcom/qdsp6/q6apm-dai.c
++++ b/sound/soc/qcom/qdsp6/q6apm-dai.c
+@@ -364,6 +364,7 @@ static int q6apm_fullio_prepare_cal(struct q6apm_dai_data *pdata,
+ 				   struct q6apm_dai_rtd *prtd)
+ {
+ 	struct q6apm_fullio_cal_buffer *buf;
++	struct audioreach_fullio_stages stages;
+ 	struct q6apm *apm = prtd->graph->apm;
+ 	struct device *dev = pdata->dev;
+ 	int owner, ret;
+@@ -377,6 +378,17 @@ static int q6apm_fullio_prepare_cal(struct q6apm_dai_data *pdata,
+ 		return ret;
+ 	if (!q6apm_is_graph_in_push_pull_mode(prtd->graph) || pdata->use_scm_assign)
+ 		return -EOPNOTSUPP;
++	ret = q6apm_find_integrated_backend(dev, WSA_CODEC_DMA_TX_0, &owner);
++	if (ret || owner != prtd->graph->id)
++		return ret ?: -EINVAL;
++	ret = q6apm_find_integrated_backend(dev, WSA_CODEC_DMA_TX_1, &owner);
++	if (ret || owner != prtd->graph->id)
++		return ret ?: -EINVAL;
++
++	/* Never claim or map a buffer for an incomplete or inconsistent graph. */
++	ret = audioreach_fullio_collect_stages(prtd->graph->info, &stages);
++	if (ret)
++		return ret;
+ 	if (!q6apm_fullio_transport_enabled(apm))
+ 		return -EAGAIN;
+ 	if (atomic_cmpxchg(&apm->fullio_oob_claimed, 0, 1))

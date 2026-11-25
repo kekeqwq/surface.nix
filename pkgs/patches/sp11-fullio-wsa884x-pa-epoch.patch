@@ -1,0 +1,98 @@
+Subject: [EXPERIMENT] ASoC: reject FullIO PA snapshots across notified transitions
+
+Count observed SoundWire non-attached status and bracket PA teardown
+writes. This is a snapshot guard, not fault monitoring or a clock-control
+callback. No change to amp or DSP render permission.
+
+diff --git a/sound/soc/codecs/wsa884x.c b/sound/soc/codecs/wsa884x.c
+index f3c23ee..ae758e9 100755
+--- a/sound/soc/codecs/wsa884x.c
++++ b/sound/soc/codecs/wsa884x.c
+@@ -4,6 +4,7 @@
+  * Copyright (c) 2023, Linaro Ltd.
+  */
+ 
++#include <linux/atomic.h>
+ #include <linux/bitfield.h>
+ #include <linux/cleanup.h>
+ #include <linux/device.h>
+@@ -744,6 +745,8 @@ struct wsa884x_priv {
+ 	struct sdw_stream_runtime *attached[WSA884X_NUM_DAIS];
+ 	struct sdw_dpn_prop feedback_ports[2];
+ 	bool feedback_enabled;
++	atomic64_t fullio_pa_epoch;
++	atomic_t fullio_pa_teardowns;
+ 	struct gpio_desc *sd_n;
+ 	struct reset_control *sd_reset;
+ 	bool port_prepared[WSA884X_MAX_SWR_PORTS];
+@@ -1579,6 +1582,8 @@ static int wsa884x_update_status(struct sdw_slave *slave,
+ 	struct wsa884x_priv *wsa884x = dev_get_drvdata(&slave->dev);
+ 	int ret;
+ 
++	if (wsa884x->feedback_enabled && status != SDW_SLAVE_ATTACHED)
++		atomic64_inc_return(&wsa884x->fullio_pa_epoch);
+ 	if (status == SDW_SLAVE_UNATTACHED) {
+ 		wsa884x->hw_init = false;
+ 		regcache_cache_only(wsa884x->regmap, true);
+@@ -1810,6 +1815,7 @@ int wsa884x_fullio_read_pa(struct snd_soc_component *component,
+ {
+ 	struct wsa884x_priv *wsa884x;
+ 	unsigned int before, after, sta0, sta1;
++	s64 epoch;
+ 	int ret;
+ 
+ 	if (!component || component->driver != &wsa884x_component_drv)
+@@ -1821,6 +1827,11 @@ int wsa884x_fullio_read_pa(struct snd_soc_component *component,
+ 	ret = pm_runtime_resume_and_get(wsa884x->dev);
+ 	if (ret < 0)
+ 		return ret;
++	epoch = atomic64_read_acquire(&wsa884x->fullio_pa_epoch);
++	if (atomic_read_acquire(&wsa884x->fullio_pa_teardowns)) {
++		ret = -EAGAIN;
++		goto put;
++	}
+ 	if (READ_ONCE(wsa884x->slave->status) != SDW_SLAVE_ATTACHED) {
+ 		ret = -ENODEV;
+ 		goto put;
+@@ -1834,7 +1845,11 @@ int wsa884x_fullio_read_pa(struct snd_soc_component *component,
+ 		ret = regmap_read_bypassed(wsa884x->regmap, WSA884X_PA_FSM_EN, &after);
+ 	if (!ret && READ_ONCE(wsa884x->slave->status) != SDW_SLAVE_ATTACHED)
+ 		ret = -ENODEV;
+-	if (!ret && before != after)
++	/* Never publish a snapshot that straddled a delivered status change
++	 * or PA teardown, even if the sampled enable values are identical.
++	 */
++	if (!ret && (before != after || atomic_read_acquire(&wsa884x->fullio_pa_teardowns) ||
++		     epoch != atomic64_read_acquire(&wsa884x->fullio_pa_epoch)))
+ 		ret = -EAGAIN;
+ 	if (!ret) {
+ 		*enable = after;
+@@ -1928,13 +1943,18 @@ static int wsa884x_mute_stream(struct snd_soc_dai *dai, int mute, int stream)
+ 		return -EPERM;
+ 
+ 	if (mute) {
++		if (wsa884x->feedback_enabled) {
++			atomic_inc_return(&wsa884x->fullio_pa_teardowns);
++			atomic64_inc_return(&wsa884x->fullio_pa_epoch);
++		}
+ 		snd_soc_component_write_field(component, WSA884X_DRE_CTL_1,
+ 					      WSA884X_DRE_CTL_1_CSR_GAIN_EN_MASK,
+ 					      0x0);
+ 		snd_soc_component_write_field(component, WSA884X_PA_FSM_EN,
+ 					      WSA884X_PA_FSM_EN_GLOBAL_PA_EN_MASK,
+ 					      0x0);
+-
++		if (wsa884x->feedback_enabled)
++			atomic_dec_return(&wsa884x->fullio_pa_teardowns);
+ 	} else {
+ 		snd_soc_component_write_field(component, WSA884X_DRE_CTL_1,
+ 					      WSA884X_DRE_CTL_1_CSR_GAIN_EN_MASK,
+@@ -2233,6 +2253,8 @@ static int wsa884x_probe(struct sdw_slave *pdev,
+ 		return -ENOMEM;
+ 
+ 	mutex_init(&wsa884x->sp_lock);
++	atomic64_set(&wsa884x->fullio_pa_epoch, 0);
++	atomic_set(&wsa884x->fullio_pa_teardowns, 0);
+ 
+ 	if (device_property_read_bool(dev, "qcom,enable-cps")) {
+ 		ret = device_property_read_u32(dev, "qcom,cps-offset1", &offset);

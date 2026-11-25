@@ -1,0 +1,110 @@
+ASoC: q6apm: deliver PCM watermarks outside the GPR receive queue
+
+A watermark requests a cursor sample; it is not a count of elapsed periods.
+Publish only under the stream lock, revoke on STOP/pause/suspend, and drain before dropping graph ownership.
+--- a/sound/soc/qcom/qdsp6/q6apm-dai.c
++++ b/sound/soc/qcom/qdsp6/q6apm-dai.c
+@@ -110,6 +110,10 @@
+ 	enum stream_state state;
+ 	struct q6apm_graph *graph;
+ 	spinlock_t lock;
++	struct work_struct watermark_work;
++	/* Protected by lock. STOP revokes queued progress notifications. */
++	bool watermark_enabled;
++	bool watermark_pending;
+ 	bool notify_on_drain;
+ };
+ 
+@@ -252,6 +256,44 @@
+ 	.periods_max =          PLAYBACK_MAX_NUM_PERIODS,
+ 	.fifo_size =            0,
+ };
++
++static void q6apm_pcm_watermark_work(struct work_struct *work)
++{
++	struct q6apm_dai_rtd *prtd = container_of(work, struct q6apm_dai_rtd, watermark_work);
++	struct snd_pcm_substream *substream = prtd->substream;
++	unsigned long flags;
++	bool notify;
++
++	snd_pcm_stream_lock_irqsave(substream, flags);
++	scoped_guard(spinlock_irqsave, &prtd->lock) {
++		notify = prtd->watermark_enabled && prtd->watermark_pending;
++		prtd->watermark_pending = false;
++	}
++	if (notify)
++		snd_pcm_period_elapsed_under_stream_lock(substream);
++	snd_pcm_stream_unlock_irqrestore(substream, flags);
++}
++
++static void q6apm_pcm_watermark_queue(struct q6apm_dai_rtd *prtd)
++{
++	guard(spinlock_irqsave)(&prtd->lock);
++	if (!prtd->watermark_enabled)
++		return;
++
++	/* The cursor reports progress, not the number of wakeups. Never take
++	 * the PCM group lock on the shared GPR receive queue.
++	 */
++	prtd->watermark_pending = true;
++	schedule_work(&prtd->watermark_work);
++}
++
++static void q6apm_pcm_watermark_enable(struct q6apm_dai_rtd *prtd, bool enable)
++{
++	guard(spinlock_irqsave)(&prtd->lock);
++	prtd->watermark_enabled = enable;
++	if (!enable)
++		prtd->watermark_pending = false;
++}
+ 
+ static void event_handler(uint32_t opcode, uint32_t token, void *payload, void *priv)
+ {
+@@ -260,7 +302,7 @@
+ 
+ 	switch (opcode) {
+ 	case APM_CLIENT_EVENT_WATERMARK_EVENT:
+-		snd_pcm_period_elapsed(substream);
++		q6apm_pcm_watermark_queue(prtd);
+ 		break;
+ 	case APM_CLIENT_EVENT_CMD_EOS_DONE:
+ 		prtd->state = Q6APM_STREAM_STOPPED;
+@@ -1255,15 +1297,17 @@
+ 	case SNDRV_PCM_TRIGGER_PAUSE_RELEASE:
+ 		if (audioreach_fullio_graph(prtd->graph->info))
+ 			return -EOPNOTSUPP;
++		q6apm_pcm_watermark_enable(prtd, true);
+ 		break;
+ 	case SNDRV_PCM_TRIGGER_STOP:
+-		/* TODO support be handled via SoftPause Module */
++		q6apm_pcm_watermark_enable(prtd, false);
+ 		prtd->state = Q6APM_STREAM_STOPPED;
+ 		prtd->queue_ptr = 0;
+ 		prtd->last_pos_index = 0;
+ 		break;
+ 	case SNDRV_PCM_TRIGGER_SUSPEND:
+ 	case SNDRV_PCM_TRIGGER_PAUSE_PUSH:
++		q6apm_pcm_watermark_enable(prtd, false);
+ 		break;
+ 	default:
+ 		ret = -EINVAL;
+@@ -1319,6 +1363,7 @@
+ 		return -ENOMEM;
+ 
+ 	spin_lock_init(&prtd->lock);
++	INIT_WORK(&prtd->watermark_work, q6apm_pcm_watermark_work);
+ 	prtd->substream = substream;
+ 	independent = q6apm_fullio_independent_pcm(component, graph_id, substream->stream);
+ 	/* The private diagnostic ring has no ALSA-visible progress. Avoid
+@@ -1419,6 +1464,11 @@
+ 	struct snd_pcm_runtime *runtime = substream->runtime;
+ 	struct q6apm_dai_rtd *prtd = runtime->private_data;
+ 
++	/* Close is outside the PCM group lock. Revoke before draining so
++	 * concurrent GPR callbacks cannot queue new work against this graph.
++	 */
++	q6apm_pcm_watermark_enable(prtd, false);
++	cancel_work_sync(&prtd->watermark_work);
+ 	if (prtd->state) {
+ 		/* only stop graph that is started */
+ 		q6apm_graph_stop(prtd->graph);

@@ -1,0 +1,53 @@
+Reserve FullIO transaction tokens across APM reprobe.
+
+--- a/sound/soc/qcom/qdsp6/q6apm.c
++++ b/sound/soc/qcom/qdsp6/q6apm.c
+@@ -154,7 +154,21 @@
+  * Use a separate token namespace; late replies must never satisfy another map.
+  */
+ #define Q6APM_FULLIO_OOB_TOKEN BIT(31)
++/* Keep the namespace across APM reprobe, but not across module reload. */
++static atomic_t fullio_oob_sequence = ATOMIC_INIT(0);
+ 
++static int q6apm_fullio_next_token(u32 *token)
++{
++	int sequence = atomic_read(&fullio_oob_sequence);
++
++	do {
++		if (sequence == INT_MAX)
++			return -EOVERFLOW;
++	} while (!atomic_try_cmpxchg(&fullio_oob_sequence, &sequence, sequence + 1));
++	*token = Q6APM_FULLIO_OOB_TOKEN | (u32)(sequence + 1);
++	return 0;
++}
++
+ struct q6apm_fullio_get {
+ 	u32 instance;
+ 	u32 param;
+@@ -262,14 +276,15 @@
+ {
+ 	gpr_device_t *gdev = apm->gdev;
+ 	unsigned long flags;
++	u32 token;
+ 	int ret;
+ 
+ 	/* Serialize against legacy APM commands, without using their reply slot. */
+ 	guard(mutex)(&apm->lock);
+-	if (apm->fullio_oob_sequence >= Q6APM_FULLIO_OOB_TOKEN - 1)
+-		return -EOVERFLOW;
+-
+-	pkt->hdr.token = Q6APM_FULLIO_OOB_TOKEN | ++apm->fullio_oob_sequence;
++	ret = q6apm_fullio_next_token(&token);
++	if (ret)
++		return ret;
++	pkt->hdr.token = token;
+ 	pkt->hdr.dest_domain = audioreach_gpr_dest_domain(gdev);
+ 	reinit_completion(&apm->fullio_oob_done);
+ 	spin_lock_irqsave(&apm->fullio_oob_lock, flags);
+--- a/sound/soc/qcom/qdsp6/q6apm.h
++++ b/sound/soc/qcom/qdsp6/q6apm.h
+@@ -52,4 +52,3 @@
+ 	struct completion fullio_oob_done;
+-	u32 fullio_oob_sequence;
+ 	u32 fullio_oob_token;
+ 	u32 fullio_oob_op;

@@ -26,10 +26,11 @@ counts; an `olddefconfig` run on unpatched upstream loses `SPI_HID_OF`.
 Known regression in the pruned `next-20261120` config: both Denali WSA884x
 codecs use LPASS GPIO 12 as a shared reset. Removing `GPIO_SHARED_PROXY=m`
 left the GPIO proxy devices unbound, with `reset_gpio` and both codecs deferred.
-The ALSA card was absent and PipeWire only exposed `Dummy Output`. The
-standalone restore-and-rebuild trial was cancelled before validation in favor of
-evaluating FullIO v19c. If returning to this kernel path, retain both
-`RESET_GPIO` and `GPIO_SHARED_PROXY`.
+The ALSA card was absent and PipeWire only exposed `Dummy Output`. This remains reproducible on the retained Gen20 closure. Restore
+`GPIO_SHARED_PROXY=m` in the normal kernel config alongside `RESET_GPIO=m`;
+FullIO now inherits both instead of substituting the proxy in a private config.
+The config regression check requires both. This source correction does not
+modify Gen20 or install a new default.
 
 The test host uses ext4/VFAT only. It no longer requests the default NTFS or
 initrd LVM integrations. Btrfs and disk unlock are **not** deployed or covered

@@ -1,0 +1,67 @@
+From: Surface FullIO bring-up
+Subject: [PATCH] ASoC: wsa884x: keep regmap reachable until runtime PM stops
+
+On driver release, devres_release_all() moves the lookup entries out of
+struct device's list before invoking any release actions. The generic
+managed PM action clears autosuspend first, which can run runtime_suspend
+with no dev_get_regmap() result even though the map has not been freed.
+The resulting NULL dereference was observed on an idle PA-off Denali.
+
+Use the per-device regmap pointer already owned by the codec and stop PM
+before clearing autosuspend. Register this action after regmap creation
+and before component registration: devres removes the component first
+and quiesces PM before destroying the map. Keep the private lookup for
+callbacks already in flight during devres list removal.
+
+--- a/sound/soc/codecs/wsa884x.c
++++ b/sound/soc/codecs/wsa884x.c
+@@ -2458,6 +2458,14 @@ static int wsa884x_get_reset(struct device *dev, struct wsa884x_priv *wsa884x)
+ 	return 0;
+ }
+ 
++static void wsa884x_runtime_disable(void *data)
++{
++	struct device *dev = data;
++
++	pm_runtime_disable(dev);
++	pm_runtime_dont_use_autosuspend(dev);
++}
++
+ static int wsa884x_probe(struct sdw_slave *pdev,
+ 			 const struct sdw_device_id *id)
+ {
+@@ -2567,7 +2575,8 @@ static int wsa884x_probe(struct sdw_slave *pdev,
+ 	pm_runtime_use_autosuspend(dev);
+ 	pm_runtime_mark_last_busy(dev);
+ 	pm_runtime_set_active(dev);
+-	ret = devm_pm_runtime_enable(dev);
++	pm_runtime_enable(dev);
++	ret = devm_add_action_or_reset(dev, wsa884x_runtime_disable, dev);
+ 	if (ret)
+ 		return ret;
+ 
+@@ -2580,19 +2589,21 @@ static int wsa884x_probe(struct sdw_slave *pdev,
+ 
+ static int wsa884x_runtime_suspend(struct device *dev)
+ {
+-	struct regmap *regmap = dev_get_regmap(dev, NULL);
++	struct wsa884x_priv *wsa884x = dev_get_drvdata(dev);
+ 
+-	regcache_cache_only(regmap, true);
+-	regcache_mark_dirty(regmap);
++	/* The devres lookup list can already be detached during unbind. */
++	regcache_cache_only(wsa884x->regmap, true);
++	regcache_mark_dirty(wsa884x->regmap);
+ 
+ 	return 0;
+ }
+ 
+ static int wsa884x_runtime_resume(struct device *dev)
+ {
+-	struct regmap *regmap = dev_get_regmap(dev, NULL);
++	struct wsa884x_priv *wsa884x = dev_get_drvdata(dev);
++	struct regmap *regmap = wsa884x->regmap;
+ 	int ret;
+ 
+ 	regcache_cache_only(regmap, false);
+ 	ret = regcache_sync(regmap);

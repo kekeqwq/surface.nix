@@ -1,0 +1,122 @@
+Subject: [EXPERIMENT] ASoC: use exact WSA feedback probe endpoint framing
+
+For the silent capture probes only, use v19c endpoint parameters with
+body sizes separate from wire padding. Do not change the normal media walk.
+
+diff --git a/sound/soc/qcom/qdsp6/audioreach.c b/sound/soc/qcom/qdsp6/audioreach.c
+index 0f49e5f..7f8da28 100644
+--- a/sound/soc/qcom/qdsp6/audioreach.c
++++ b/sound/soc/qcom/qdsp6/audioreach.c
+@@ -1080,6 +1080,64 @@ static int audioreach_display_port_set_media_format(struct q6apm_graph *graph,
+ }
+ 
+ /* LPASS Codec DMA port Module Media Format Setup */
++/* Native WSA feedback endpoint SET_CFG: param_size excludes wire padding. */
++int audioreach_fullio_probe_endpoint(struct q6apm_graph *graph,
++				    const struct audioreach_module_config *cfg, bool cps)
++{
++	u32 rate = cps ? 24000 : 8000;
++	u32 iface = cps ? 3 : 1;
++	struct audioreach_sub_graph *sg;
++	struct audioreach_container *container;
++	struct audioreach_module *module;
++	const u32 iid = 24720;
++	unsigned int sources = 0;
++	const __le32 words[] = {
++		cpu_to_le32(iid), cpu_to_le32(PARAM_ID_HW_EP_MF_CFG), cpu_to_le32(12), 0,
++		cpu_to_le32(rate), cpu_to_le32((2 << 16) | 32), cpu_to_le32(1), 0,
++		cpu_to_le32(iid), cpu_to_le32(PARAM_ID_HW_EP_FRAME_SIZE_FACTOR), cpu_to_le32(4), 0,
++		cpu_to_le32(1), 0,
++		cpu_to_le32(iid), cpu_to_le32(PARAM_ID_CODEC_DMA_INTF_CFG), cpu_to_le32(12), 0,
++		cpu_to_le32(2), cpu_to_le32(iface), cpu_to_le32(3), 0,
++		cpu_to_le32(iid), cpu_to_le32(PARAM_ID_HW_EP_POWER_MODE_CFG), cpu_to_le32(4), 0,
++		0, 0,
++		cpu_to_le32(iid), cpu_to_le32(0x080013d5), cpu_to_le32(4), 0,
++		0, 0,
++	};
++	int ret;
++
++	if (graph->id != (cps ? 108 : 106) ||
++	    cfg->direction != SNDRV_PCM_STREAM_CAPTURE || cfg->sample_rate != rate ||
++	    cfg->bit_width != 32 || cfg->num_channels != 2)
++		return -EINVAL;
++
++	list_for_each_entry(sg, &graph->info->sg_list, node) {
++		list_for_each_entry(container, &sg->container_list, node) {
++			list_for_each_entry(module, &container->modules_list, node) {
++				if (module->module_id != MODULE_ID_CODEC_DMA_SOURCE)
++					continue;
++				if (module->instance_id != iid)
++					return -EINVAL;
++				sources++;
++			}
++		}
++	}
++	if (sources != 1)
++		return -EINVAL;
++
++	struct gpr_pkt *pkt __free(kfree) =
++		audioreach_alloc_apm_cmd_pkt(sizeof(words), APM_CMD_SET_CFG, 0);
++	if (IS_ERR(pkt))
++		return PTR_ERR(pkt);
++
++	memcpy((u8 *)pkt + GPR_HDR_SIZE + APM_CMD_HDR_SIZE, words, sizeof(words));
++	ret = q6apm_send_cmd_sync(graph->apm, pkt, 0);
++	if (!ret)
++		dev_info(graph->dev, "FullIO %s native endpoint format accepted\n",
++			 cps ? "CPS" : "VI");
++	return ret;
++}
++EXPORT_SYMBOL_GPL(audioreach_fullio_probe_endpoint);
++
+ static int audioreach_codec_dma_set_media_format(struct q6apm_graph *graph,
+ 						 const struct audioreach_module *module,
+ 						 const struct audioreach_module_config *cfg)
+diff --git a/sound/soc/qcom/qdsp6/audioreach.h b/sound/soc/qcom/qdsp6/audioreach.h
+index bba92de..093e367 100644
+--- a/sound/soc/qcom/qdsp6/audioreach.h
++++ b/sound/soc/qcom/qdsp6/audioreach.h
+@@ -1059,6 +1059,8 @@ int audioreach_fullio_calibrate(struct q6apm_graph *graph,
+ 			       const struct audioreach_fullio_stages *stages,
+ 			       struct q6apm_fullio_oob_region *region, void *buffer,
+ 			       int (*assert_pa_off)(void *ctx), void *ctx);
++int audioreach_fullio_probe_endpoint(struct q6apm_graph *graph,
++				    const struct audioreach_module_config *cfg, bool cps);
+ /* Topology specific */
+ int audioreach_tplg_init(struct snd_soc_component *component);
+ 
+diff --git a/sound/soc/qcom/qdsp6/q6apm-lpass-dais.c b/sound/soc/qcom/qdsp6/q6apm-lpass-dais.c
+index 067ff53..8340df3 100644
+--- a/sound/soc/qcom/qdsp6/q6apm-lpass-dais.c
++++ b/sound/soc/qcom/qdsp6/q6apm-lpass-dais.c
+@@ -266,6 +266,8 @@ static int q6apm_lpass_dai_prepare(struct snd_pcm_substream *substream, struct s
+ 	struct q6apm_lpass_dai_data *dai_data = dev_get_drvdata(dai->dev);
+ 	struct audioreach_module_config *cfg = &dai_data->module_config[dai->id];
+ 	struct q6apm_graph *graph;
++	struct device_node *node = dai->component->card->dev->of_node;
++	const char *probe;
+ 	int graph_id = dai->id;
+ 	int rc;
+ 
+@@ -294,7 +296,20 @@ static int q6apm_lpass_dai_prepare(struct snd_pcm_substream *substream, struct s
+ 	}
+ 
+ 	cfg->direction = substream->stream;
+-	rc = q6apm_graph_media_format_pcm(dai_data->graph[dai->id], cfg);
++
++	if (of_property_present(node, "microsoft,denali-fullio-feedback-probe")) {
++		bool cps = dai->id == WSA_CODEC_DMA_TX_1;
++
++		if (!of_machine_is_compatible("microsoft,denali") ||
++		    !of_property_read_bool(node, "microsoft,denali-fullio-muted-test") ||
++		    (!cps && dai->id != WSA_CODEC_DMA_TX_0) ||
++		    of_property_read_string(node, "microsoft,denali-fullio-feedback-probe", &probe) ||
++		    strcmp(probe, cps ? "cps" : "vi"))
++			return -EINVAL;
++		rc = audioreach_fullio_probe_endpoint(dai_data->graph[dai->id], cfg, cps);
++	} else {
++		rc = q6apm_graph_media_format_pcm(dai_data->graph[dai->id], cfg);
++	}
+ 	if (rc) {
+ 		dev_err(dai->dev, "Failed to set media format %d\n", rc);
+ 		goto err;

@@ -1,0 +1,57 @@
+Subject: [EXPERIMENT] ASoC: q6dsp: declare Denali FullIO VI/CPS endpoints
+
+Adapt the playback-side Protection DAI definitions from the Golden v32
+overlay of geocausa/SP11X1e-audio@3232e1dacdeb580a10a9cb8d4756a4518a7bd83e.
+Keep the original capture capabilities. This declares endpoint formats only;
+it does not wire a stream, adjust loudness, or prove feedback readiness.
+
+diff --git a/sound/soc/qcom/qdsp6/q6dsp-lpass-ports.c b/sound/soc/qcom/qdsp6/q6dsp-lpass-ports.c
+index f422346..2482e92 100755
+--- a/sound/soc/qcom/qdsp6/q6dsp-lpass-ports.c
++++ b/sound/soc/qcom/qdsp6/q6dsp-lpass-ports.c
+@@ -79,6 +79,33 @@
+ 		.id = did,						\
+ 	}
+ 
++#define Q6AFE_CDC_DMA_FEEDBACK_DAI(did, rate_bit, hz) {		\
++		.playback = {						\
++			.stream_name = #did " Protection",		\
++			.rates = rate_bit,				\
++			.formats = SNDRV_PCM_FMTBIT_S32_LE,		\
++			.channels_min = 2,				\
++			.channels_max = 2,				\
++			.rate_min = hz,					\
++			.rate_max = hz,					\
++		},							\
++		.capture = {						\
++			.stream_name = #did" Capture",		\
++			.rates = SNDRV_PCM_RATE_8000 | SNDRV_PCM_RATE_16000 |\
++				SNDRV_PCM_RATE_32000 | SNDRV_PCM_RATE_48000 |\
++				SNDRV_PCM_RATE_176400,			\
++			.formats = SNDRV_PCM_FMTBIT_S16_LE |		\
++				   SNDRV_PCM_FMTBIT_S24_LE |		\
++				   SNDRV_PCM_FMTBIT_S32_LE,		\
++			.channels_min = 1,				\
++			.channels_max = 8,				\
++			.rate_min = 8000,				\
++			.rate_max = 176400,				\
++		},							\
++		.name = #did,						\
++		.id = did,						\
++	}
++
+ #define Q6AFE_DP_RX_DAI(did) {						\
+ 		.playback = {						\
+ 			.stream_name = #did" Playback",			\
+@@ -703,9 +730,9 @@ static struct snd_soc_dai_driver q6dsp_audio_fe_dais[] = {
+ 	Q6AFE_DP_RX_DAI(DISPLAY_PORT_RX_6),
+ 	Q6AFE_DP_RX_DAI(DISPLAY_PORT_RX_7),
+ 	Q6AFE_CDC_DMA_RX_DAI(WSA_CODEC_DMA_RX_0),
+-	Q6AFE_CDC_DMA_TX_DAI(WSA_CODEC_DMA_TX_0),
++	Q6AFE_CDC_DMA_FEEDBACK_DAI(WSA_CODEC_DMA_TX_0, SNDRV_PCM_RATE_8000, 8000),
+ 	Q6AFE_CDC_DMA_RX_DAI(WSA_CODEC_DMA_RX_1),
+-	Q6AFE_CDC_DMA_TX_DAI(WSA_CODEC_DMA_TX_1),
++	Q6AFE_CDC_DMA_FEEDBACK_DAI(WSA_CODEC_DMA_TX_1, SNDRV_PCM_RATE_24000, 24000),
+ 	Q6AFE_CDC_DMA_TX_DAI(WSA_CODEC_DMA_TX_2),
+ 	Q6AFE_CDC_DMA_TX_DAI(VA_CODEC_DMA_TX_0),
+ 	Q6AFE_CDC_DMA_TX_DAI(VA_CODEC_DMA_TX_1),

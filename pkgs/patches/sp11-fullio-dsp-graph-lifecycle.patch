@@ -1,0 +1,156 @@
+Subject: [EXPERIMENT] ASoC: q6apm: reject a graph when GRAPH_OPEN fails
+
+A DSP command failure must not publish a usable graph to a second owner.
+Serialize reference acquisition and final close around the DSP acknowledgement.
+This is a prerequisite for protected playback, not a protection signal.
+
+diff --git a/sound/soc/qcom/qdsp6/q6apm.c b/sound/soc/qcom/qdsp6/q6apm.c
+index 6c17f93..e833362 100644
+--- a/sound/soc/qcom/qdsp6/q6apm.c
++++ b/sound/soc/qcom/qdsp6/q6apm.c
+@@ -2,6 +2,7 @@
+ // Copyright (c) 2020, Linaro Limited
+ 
+ #include <dt-bindings/soc/qcom,gpr.h>
++#include <linux/cleanup.h>
+ #include <linux/delay.h>
+ #include <linux/jiffies.h>
+ #include <linux/kernel.h>
+@@ -44,19 +45,18 @@ static struct audioreach_graph *q6apm_get_audioreach_graph(struct q6apm *apm, ui
+ {
+ 	struct audioreach_graph_info *info;
+ 	struct audioreach_graph *graph;
+-	int id;
++	int ret;
+ 
+-	mutex_lock(&apm->lock);
++	guard(mutex)(&apm->graph_lock);
+ 	graph = idr_find(&apm->graph_idr, graph_id);
+-	mutex_unlock(&apm->lock);
+-
+ 	if (graph) {
+ 		kref_get(&graph->refcount);
+ 		return graph;
+ 	}
+ 
++	mutex_lock(&apm->lock);
+ 	info = idr_find(&apm->graph_info_idr, graph_id);
+-
++	mutex_unlock(&apm->lock);
+ 	if (!info)
+ 		return ERR_PTR(-ENODEV);
+ 
+@@ -67,31 +67,32 @@ static struct audioreach_graph *q6apm_get_audioreach_graph(struct q6apm *apm, ui
+ 	graph->apm = apm;
+ 	graph->info = info;
+ 	graph->id = graph_id;
+-
+ 	graph->graph = audioreach_alloc_graph_pkt(apm, info);
+ 	if (IS_ERR(graph->graph)) {
+-		void *err = graph->graph;
+-
+-		kfree(graph);
+-		return ERR_CAST(err);
++		ret = PTR_ERR(graph->graph);
++		goto free_graph;
+ 	}
+ 
+-	mutex_lock(&apm->lock);
+-	id = idr_alloc(&apm->graph_idr, graph, graph_id, graph_id + 1, GFP_KERNEL);
+-	if (id < 0) {
+-		dev_err(apm->dev, "Unable to allocate graph id (%d)\n", graph_id);
+-		kfree(graph->graph);
+-		kfree(graph);
+-		mutex_unlock(&apm->lock);
+-		return ERR_PTR(id);
++	/* Reserve the ID before sending. No other owner sees it while the
++	 * graph lock is held, including during the DSP acknowledgement.
++	 */
++	ret = idr_alloc(&apm->graph_idr, graph, graph_id, graph_id + 1, GFP_KERNEL);
++	if (ret < 0)
++		goto free_packet;
++
++	ret = q6apm_send_cmd_sync(apm, graph->graph, 0);
++	if (ret) {
++		idr_remove(&apm->graph_idr, graph_id);
++		goto free_packet;
+ 	}
+-	mutex_unlock(&apm->lock);
+-
+ 	kref_init(&graph->refcount);
+-
+-	q6apm_send_cmd_sync(apm, graph->graph, 0);
+-
+ 	return graph;
++
++free_packet:
++	kfree(graph->graph);
++free_graph:
++	kfree(graph);
++	return ERR_PTR(ret);
+ }
+ 
+ static int audioreach_graph_mgmt_cmd(struct audioreach_graph *graph, uint32_t opcode)
+@@ -133,15 +134,20 @@ static void q6apm_put_audioreach_graph(struct kref *ref)
+ 
+ 	audioreach_graph_mgmt_cmd(graph, APM_CMD_GRAPH_CLOSE);
+ 
+-	mutex_lock(&apm->lock);
+-	graph = idr_remove(&apm->graph_idr, graph->id);
+-	mutex_unlock(&apm->lock);
++	lockdep_assert_held(&apm->graph_lock);
++	idr_remove(&apm->graph_idr, graph->id);
+ 
+ 	kfree(graph->graph);
+ 	kfree(graph);
+ }
+ 
+ 
++static void q6apm_release_audioreach_graph(struct audioreach_graph *graph)
++{
++	guard(mutex)(&graph->apm->graph_lock);
++	kref_put(&graph->refcount, q6apm_put_audioreach_graph);
++}
++
+ static int q6apm_get_apm_state(struct q6apm *apm)
+ {
+ 	struct gpr_pkt *pkt __free(kfree) = audioreach_alloc_apm_cmd_pkt(0,
+@@ -822,7 +828,7 @@ struct q6apm_graph *q6apm_graph_open(struct device *dev, q6apm_cb cb,
+ free_graph:
+ 	kfree(graph);
+ put_ar_graph:
+-	kref_put(&ar_graph->refcount, q6apm_put_audioreach_graph);
++	q6apm_release_audioreach_graph(ar_graph);
+ 	return ERR_PTR(ret);
+ }
+ EXPORT_SYMBOL_GPL(q6apm_graph_open);
+@@ -832,7 +838,7 @@ int q6apm_graph_close(struct q6apm_graph *graph)
+ 	struct audioreach_graph *ar_graph = graph->ar_graph;
+ 
+ 	graph->ar_graph = NULL;
+-	kref_put(&ar_graph->refcount, q6apm_put_audioreach_graph);
++	q6apm_release_audioreach_graph(ar_graph);
+ 	gpr_free_port(graph->port);
+ 	kfree(graph);
+ 
+@@ -929,6 +935,7 @@ static int apm_probe(gpr_device_t *gdev)
+ 		return -ENOMEM;
+ 
+ 	mutex_init(&apm->lock);
++	mutex_init(&apm->graph_lock);
+ 	apm->dev = dev;
+ 	apm->gdev = gdev;
+ 	init_waitqueue_head(&apm->wait);
+diff --git a/sound/soc/qcom/qdsp6/q6apm.h b/sound/soc/qcom/qdsp6/q6apm.h
+index 2bbd85e..d470c7d 100644
+--- a/sound/soc/qcom/qdsp6/q6apm.h
++++ b/sound/soc/qcom/qdsp6/q6apm.h
+@@ -63,6 +63,8 @@ struct q6apm {
+ 	uint32_t state;
+ 
+ 	struct list_head widget_list;
++	/* Serializes DSP graph open, publication and final close. */
++	struct mutex graph_lock;
+ 	struct idr graph_idr;
+ 	struct idr graph_info_idr;
+ 	struct idr sub_graphs_idr;

@@ -1,0 +1,106 @@
+Treat missing DSP STOP proof as a separate sticky render failure.
+
+Audit results are zero or negative errno. A positive result is an unknown
+verdict, not a successful ALSA prepare; quarantine render if it escapes
+from any audit callback.
+
+--- a/sound/soc/qcom/qdsp6/q6apm.c
++++ b/sound/soc/qcom/qdsp6/q6apm.c
+@@ -1328,7 +1328,8 @@
+  * a graph running or to vouch for valid feedback or analogue silence.
+  */
+ int q6apm_fullio_audit_start_stop(struct q6apm_graph *graph, struct snd_soc_card *card,
+-				 int (*verify)(void *ctx, bool started), void *ctx)
++				 int (*verify)(void *ctx, bool started), void *ctx,
++				 int *stop_error)
+ {
+ 	struct device_node *node = card->dev->of_node;
+ 	struct audioreach_graph *ar = graph->ar_graph;
+@@ -1336,6 +1337,7 @@
+ 	u64 start_ack_ns = 0, stop_begin_ns;
+ 	int ret, stop;
+ 
++	*stop_error = 0;
+ 	if (!verify || !of_machine_is_compatible("microsoft,denali") ||
+ 	    !of_property_read_bool(node, "microsoft,denali-fullio-muted-test") ||
+ 	    !of_property_read_bool(node, "microsoft,denali-fullio-clock-off-audit") ||
+@@ -1373,6 +1375,7 @@
+ 	 */
+ 	stop_begin_ns = ktime_get_ns();
+ 	stop = audioreach_graph_mgmt_transaction(ar, APM_CMD_GRAPH_STOP, true);
++	*stop_error = stop;
+ 	if (of_property_read_bool(node, "microsoft,denali-fullio-immediate-taps-audit"))
+ 		dev_info(graph->dev,
+ 			 "FullIO tap host window: start_ack_ns=%llu stop_begin_ns=%llu verify=%d stop=%d\n",
+--- a/sound/soc/qcom/qdsp6/q6apm-dai.c
++++ b/sound/soc/qcom/qdsp6/q6apm-dai.c
+@@ -577,21 +577,26 @@
+ 
+ /* A DSP STOP acknowledgement is not evidence about the physical PAs. */
+ static int q6apm_fullio_finish_audit(struct q6apm_dai_data *pdata, struct snd_soc_card *card,
+-				    int dsp_result, bool worker_verified)
++				    int dsp_result, int dsp_stop_error, bool worker_verified)
+ {
+-	int stop;
+-
+-	if (worker_verified ||
+-	    !of_property_read_bool(card->dev->of_node, "microsoft,denali-fullio-pa-stop-audit"))
+-		return dsp_result;
++	int pa_error = 0;
+ 
+-	stop = q6apm_fullio_stop_pair_audit(card);
+-	if (!stop)
++	if (!worker_verified &&
++	    of_property_read_bool(card->dev->of_node, "microsoft,denali-fullio-pa-stop-audit"))
++		pa_error = q6apm_fullio_stop_pair_audit(card);
++	if (!pa_error && !dsp_stop_error && dsp_result <= 0)
+ 		return dsp_result;
+ 
+ 	WRITE_ONCE(pdata->fullio_render_locked, true);
+-	dev_err(card->dev, "FullIO paired PA shutdown unverified: PA=%d, graph audit=%d; render locked\n",
+-		stop, dsp_result);
++	if (pa_error)
++		dev_err(card->dev, "FullIO paired PA shutdown unverified: PA=%d, graph audit=%d; render locked\n",
++			pa_error, dsp_result);
++	if (dsp_stop_error)
++		dev_err(card->dev, "FullIO DSP shutdown unverified: GRAPH_STOP=%d; render locked\n",
++			dsp_stop_error);
++	if (dsp_result > 0)
++		dev_err(card->dev, "FullIO invalid audit result %d; render locked\n",
++			dsp_result);
+ 	return -ENOTRECOVERABLE;
+ }
+ 
+@@ -864,18 +866,19 @@
+ 			.ring_bytes = pdata->has_reserved_mem ? pdata->reserved_buf_size :
+ 							       BUFFER_BYTES_MAX,
+ 		};
++		int dsp_stop_error;
+ 
+ 		ret = q6apm_fullio_mute_commit(prtd->graph, &ticket);
+ 		if (ret)
+ 			return ret;
+ 		ret = q6apm_fullio_audit_start_stop(prtd->graph, card, q6apm_fullio_verify_silent_audit,
+-						   &audit);
++						   &audit, &dsp_stop_error);
+ 		/* Clear any ticket left by a rejection before START. A real
+ 		 * attempt already revokes it before sending STOP.
+ 		 */
+ 		if (q6apm_fullio_mute_is_verified(prtd->graph))
+ 			q6apm_fullio_mute_invalidate(prtd->graph);
+-		ret = q6apm_fullio_finish_audit(pdata, card, ret, audit.stop_worker_done);
++		ret = q6apm_fullio_finish_audit(pdata, card, ret, dsp_stop_error, audit.stop_worker_done);
+ 		if (ret)
+ 			return ret;
+ 	} else {
+--- a/sound/soc/qcom/qdsp6/q6apm.h
++++ b/sound/soc/qcom/qdsp6/q6apm.h
+@@ -184,6 +184,7 @@
+ int q6apm_graph_start(struct q6apm_graph *graph);
+ int q6apm_fullio_audit_start_stop(struct q6apm_graph *graph, struct snd_soc_card *card,
+-				 int (*verify)(void *ctx, bool started), void *ctx);
++				 int (*verify)(void *ctx, bool started), void *ctx,
++				 int *stop_error);
+ int q6apm_graph_stop(struct q6apm_graph *graph);
+ int q6apm_graph_flush(struct q6apm_graph *graph);
+ 

@@ -1,0 +1,83 @@
+Subject: [EXPERIMENT] ASoC: verify PA disable even after a clock shutdown error
+
+The post-PA-only stop path checks hardware PA-off after attempting both
+writes, irrespective of earlier errors. Do not relax the unmute lock.
+
+diff --git a/sound/soc/codecs/wsa884x.c b/sound/soc/codecs/wsa884x.c
+index ec7c4ee..7a74e74 100755
+--- a/sound/soc/codecs/wsa884x.c
++++ b/sound/soc/codecs/wsa884x.c
+@@ -1971,11 +1971,42 @@ static int wsa_macro_fullio_clock_off_for_pa(struct snd_soc_component *amp)
+ }
+ #endif
+ 
++/* Stop path for a future, explicitly armed post-PA transaction. Never
++ * invoked from an IRQ or a SoundWire status notifier. Check readback even
++ * if either write failed: a write error is not evidence that PA is off.
++ */
++static int wsa884x_fullio_verified_stop(struct snd_soc_component *component,
++					struct wsa884x_priv *amp)
++{
++	unsigned int value;
++	int dre, pa, verify, clock;
++
++	atomic_inc_return(&amp->fullio_pa_teardowns);
++	atomic64_inc_return(&amp->fullio_pa_epoch);
++	clock = wsa_macro_fullio_clock_off_for_pa(component);
++
++	/* Try both writes regardless of the clock or DRE result. */
++	dre = regmap_write_bits(amp->regmap, WSA884X_DRE_CTL_1,
++				WSA884X_DRE_CTL_1_CSR_GAIN_EN_MASK, 0);
++	pa = regmap_write_bits(amp->regmap, WSA884X_PA_FSM_EN,
++			       WSA884X_PA_FSM_EN_GLOBAL_PA_EN_MASK, 0);
++	verify = regmap_read_bypassed(amp->regmap, WSA884X_PA_FSM_EN, &value);
++	if (!verify && (value & WSA884X_PA_FSM_EN_GLOBAL_PA_EN_MASK))
++		verify = -EBUSY;
++	if (!verify && READ_ONCE(amp->slave->status) != SDW_SLAVE_ATTACHED)
++		verify = -ENODEV;
++	atomic_dec_return(&amp->fullio_pa_teardowns);
++	if (clock || dre < 0 || pa < 0 || verify)
++		dev_err_ratelimited(component->dev,
++			"FullIO PA shutdown not fully verified: clock=%d DRE=%d PA=%d readback=%d\n",
++			clock, dre, pa, verify);
++	return verify ?: (pa < 0 ? pa : dre < 0 ? dre : clock);
++}
++
+ static int wsa884x_mute_stream(struct snd_soc_dai *dai, int mute, int stream)
+ {
+ 	struct snd_soc_component *component = dai->component;
+ 	struct wsa884x_priv *wsa884x = dev_get_drvdata(dai->dev);
+-	int clock_ret = 0;
+ 
+ 	if (dai->id != WSA884X_DAI_PLAYBACK)
+ 		return 0;
+@@ -1986,17 +2017,13 @@ static int wsa884x_mute_stream(struct snd_soc_dai *dai, int mute, int stream)
+ 
+ 	if (mute) {
+ 		if (wsa884x->feedback_enabled) {
+-			atomic_inc_return(&wsa884x->fullio_pa_teardowns);
+-			atomic64_inc_return(&wsa884x->fullio_pa_epoch);
+ 			if (component->card && of_machine_is_compatible("microsoft,denali") &&
+ 			    of_property_read_bool(component->card->dev->of_node,
+ 						  "microsoft,denali-fullio-post-pa-test"))
+-				clock_ret = wsa_macro_fullio_clock_off_for_pa(component);
+-			if (clock_ret)
+-				dev_err_ratelimited(component->dev,
+-					"FullIO clock shutdown failed before PA mute: %d\n", clock_ret);
++				return wsa884x_fullio_verified_stop(component, wsa884x);
++			atomic_inc_return(&wsa884x->fullio_pa_teardowns);
++			atomic64_inc_return(&wsa884x->fullio_pa_epoch);
+ 		}
+-		/* Do not abandon PA shutdown even if the clock write/readback failed. */
+ 		snd_soc_component_write_field(component, WSA884X_DRE_CTL_1,
+ 					      WSA884X_DRE_CTL_1_CSR_GAIN_EN_MASK,
+ 					      0x0);
+@@ -2014,7 +2041,7 @@ static int wsa884x_mute_stream(struct snd_soc_dai *dai, int mute, int stream)
+ 					      0x1);
+ 	}
+ 
+-	return clock_ret;
++	return 0;
+ }
+ 
+ static int wsa884x_set_stream(struct snd_soc_dai *dai,

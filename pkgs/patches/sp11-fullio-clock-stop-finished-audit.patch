@@ -1,0 +1,28 @@
+Distinguish ClockStopNow acknowledgement from the controller stop-finished IRQ.
+
+--- a/drivers/soundwire/qcom.c
++++ b/drivers/soundwire/qcom.c
+@@ -979,6 +979,10 @@
+ 			case SWRM_INTERRUPT_STATUS_BUS_RESET_FINISHED_V2:
+ 				break;
+ 			case SWRM_INTERRUPT_STATUS_CLK_STOP_FINISHED_V2:
++				if (ctrl->version >= SWRM_VERSION_2_0_0 && qcom_swrm_fullio_pm_audit(ctrl))
++					dev_info_ratelimited(ctrl->dev,
++						"FullIO PM transition clock-stop-finished-irq: raw_irq=0x%08x\n",
++						intr_sts);
+ 				break;
+ 			case SWRM_INTERRUPT_STATUS_EXT_CLK_STOP_WAKEUP:
+ 				break;
+@@ -2208,9 +2212,10 @@
+ 			 stage, irq_ret, frame_ret, slave_ret, transition_ret);
+ 		return;
+ 	}
+-	dev_info(ctrl->dev, "FullIO PM transition %s: clash=%d frame=%d result=%d slaves=0x%08x\n",
++	dev_info(ctrl->dev,
++		 "FullIO PM transition %s: clash=%d frame=%d result=%d slaves=0x%08x raw_irq=0x%08x\n",
+ 		 stage, !!(irq_status & SWRM_INTERRUPT_STATUS_MASTER_CLASH_DET),
+-		 !!(frame_status & SWRM_FRM_GEN_ENABLED), transition_ret, slave_status);
++		 !!(frame_status & SWRM_FRM_GEN_ENABLED), transition_ret, slave_status, irq_status);
+ }
+ 
+ static int __maybe_unused swrm_runtime_resume(struct device *dev)

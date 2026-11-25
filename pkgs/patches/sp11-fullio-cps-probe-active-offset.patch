@@ -1,0 +1,38 @@
+Subject: [EXPERIMENT] soundwire: measure active Offset2 in the CPS fixture
+
+Port the reference bank-enable delta for DP13 only, and confirm readback.
+Do not touch passive bank programming, PA state, gain or the control fixtures.
+
+diff --git a/drivers/soundwire/qcom.c b/drivers/soundwire/qcom.c
+index 341644b..ff285cc 100755
+--- a/drivers/soundwire/qcom.c
++++ b/drivers/soundwire/qcom.c
+@@ -1259,6 +1259,28 @@ static int qcom_swrm_port_enable(struct sdw_bus *bus,
+ 
+ 	reg = SWRM_DPn_PORT_CTRL_BANK(offset, enable_ch->port_num, bank);
+ 
++	if (enable_ch->enable && enable_ch->port_num == 13 && qcom_swrm_cps_wake_probe(ctrl) &&
++	    of_property_read_bool(ctrl->dev->of_node, "qcom,denali-cps-probe-active-offset2-test")) {
++		u32 check;
++		int ret;
++
++		ret = ctrl->reg_read(ctrl, reg, &val);
++		if (ret)
++			return ret;
++		val &= ~(0xffU << SWRM_DP_PORT_CTRL_OFFSET2_SHFT);
++		val |= enable_ch->ch_mask << SWRM_DP_PORT_CTRL_EN_CHAN_SHFT;
++		ret = ctrl->reg_write(ctrl, reg, val);
++		if (ret)
++			return ret;
++		ret = ctrl->reg_read(ctrl, reg, &check);
++		if (ret)
++			return ret;
++		if (check != val)
++			return -EIO;
++		dev_info_ratelimited(ctrl->dev, "CPS probe DP13 bank %u active Offset2=0 verified\n", bank);
++		return 0;
++	}
++
+ 	ctrl->reg_read(ctrl, reg, &val);
+ 
+ 	if (enable_ch->enable)

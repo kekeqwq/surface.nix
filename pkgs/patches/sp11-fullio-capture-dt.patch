@@ -1,0 +1,62 @@
+Subject: [EXPERIMENT] arm64: dts: Denali: port FullIO TX MicArray routing
+
+Adapt the microphone link of geocausa/SP11X1e-audio@3232e1dacdeb580a10a9cb8d4756a4518a7bd83e.
+Retain VA as the clock provider. No speaker route or firmware selection changes.
+This fragment is not suitable for standalone installation without matching UCM/topology.
+
+diff --git a/arch/arm64/boot/dts/qcom/x1-microsoft-denali.dtsi b/arch/arm64/boot/dts/qcom/x1-microsoft-denali.dtsi
+index c15e9fb..3448580 100755
+--- a/arch/arm64/boot/dts/qcom/x1-microsoft-denali.dtsi
++++ b/arch/arm64/boot/dts/qcom/x1-microsoft-denali.dtsi
+@@ -330,7 +330,9 @@
+ 		audio-routing = "SpkrLeft IN", "WSA WSA_SPK1 OUT",
+ 				"SpkrRight IN", "WSA WSA_SPK2 OUT",
+ 				"VA DMIC0", "vdd-micb",
+-				"VA DMIC1", "vdd-micb";
++				"VA DMIC1", "vdd-micb",
++				"TX DMIC0", "vdd-micb",
++				"TX DMIC1", "vdd-micb";
+ 
+ 		displayport-0-dai-link {
+ 			link-name = "DisplayPort0 Playback";
+@@ -381,6 +383,22 @@
+ 			};
+ 		};
+ 
++		tx-dmic-dai-link {
++			link-name = "TX DMIC Capture";
++
++			codec {
++				sound-dai = <&lpass_txmacro 0>;
++			};
++
++			cpu {
++				sound-dai = <&q6apmbedai TX_CODEC_DMA_TX_3>;
++			};
++
++			platform {
++				sound-dai = <&q6apm>;
++			};
++		};
++
+ 		va-dai-link {
+ 			link-name = "VA Capture";
+ 
+@@ -918,12 +936,16 @@
+ 	};
+ };
+ 
++&lpass_txmacro {
++	status = "okay";
++};
++
+ &lpass_vamacro {
+ 	pinctrl-0 = <&dmic01_default>;
+ 	pinctrl-names = "default";
+ 
+ 	vdd-micb-supply = <&vreg_l1b_1p8>;
+-	qcom,dmic-sample-rate = <2400000>;
++	qcom,dmic-sample-rate = <4800000>;
+ };
+ 
+ &mdss {

@@ -1,0 +1,40 @@
+Subject: [EXPERIMENT] ASoC: WSA884x: require watchdog readback in FullIO PA readiness
+
+A seemingly healthy PA status without the reference PDM watchdog
+fields is not ready for the next protected transition. Check the
+uncached value within the existing PA epoch. No writes, new call
+site, DT arm, or declaration of hardware cutoff timing.
+
+--- a/sound/soc/codecs/wsa884x.c
++++ b/sound/soc/codecs/wsa884x.c
+@@ -1888,7 +1888,7 @@
+ };
+ 
+ struct wsa884x_fullio_pa_snapshot {
+-	unsigned int enable, sta0, sta1, err0, err1;
++	unsigned int enable, sta0, sta1, err0, err1, pdm_wd;
+ 	unsigned int dre0, dre1;
+ 	bool gain_sampled;
+ 	s64 epoch;
+@@ -1931,6 +1931,8 @@
+ 		ret = regmap_read_bypassed(wsa884x->regmap, WSA884X_PA_FSM_ERR_COND0, &snapshot.err0);
+ 	if (!ret && read_faults)
+ 		ret = regmap_read_bypassed(wsa884x->regmap, WSA884X_PA_FSM_ERR_COND1, &snapshot.err1);
++	if (!ret && read_faults)
++		ret = regmap_read_bypassed(wsa884x->regmap, WSA884X_PDM_WD_CTL, &snapshot.pdm_wd);
+ 	sound = component->card ? component->card->dev->of_node : NULL;
+ 	if (!ret && !read_faults && !(before & WSA884X_PA_FSM_EN_GLOBAL_PA_EN_MASK) &&
+ 	    of_machine_is_compatible("microsoft,denali") &&
+@@ -1972,6 +1974,12 @@
+ 		return -EIO;
+ 	if (!(snapshot->enable & WSA884X_PA_FSM_EN_GLOBAL_PA_EN_MASK) || snapshot->sta0 != 0x2f)
+ 		return -EAGAIN;
++	/* Match the reference watchdog configuration, not a cutoff guarantee. */
++	if ((snapshot->pdm_wd & (WSA884X_PDM_WD_CTL_PDM_WD_EN_MASK |
++				 WSA884X_PDM_WD_CTL_HOLD_OFF_MASK |
++				 WSA884X_PDM_WD_CTL_TIME_OUT_SEL_MASK)) !=
++	    WSA884X_PDM_WD_CTL_PDM_WD_EN_MASK)
++		return -EIO;
+ 	return 0;
+ }
+ 

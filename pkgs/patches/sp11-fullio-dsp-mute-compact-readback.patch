@@ -1,0 +1,73 @@
+Subject: [EXPERIMENT] ASoC: check a compact FullIO mute readback
+
+On this exact query the DSP reports sixteen parameter bytes in the
+unchanged 124-byte reply. Require one combined FL/FR entry with mute=1;
+keep the nonzero status, token and exact outer-size checks.
+
+diff --git a/sound/soc/qcom/qdsp6/audioreach.c b/sound/soc/qcom/qdsp6/audioreach.c
+index 2a0a680..9929da8 100644
+--- a/sound/soc/qcom/qdsp6/audioreach.c
++++ b/sound/soc/qcom/qdsp6/audioreach.c
+@@ -318,6 +318,14 @@ static int audioreach_fullio_bootstrap(struct q6apm_graph *graph,
+ 				      input_bytes - query_span, false);
+ }
+ 
++static bool audioreach_fullio_compact_stereo_mute(const u8 *data)
++{
++	return get_unaligned_le32(data) == 1 && /* one entry */
++	       get_unaligned_le32(data + 4) == (BIT(1) | BIT(2)) && /* FL + FR */
++	       get_unaligned_le32(data + 8) == 0 && /* no high mask bits */
++	       get_unaligned_le32(data + 12) == 1; /* muted */
++}
++
+ static int audioreach_fullio_acknowledge_mute(struct q6apm_graph *graph,
+ 					     const struct audioreach_fullio_stages *stages)
+ {
+@@ -349,10 +357,20 @@ static int audioreach_fullio_acknowledge_mute(struct q6apm_graph *graph,
+ 	dev_info(graph->dev, "FullIO endpoint stereo mute acknowledged\n");
+ 
+ 	ret = q6apm_fullio_get_cfg(graph, 0x4a63, 0x08001039, actual, sizeof(actual));
+-	if (ret)
++	if (ret < 0)
+ 		return dev_err_probe(graph->dev, ret, "FullIO endpoint stereo mute not readable\n");
+-	if (memcmp((const u8 *)mute + APM_MODULE_PARAM_DATA_SIZE, actual, sizeof(actual)))
++	if (ret == 16) {
++		if (!audioreach_fullio_compact_stereo_mute(actual)) {
++			dev_warn_ratelimited(graph->dev,
++				"FullIO compact mute mismatch: count=%u mask=%#x/%#x value=%u\n",
++				get_unaligned_le32(actual), get_unaligned_le32(actual + 4),
++				get_unaligned_le32(actual + 8), get_unaligned_le32(actual + 12));
++			return -EILSEQ;
++		}
++	} else if (ret || memcmp((const u8 *)mute + APM_MODULE_PARAM_DATA_SIZE,
++				 actual, sizeof(actual))) {
+ 		return dev_err_probe(graph->dev, -EILSEQ, "FullIO endpoint stereo mute mismatch\n");
++	}
+ 	dev_info(graph->dev, "FullIO endpoint stereo mute readback verified\n");
+ 	return 0;
+ }
+diff --git a/sound/soc/qcom/qdsp6/q6apm.c b/sound/soc/qcom/qdsp6/q6apm.c
+index 9d0eb36..0c6b406 100644
+--- a/sound/soc/qcom/qdsp6/q6apm.c
++++ b/sound/soc/qcom/qdsp6/q6apm.c
+@@ -92,9 +92,19 @@ static int q6apm_fullio_readback(const struct gpr_resp_pkt *rsp,
+ 		return -EPROTO;
+ 	if (get_unaligned_le32(payload + 4) != get->instance ||
+ 	    get_unaligned_le32(payload + 8) != get->param ||
+-	    get_unaligned_le32(payload + 12) != get->bytes ||
+ 	    get_unaligned_le32(payload + 16))
+ 		return -EPROTO;
++	/* This VOL_CTRL reply retains the requested outer buffer size but
++	 * declares a compact 16-byte body. Do not parse its unused tail or
++	 * apply variable-size handling to the SP/SPVI readbacks.
++	 */
++	if (get->instance == 0x4a63 && get->param == 0x08001039 && get->bytes == 104 &&
++	    get_unaligned_le32(payload + 12) == 16) {
++		memcpy(get->data, payload + header, 16);
++		return 16;
++	}
++	if (get_unaligned_le32(payload + 12) != get->bytes)
++		return -EPROTO;
+ 	memcpy(get->data, payload + header, get->bytes);
+ 	return 0;
+ }

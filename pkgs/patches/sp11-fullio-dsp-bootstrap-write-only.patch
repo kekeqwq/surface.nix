@@ -1,0 +1,62 @@
+Subject: [EXPERIMENT] ASoC: omit the GET-only FullIO bootstrap record
+
+Skip only the exact pinned zero-body SPR_SESSION_TIME request before
+transmission. Still require an acknowledged SET_CFG and keep speakers off.
+
+diff --git a/sound/soc/qcom/qdsp6/audioreach.c b/sound/soc/qcom/qdsp6/audioreach.c
+index 97b7e70..0f49e5f 100644
+--- a/sound/soc/qcom/qdsp6/audioreach.c
++++ b/sound/soc/qcom/qdsp6/audioreach.c
+@@ -287,6 +287,37 @@ static int audioreach_fullio_dynamic_frame(const struct audioreach_module_priv_d
+ 	return left ? -EINVAL : 0;
+ }
+ 
++static int audioreach_fullio_bootstrap(struct q6apm_graph *graph,
++				      struct q6apm_fullio_oob_region *region,
++				      void *buffer,
++				      const struct audioreach_module_priv_data *blob)
++{
++	enum { input_bytes = 10464, query_offset = 8352, query_span = 48 };
++	const u8 *raw = (const u8 *)blob->data;
++	const u8 *query;
++	u8 *writes __free(kfree) = NULL;
++	if (le32_to_cpu(blob->size) != input_bytes)
++		return -EINVAL;
++	query = raw + query_offset;
++
++	/* SPR_SESSION_TIME is GET-only, not a calibration write. */
++	if (get_unaligned_le32(query) != 0x412b ||
++	    get_unaligned_le32(query + 4) != 0x0800113d ||
++	    get_unaligned_le32(query + 8) != 28 ||
++	    memchr_inv(query + 12, 0, query_span - 12))
++		return -EINVAL;
++
++	writes = kmalloc(input_bytes - query_span, GFP_KERNEL);
++	if (!writes)
++		return -ENOMEM;
++	memcpy(writes, raw, query_offset);
++	memcpy(writes + query_offset, query + query_span,
++	       input_bytes - query_offset - query_span);
++
++	return q6apm_fullio_set_cfg_oob(graph, region, buffer, writes,
++				      input_bytes - query_span, false);
++}
++
+ /* Bootstrap includes reference VOL_CTRL defaults; no final-volume stage or
+  * GRAPH_START here. Validate hardware PA-off and conservative caps first.
+  */
+@@ -340,9 +371,11 @@ int audioreach_fullio_calibrate(struct q6apm_graph *graph,
+ 		blob = stages->stage[steps[i].stage];
+ 		switch (steps[i].op) {
+ 		case OOB:
+-			ret = q6apm_fullio_set_cfg_oob(graph, region, buffer, blob->data,
+-						     le32_to_cpu(blob->size),
+-						     steps[i].stage != AR_FULLIO_BOOTSTRAP);
++			if (steps[i].stage == AR_FULLIO_BOOTSTRAP)
++				ret = audioreach_fullio_bootstrap(graph, region, buffer, blob);
++			else
++				ret = q6apm_fullio_set_cfg_oob(graph, region, buffer, blob->data,
++							     le32_to_cpu(blob->size), true);
+ 			break;
+ 		case SINGLE:
+ 			ret = q6apm_fullio_set_cfg_inband(graph, dynamic[steps[i].index],

@@ -1,0 +1,56 @@
+Subject: [EXPERIMENT] soundwire: qcom: latch loss of a previously attached FullIO slot
+
+The controller may report detach without a master clash interrupt.
+Once an opted-in WSA controller has observed an attached slot, seeing
+it become unattached must prevent new admissions. Boot-empty slots
+and normal ALERT status are not detach. No auto-reset or retry.
+
+--- a/drivers/soundwire/qcom.c
++++ b/drivers/soundwire/qcom.c
+@@ -219,6 +219,7 @@
+ 	u32 intr_mask;
+ 	bool fullio_link_gate;
+ 	int fullio_link_error; /* First failure, sticky for the controller lifetime. */
++	unsigned long fullio_seen_attached;
+ 	u8 rcmd_id;
+ 	u8 wcmd_id;
+ 	/* Port numbers are 1 - 14 */
+@@ -656,7 +657,27 @@
+ 	       of_machine_is_compatible("microsoft,denali") &&
+ 	       of_property_read_bool(ctrl->dev->of_node, "qcom,denali-fullio-pm-transition-audit");
+ }
++
++/* Do not confuse an empty initial bus or a codec ALERT with detach.
++ * Once a slot has been attached on this scoped controller, its loss is
++ * sticky even if a later event enumerates it again.
++ */
++static void qcom_swrm_fullio_observe_slots(struct qcom_swrm_ctrl *ctrl, u32 slots)
++{
++	unsigned int i;
+ 
++	if (!ctrl->fullio_link_gate)
++		return;
++	for (i = 1; i <= SDW_MAX_DEVICES; i++) {
++		u32 status = (slots >> (i * SWRM_MCP_SLV_STATUS_SZ)) & SWRM_MCP_SLV_STATUS_MASK;
++
++		if (status == SDW_SLAVE_ATTACHED)
++			set_bit(i, &ctrl->fullio_seen_attached);
++		else if (status == SDW_SLAVE_UNATTACHED && test_bit(i, &ctrl->fullio_seen_attached))
++			qcom_swrm_fullio_latch_link_error(ctrl, -ENODEV);
++	}
++}
++
+ static int qcom_swrm_get_alert_slave_dev_num(struct qcom_swrm_ctrl *ctrl)
+ {
+ 	u32 val, status;
+@@ -684,7 +705,9 @@
+ 	u32 val;
+ 	int i;
+ 
+-	ctrl->reg_read(ctrl, SWRM_MCP_SLV_STATUS, &val);
++	if (ctrl->reg_read(ctrl, SWRM_MCP_SLV_STATUS, &val) != SDW_CMD_OK)
++		return;
++	qcom_swrm_fullio_observe_slots(ctrl, val);
+ 	ctrl->slave_status = val;
+ 
+ 	for (i = 1; i <= SDW_MAX_DEVICES; i++) {

@@ -1,0 +1,354 @@
+ASoC: q6apm: connect native Denali FullIO PCM prepare
+
+Prepare the once-only reference graph with PA/clock off, mute and SP/SPVI proof.
+Start the DSP once and keep its buffer borrowed across repeated prepare; normal PCM START performs no DSP transaction.
+Only the opt-in native card; all existing muted and audit fixtures retain their paths.
+--- a/sound/soc/qcom/qdsp6/q6apm.c
++++ b/sound/soc/qcom/qdsp6/q6apm.c
+@@ -387,6 +387,7 @@
+ 	FULLIO_PULL_PAUSED,
+ 	FULLIO_PULL_UNCERTAIN,
+ 	FULLIO_PULL_STOPPED,
++	FULLIO_PULL_STOP_UNVERIFIED,
+ };
+ 
+ /* Neither ALSA nor devres owns this coherent allocation. Keep one slot
+@@ -399,6 +400,7 @@
+ 	size_t bytes;
+ 	u32 config_bytes;
+ 	struct snd_dma_buffer pcm_buffer;
++	bool pcm_native;
+ 	int sid;
+ 	enum q6apm_fullio_pull_state state;
+ 	struct q6apm_fullio_oob_region data, pos;
+@@ -540,7 +542,33 @@
+ 	ring->pcm_buffer.addr = ring->dma;
+ 	smp_store_release(&ring->pcm_buffer.bytes, config_bytes);
+ 	return 0;
++}
++
++bool q6apm_fullio_reference_render(struct snd_soc_card *card)
++{
++	return card && of_machine_is_compatible("microsoft,denali") &&
++	       of_property_read_bool(card->dev->of_node, "microsoft,denali-fullio-reference-render") &&
++	       !of_property_read_bool(card->dev->of_node, "microsoft,denali-fullio-muted-test");
++}
++EXPORT_SYMBOL_GPL(q6apm_fullio_reference_render);
++
++int q6apm_fullio_pcm_configure(struct q6apm_graph *graph, struct snd_soc_card *card, int sid)
++{
++	struct q6apm_fullio_ring *ring;
++
++	if (!q6apm_fullio_reference_render(card) || graph->id || graph->shm_iid != 0x4660 ||
++	    !q6apm_is_graph_in_push_pull_mode(graph) || !audioreach_fullio_graph(graph->info))
++		return -EPERM;
++	guard(mutex)(&graph->apm->graph_lock);
++	if (graph->ar_graph->start_count || graph->ar_graph->fullio_ring)
++		return -EBUSY;
++	ring = q6apm_fullio_ring_alloc(graph->apm, graph->dev, SZ_512K, sid);
++	if (IS_ERR(ring))
++		return PTR_ERR(ring);
++	ring->pcm_native = true;
++	return q6apm_fullio_ring_attach(graph, ring, 2 * FULLIO_PULL_PERIOD_BYTES, true);
+ }
++EXPORT_SYMBOL_GPL(q6apm_fullio_pcm_configure);
+ 
+ /* Mapping-only or never-started attachment, selected by the fixture DT. */
+ int q6apm_fullio_ring_map_audit(struct q6apm_graph *graph, struct snd_soc_card *card,
+@@ -1871,7 +1899,55 @@
+ 	return audioreach_graph_mgmt_cmd(graph->ar_graph, APM_CMD_GRAPH_PREPARE);
+ }
+ EXPORT_SYMBOL_GPL(q6apm_graph_prepare);
++
++/* Start the producer once, with the graph muted and no endpoint owner
++ * published. PCM START does not repeat the DSP transaction.
++ */
++int q6apm_fullio_pcm_start(struct q6apm_graph *graph)
++{
++	struct audioreach_graph *ar = graph->ar_graph;
++	struct q6apm_fullio_ring *ring;
++	int ret;
++
++	guard(mutex)(&graph->apm->graph_lock);
++	ring = ar->fullio_ring;
++	if (!ring || !ring->pcm_native || graph->id || !audioreach_fullio_graph(graph->info) ||
++	    !q6apm_fullio_mute_is_verified(graph))
++		return -EPERM;
++	if (ring->state == FULLIO_PULL_RUNNING)
++		return 0;
++	if (ring->state != FULLIO_PULL_NEW || !ring->pcm_buffer.bytes || ar->start_count)
++		return -ENOTRECOVERABLE;
++	ring->state = FULLIO_PULL_UNCERTAIN;
++	ret = audioreach_graph_mgmt_transaction(ar, APM_CMD_GRAPH_START, true);
++	if (ret)
++		return ret;
++	ring->state = FULLIO_PULL_RUNNING;
++	return q6apm_fullio_mute_is_verified(graph) ? 0 : -ESTALE;
++}
++EXPORT_SYMBOL_GPL(q6apm_fullio_pcm_start);
+ 
++int q6apm_fullio_pcm_stop(struct q6apm_graph *graph)
++{
++	struct audioreach_graph *ar = graph->ar_graph;
++	struct q6apm_fullio_ring *ring;
++	int ret;
++
++	guard(mutex)(&graph->apm->graph_lock);
++	q6apm_fullio_mute_invalidate(graph);
++	ring = ar->fullio_ring;
++	if (!ring || ring->state == FULLIO_PULL_NEW || ring->state == FULLIO_PULL_STOPPED)
++		return 0;
++	if (!ring->pcm_native || ring->state == FULLIO_PULL_STOP_UNVERIFIED)
++		return -ENOTRECOVERABLE;
++	ring->state = FULLIO_PULL_STOP_UNVERIFIED;
++	ret = audioreach_graph_mgmt_transaction(ar, APM_CMD_GRAPH_STOP, true);
++	if (!ret)
++		ring->state = FULLIO_PULL_STOPPED;
++	return ret;
++}
++EXPORT_SYMBOL_GPL(q6apm_fullio_pcm_stop);
++
+ /* One diagnostic transaction per APM lifetime. Never use this to leave
+  * a graph running or to vouch for valid feedback or analogue silence.
+  */
+--- a/sound/soc/qcom/qdsp6/q6apm.h
++++ b/sound/soc/qcom/qdsp6/q6apm.h
+@@ -174,6 +174,10 @@
+ int q6apm_fullio_oob_unmap(struct q6apm *apm, struct q6apm_fullio_oob_region *region);
+ int q6apm_fullio_ring_map_audit(struct q6apm_graph *graph, struct snd_soc_card *card,
+ 			       size_t bytes, int sid, u32 config_bytes);
++bool q6apm_fullio_reference_render(struct snd_soc_card *card);
++int q6apm_fullio_pcm_configure(struct q6apm_graph *graph, struct snd_soc_card *card, int sid);
++int q6apm_fullio_pcm_start(struct q6apm_graph *graph);
++int q6apm_fullio_pcm_stop(struct q6apm_graph *graph);
+ struct snd_dma_buffer *q6apm_fullio_pcm_buffer(struct q6apm_graph *graph, size_t bytes);
+ int q6apm_fullio_pcm_cursor(struct q6apm_graph *graph, u32 frame_bytes, u32 *offset);
+ int q6apm_fullio_ring_position_audit(struct q6apm_graph *graph, bool started);
+--- a/sound/soc/qcom/qdsp6/q6apm-dai.c
++++ b/sound/soc/qcom/qdsp6/q6apm-dai.c
+@@ -115,6 +115,8 @@
+ 	bool watermark_enabled;
+ 	bool watermark_pending;
+ 	bool independent_pcm;
++	bool fullio_reference_pcm;
++	bool fullio_reference_prepared;
+ 	bool notify_on_drain;
+ };
+ 
+@@ -719,12 +721,13 @@
+ 	return 0;
+ }
+ 
+-static int q6apm_fullio_dsp_prepare_audit(struct q6apm_graph *graph, struct snd_soc_card *card,
++static int q6apm_fullio_dsp_prepare(struct q6apm_graph *graph, struct snd_soc_card *card,
+ 				       const struct audioreach_fullio_stages *stages)
+ {
+ 	struct device_node *node = card->dev->of_node;
+ 	bool sink_readback = of_property_read_bool(node, "microsoft,denali-fullio-sink-readback-audit");
+-	bool prepare = of_property_read_bool(node, "microsoft,denali-fullio-dsp-prepare-audit");
++	bool reference = q6apm_fullio_reference_render(card);
++	bool prepare = reference || of_property_read_bool(node, "microsoft,denali-fullio-dsp-prepare-audit");
+ 	int ret;
+ 
+ 	if (sink_readback && (!prepare ||
+@@ -732,7 +735,7 @@
+ 		return -EPERM;
+ 	if (!prepare)
+ 		return 0;
+-	if (!of_property_read_bool(node, "microsoft,denali-fullio-clock-off-audit") ||
++	if ((!reference && !of_property_read_bool(node, "microsoft,denali-fullio-clock-off-audit")) ||
+ 	    of_property_read_bool(node, "microsoft,denali-fullio-post-pa-test") ||
+ 	    !graph->ar_graph || READ_ONCE(graph->ar_graph->start_count) ||
+ 	    !q6apm_fullio_transport_enabled(graph->apm))
+@@ -1042,9 +1045,11 @@
+ 	unmap_ret = q6apm_fullio_release_cal(prtd);
+ 	if (ret || unmap_ret)
+ 		return ret ?: unmap_ret;
+-	ret = q6apm_fullio_dsp_prepare_audit(prtd->graph, card, &stages);
++	ret = q6apm_fullio_dsp_prepare(prtd->graph, card, &stages);
+ 	if (ret)
+ 		return ret;
++	if (prtd->fullio_reference_pcm)
++		return q6apm_fullio_mute_commit(prtd->graph, &ticket);
+ 	if (of_property_read_bool(card->dev->of_node, "microsoft,denali-fullio-dsp-start-audit")) {
+ 		struct q6apm_fullio_start_audit audit = {
+ 			.card = card,
+@@ -1084,8 +1089,9 @@
+ 	/* MultiMedia1 is graph 0 in the pinned Denali FullIO topology. */
+ 	return stream == SNDRV_PCM_STREAM_PLAYBACK && graph_id == 0 && component->card &&
+ 	       of_machine_is_compatible("microsoft,denali") &&
+-	       of_property_read_bool(component->card->dev->of_node,
+-				     "microsoft,denali-fullio-ring-map-audit");
++	       (q6apm_fullio_reference_render(component->card) ||
++		of_property_read_bool(component->card->dev->of_node,
++				      "microsoft,denali-fullio-ring-map-audit"));
+ }
+ 
+ /* Keep the pull producer's registration and media order together. It is
+@@ -1108,7 +1114,59 @@
+ 	dev_info(graph->dev, "FullIO independent ring SHMEM media accepted\n");
+ 	return 0;
+ }
++
++static int q6apm_fullio_reference_prepare(struct q6apm_dai_data *pdata,
++					 struct q6apm_dai_rtd *prtd, struct snd_soc_card *card,
++					 struct audioreach_module_config *cfg)
++{
++	struct snd_pcm_substream *substream = prtd->substream;
++	struct snd_pcm_runtime *runtime = substream->runtime;
++	struct snd_dma_buffer *buffer;
++	int ret;
++
++	if (pdata->has_reserved_mem || pdata->use_scm_assign ||
++	    runtime->format != SNDRV_PCM_FORMAT_S16_LE || runtime->rate != 48000 ||
++	    runtime->channels != 2 || prtd->pcm_size != 3840 ||
++	    snd_pcm_lib_period_bytes(substream) != 1920 || prtd->periods != 2)
++		return -EINVAL;
+ 
++	if (!prtd->fullio_reference_prepared) {
++		ret = q6apm_fullio_both_pa_off(card);
++		if (!ret)
++			ret = wsa_macro_fullio_clock_off_for_feedback(card);
++		if (!ret)
++			ret = q6apm_fullio_pcm_configure(prtd->graph, card, pdata->sid);
++		if (!ret)
++			ret = q6apm_fullio_prepare_pull_media(prtd->graph, cfg, 1920);
++		if (!ret)
++			ret = q6apm_fullio_prepare_cal(pdata, prtd, card, cfg);
++		if (ret)
++			return ret;
++	}
++
++	buffer = q6apm_fullio_pcm_buffer(prtd->graph, prtd->pcm_size);
++	if (!buffer)
++		return -ENODATA;
++	ret = q6apm_fullio_pcm_start(prtd->graph);
++	if (!ret)
++		ret = audioreach_fullio_verify_mute(prtd->graph);
++	if (!ret && !q6apm_fullio_mute_is_verified(prtd->graph))
++		ret = -ESTALE;
++	if (ret) {
++		int stop;
++
++		snd_pcm_set_runtime_buffer(substream, NULL);
++		stop = q6apm_fullio_pcm_stop(prtd->graph);
++
++		if (stop)
++			WRITE_ONCE(pdata->fullio_render_locked, true);
++		return ret;
++	}
++	snd_pcm_set_runtime_buffer(substream, buffer);
++	prtd->fullio_reference_prepared = true;
++	return 0;
++}
++
+ static int q6apm_dai_prepare(struct snd_soc_component *component,
+ 			     struct snd_pcm_substream *substream)
+ {
+@@ -1131,7 +1189,7 @@
+ 	ret = q6apm_fullio_check_render(pdata, substream->stream);
+ 	if (ret)
+ 		return ret;
+-	if (audioreach_fullio_graph(prtd->graph->info))
++	if (audioreach_fullio_graph(prtd->graph->info) && !prtd->fullio_reference_prepared)
+ 		q6apm_fullio_mute_invalidate(prtd->graph);
+ 	cfg.direction = substream->stream;
+ 	cfg.sample_rate = runtime->rate;
+@@ -1150,6 +1208,8 @@
+ 		if (ret)
+ 			return dev_err_probe(dev, ret, "FullIO feedback probe requires both PAs off\n");
+ 	}
++	if (prtd->fullio_reference_pcm)
++		return q6apm_fullio_reference_prepare(pdata, prtd, component->card, &cfg);
+ 	if (q6apm_fullio_independent_pcm(component, prtd->graph->id, substream->stream)) {
+ 		const unsigned int audit_period = 1920; /* Golden: 10 ms stereo S16_LE. */
+ 		struct snd_dma_buffer *buffer;
+@@ -1378,9 +1438,12 @@
+ 	prtd->substream = substream;
+ 	independent = q6apm_fullio_independent_pcm(component, graph_id, substream->stream);
+ 	prtd->independent_pcm = independent;
++	prtd->fullio_reference_pcm = independent && q6apm_fullio_reference_render(component->card);
+ 	/* No asynchronous ALSA period delivery for the diagnostic ring. */
+-	prtd->graph = q6apm_graph_open(dev, independent ? NULL : event_handler,
+-				     independent ? NULL : prtd, graph_id, substream->stream);
++	prtd->graph = q6apm_graph_open(dev,
++				     independent && !prtd->fullio_reference_pcm ? NULL : event_handler,
++				     independent && !prtd->fullio_reference_pcm ? NULL : prtd,
++				     graph_id, substream->stream);
+ 	if (IS_ERR(prtd->graph)) {
+ 		dev_err(dev, "%s: Could not allocate memory\n", __func__);
+ 		ret = PTR_ERR(prtd->graph);
+@@ -1400,7 +1463,19 @@
+ 		ret = snd_pcm_hw_constraint_mask64(runtime, SNDRV_PCM_HW_PARAM_ACCESS,
+ 						  BIT_ULL(SNDRV_PCM_ACCESS_RW_INTERLEAVED));
+ 		if (ret)
++			goto err;
++	}
++	if (prtd->fullio_reference_pcm) {
++		runtime->hw.formats = SNDRV_PCM_FMTBIT_S16_LE;
++		runtime->hw.rates = SNDRV_PCM_RATE_48000;
++		runtime->hw.rate_min = runtime->hw.rate_max = 48000;
++		runtime->hw.channels_min = runtime->hw.channels_max = 2;
++		ret = snd_pcm_hw_constraint_single(runtime, SNDRV_PCM_HW_PARAM_PERIOD_BYTES, 1920);
++		if (ret < 0)
+ 			goto err;
++		ret = snd_pcm_hw_constraint_single(runtime, SNDRV_PCM_HW_PARAM_BUFFER_BYTES, 3840);
++		if (ret < 0)
++			goto err;
+ 	}
+ 	if (probe_rate) {
+ 		runtime->hw.formats = SNDRV_PCM_FMTBIT_S32_LE;
+@@ -1475,6 +1550,8 @@
+ {
+ 	struct snd_pcm_runtime *runtime = substream->runtime;
+ 	struct q6apm_dai_rtd *prtd = runtime->private_data;
++	struct q6apm_dai_data *pdata = snd_soc_component_get_drvdata(component);
++	int ret = 0;
+ 
+ 	/* Close is outside the PCM group lock. Revoke before draining so
+ 	 * concurrent GPR callbacks cannot queue new work against this graph.
+@@ -1489,13 +1566,18 @@
+ 
+ 	if (prtd->independent_pcm)
+ 		snd_pcm_set_runtime_buffer(substream, NULL);
++	if (prtd->fullio_reference_pcm) {
++		ret = q6apm_fullio_pcm_stop(prtd->graph);
++		if (ret)
++			WRITE_ONCE(pdata->fullio_render_locked, true);
++	}
+ 	q6apm_fullio_release_cal(prtd);
+ 	q6apm_graph_close(prtd->graph);
+ 	prtd->graph = NULL;
+ 	kfree(prtd);
+ 	runtime->private_data = NULL;
+ 
+-	return 0;
++	return ret;
+ }
+ 
+ static snd_pcm_uframes_t q6apm_dai_pointer(struct snd_soc_component *component,
+@@ -1548,6 +1630,16 @@
+ 	return ptr * runtime->period_size;
+ }
+ 
++static int q6apm_dai_hw_free(struct snd_soc_component *component,
++			     struct snd_pcm_substream *substream)
++{
++	struct q6apm_dai_rtd *prtd = substream->runtime->private_data;
++
++	if (prtd && prtd->fullio_reference_pcm)
++		snd_pcm_set_runtime_buffer(substream, NULL);
++	return 0;
++}
++
+ static int q6apm_dai_hw_params(struct snd_soc_component *component,
+ 			       struct snd_pcm_substream *substream,
+ 			       struct snd_pcm_hw_params *params)
+@@ -2155,6 +2247,7 @@
+ 	.pcm_new	= q6apm_dai_pcm_new,
+ 	.pcm_free	= q6apm_dai_pcm_free,
+ 	.hw_params	= q6apm_dai_hw_params,
++	.hw_free	= q6apm_dai_hw_free,
+ 	.pointer	= q6apm_dai_pointer,
+ 	.trigger	= q6apm_dai_trigger,
+ 	.ack		= q6apm_dai_ack,

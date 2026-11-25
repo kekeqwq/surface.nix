@@ -1,0 +1,55 @@
+Subject: [EXPERIMENT] ASoC: deny latched FullIO WSA opens before runtime PM
+
+Consult an optional pure DAI admission check before pinctrl and the
+component runtime PM votes. FullIO WSA uses its existing sticky policy.
+Keep both later WSA checks for faults racing open/resume.
+
+--- a/include/sound/soc-dai.h
++++ b/include/sound/soc-dai.h
+@@ -330,6 +330,8 @@
+ 	 * ALSA PCM audio operations - all optional.
+ 	 * Called by soc-core during audio PCM operations.
+ 	 */
++	/* Side-effect-free admission check, before pinctrl and runtime PM. */
++	int (*check_open)(struct snd_pcm_substream *, struct snd_soc_dai *);
+ 	int (*startup)(struct snd_pcm_substream *,
+ 		struct snd_soc_dai *);
+ 	void (*shutdown)(struct snd_pcm_substream *,
+--- a/sound/soc/soc-pcm.c
++++ b/sound/soc/soc-pcm.c
+@@ -879,6 +879,16 @@
+ 	int i, ret = 0;
+ 
+ 	snd_soc_dpcm_mutex_assert_held(rtd);
++
++	/* No open state has been acquired yet; do not run rollback on denial. */
++	for_each_rtd_dais(rtd, i, dai) {
++		if (!snd_soc_dai_stream_valid(dai, substream->stream) ||
++		    !dai->driver->ops || !dai->driver->ops->check_open)
++			continue;
++		ret = dai->driver->ops->check_open(substream, dai);
++		if (ret < 0)
++			return soc_pcm_ret(rtd, ret);
++	}
+ 
+ 	for_each_rtd_components(rtd, i, component)
+ 		pinctrl_pm_select_default_state(component->dev);
+--- a/drivers/soundwire/qcom.c
++++ b/drivers/soundwire/qcom.c
+@@ -1712,7 +1712,16 @@
+ 
+ }
+ 
++static int qcom_swrm_check_open(struct snd_pcm_substream *substream,
++			       struct snd_soc_dai *dai)
++{
++	struct qcom_swrm_ctrl *ctrl = dev_get_drvdata(dai->dev);
++
++	return qcom_swrm_fullio_new_stream_ok(ctrl);
++}
++
+ static const struct snd_soc_dai_ops qcom_swrm_pdm_dai_ops = {
++	.check_open = qcom_swrm_check_open,
+ 	.hw_params = qcom_swrm_hw_params,
+ 	.hw_free = qcom_swrm_hw_free,
+ 	.startup = qcom_swrm_startup,

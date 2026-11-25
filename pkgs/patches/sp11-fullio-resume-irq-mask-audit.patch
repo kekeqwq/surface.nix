@@ -1,0 +1,39 @@
+Observe the existing clash clear and IRQ-mask restore boundaries on Denali.
+
+--- a/drivers/soundwire/qcom.c
++++ b/drivers/soundwire/qcom.c
+@@ -2252,7 +2252,7 @@
+ 		qcom_swrm_get_device_status(ctrl);
+ 		sdw_handle_slave_status(&ctrl->bus, ctrl->status);
+ 	} else {
+-		int ee_ret = 0, start_ret;
++		int ee_ret = 0, start_ret, mask_ret = 0;
+ 
+ 		swrm_fullio_pm_snapshot(ctrl, "before-cgcr-reset", 0);
+ 		ret = reset_control_reset(ctrl->audio_cgcr);
+@@ -2273,16 +2273,18 @@
+ 		}
+ 
+ 		swrm_fullio_pm_snapshot(ctrl, "clock-start-before-clash-clear", ee_ret ?: start_ret);
+-		ctrl->reg_write(ctrl, ctrl->reg_layout[SWRM_REG_INTERRUPT_CLEAR],
+-			SWRM_INTERRUPT_STATUS_MASTER_CLASH_DET);
++		ret = ctrl->reg_write(ctrl, ctrl->reg_layout[SWRM_REG_INTERRUPT_CLEAR],
++				      SWRM_INTERRUPT_STATUS_MASTER_CLASH_DET);
++		swrm_fullio_pm_snapshot(ctrl, "after-clash-clear-before-irq-restore", ret);
+ 
+ 		ctrl->intr_mask |= SWRM_INTERRUPT_STATUS_MASTER_CLASH_DET;
+ 		if (ctrl->version < SWRM_VERSION_2_0_0)
+-			ctrl->reg_write(ctrl,
+-					ctrl->reg_layout[SWRM_REG_INTERRUPT_MASK_ADDR],
+-					ctrl->intr_mask);
+-		ctrl->reg_write(ctrl, ctrl->reg_layout[SWRM_REG_INTERRUPT_CPU_EN],
+-				ctrl->intr_mask);
++			mask_ret = ctrl->reg_write(ctrl,
++						   ctrl->reg_layout[SWRM_REG_INTERRUPT_MASK_ADDR],
++						   ctrl->intr_mask);
++		ret = ctrl->reg_write(ctrl, ctrl->reg_layout[SWRM_REG_INTERRUPT_CPU_EN],
++				      ctrl->intr_mask);
++		swrm_fullio_pm_snapshot(ctrl, "after-irq-restore-before-frame-wait", mask_ret ?: ret);
+ 
+ 		usleep_range(100, 105);
+ 		if (!swrm_wait_for_frame_gen_enabled(ctrl)) {

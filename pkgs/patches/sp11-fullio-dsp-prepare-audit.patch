@@ -1,0 +1,158 @@
+Subject: [EXPERIMENT] ASoC: audit mute retention across GRAPH_PREPARE
+
+Apply only to the PA-off, clock-off fixture. Read mute again without
+rewriting it. Keep graph START and amplifier unmute prohibited.
+
+diff --git a/sound/soc/qcom/qdsp6/audioreach.c b/sound/soc/qcom/qdsp6/audioreach.c
+index 9929da8..f394aea 100644
+--- a/sound/soc/qcom/qdsp6/audioreach.c
++++ b/sound/soc/qcom/qdsp6/audioreach.c
+@@ -326,36 +326,26 @@ static bool audioreach_fullio_compact_stereo_mute(const u8 *data)
+ 	       get_unaligned_le32(data + 12) == 1; /* muted */
+ }
+ 
+-static int audioreach_fullio_acknowledge_mute(struct q6apm_graph *graph,
+-					     const struct audioreach_fullio_stages *stages)
++/* The pinned endpoint ABI has eight slots, but only FL and FR are
++ * selected. Unlike the reference stage, this packet has no unmute
++ * variant, and it never writes a gain parameter.
++ */
++static const __le32 fullio_stereo_mute[30] = {
++	[0] = cpu_to_le32(0x4a63),
++	[1] = cpu_to_le32(0x08001039),
++	[2] = cpu_to_le32(104),
++	[4] = cpu_to_le32(8),
++	[5] = cpu_to_le32(0x2),
++	[7] = cpu_to_le32(1),
++	[8] = cpu_to_le32(0x4),
++	[10] = cpu_to_le32(1),
++};
++
++int audioreach_fullio_verify_mute(struct q6apm_graph *graph)
+ {
+-	/* The pinned endpoint ABI has eight slots, but only FL and FR are
+-	 * selected. Unlike the reference stage, this packet has no unmute
+-	 * variant, and it never writes a gain parameter.
+-	 */
+-	static const __le32 mute[30] = {
+-		[0] = cpu_to_le32(0x4a63),
+-		[1] = cpu_to_le32(0x08001039),
+-		[2] = cpu_to_le32(104),
+-		[4] = cpu_to_le32(8),
+-		[5] = cpu_to_le32(0x2),
+-		[7] = cpu_to_le32(1),
+-		[8] = cpu_to_le32(0x4),
+-		[10] = cpu_to_le32(1),
+-	};
+-	const struct audioreach_module_priv_data *stage = stages->stage[AR_FULLIO_MUTE];
+-	u8 actual[sizeof(mute) - APM_MODULE_PARAM_DATA_SIZE];
++	u8 actual[sizeof(fullio_stereo_mute) - APM_MODULE_PARAM_DATA_SIZE];
+ 	int ret;
+ 
+-	if (!stage || le32_to_cpu(stage->size) != sizeof(mute) ||
+-	    get_unaligned_le32(stage->data) != 0x4a63 ||
+-	    get_unaligned_le32(stage->data + 1) != 0x08001039)
+-		return -EINVAL;
+-	ret = q6apm_fullio_set_cfg_inband(graph, mute, sizeof(mute));
+-	if (ret)
+-		return dev_err_probe(graph->dev, ret, "FullIO endpoint stereo mute rejected\n");
+-	dev_info(graph->dev, "FullIO endpoint stereo mute acknowledged\n");
+-
+ 	ret = q6apm_fullio_get_cfg(graph, 0x4a63, 0x08001039, actual, sizeof(actual));
+ 	if (ret < 0)
+ 		return dev_err_probe(graph->dev, ret, "FullIO endpoint stereo mute not readable\n");
+@@ -367,13 +357,32 @@ static int audioreach_fullio_acknowledge_mute(struct q6apm_graph *graph,
+ 				get_unaligned_le32(actual + 8), get_unaligned_le32(actual + 12));
+ 			return -EILSEQ;
+ 		}
+-	} else if (ret || memcmp((const u8 *)mute + APM_MODULE_PARAM_DATA_SIZE,
++	} else if (ret || memcmp((const u8 *)fullio_stereo_mute + APM_MODULE_PARAM_DATA_SIZE,
+ 				 actual, sizeof(actual))) {
+ 		return dev_err_probe(graph->dev, -EILSEQ, "FullIO endpoint stereo mute mismatch\n");
+ 	}
+ 	dev_info(graph->dev, "FullIO endpoint stereo mute readback verified\n");
+ 	return 0;
+ }
++EXPORT_SYMBOL_GPL(audioreach_fullio_verify_mute);
++
++static int audioreach_fullio_acknowledge_mute(struct q6apm_graph *graph,
++					     const struct audioreach_fullio_stages *stages)
++{
++	const struct audioreach_module_priv_data *stage = stages->stage[AR_FULLIO_MUTE];
++	int ret;
++
++	if (!stage || le32_to_cpu(stage->size) != sizeof(fullio_stereo_mute) ||
++	    get_unaligned_le32(stage->data) != 0x4a63 ||
++	    get_unaligned_le32(stage->data + 1) != 0x08001039)
++		return -EINVAL;
++	ret = q6apm_fullio_set_cfg_inband(graph, fullio_stereo_mute, sizeof(fullio_stereo_mute));
++	if (ret)
++		return dev_err_probe(graph->dev, ret, "FullIO endpoint stereo mute rejected\n");
++	dev_info(graph->dev, "FullIO endpoint stereo mute acknowledged\n");
++
++	return audioreach_fullio_verify_mute(graph);
++}
+ 
+ /* Bootstrap includes reference VOL_CTRL defaults; no final-volume stage or
+  * GRAPH_START here. Validate hardware PA-off and conservative caps first.
+diff --git a/sound/soc/qcom/qdsp6/audioreach.h b/sound/soc/qcom/qdsp6/audioreach.h
+index 093e367..59aa549 100644
+--- a/sound/soc/qcom/qdsp6/audioreach.h
++++ b/sound/soc/qcom/qdsp6/audioreach.h
+@@ -1055,6 +1055,7 @@ bool audioreach_fullio_graph(const struct audioreach_graph_info *info);
+ int audioreach_fullio_media_prelude(struct q6apm_graph *graph,
+ 				  const struct audioreach_module_config *cfg);
+ struct q6apm_fullio_oob_region;
++int audioreach_fullio_verify_mute(struct q6apm_graph *graph);
+ int audioreach_fullio_calibrate(struct q6apm_graph *graph,
+ 			       const struct audioreach_fullio_stages *stages,
+ 			       struct q6apm_fullio_oob_region *region, void *buffer,
+diff --git a/sound/soc/qcom/qdsp6/q6apm-dai.c b/sound/soc/qcom/qdsp6/q6apm-dai.c
+index 8bd5cd4..1a48c97 100644
+--- a/sound/soc/qcom/qdsp6/q6apm-dai.c
++++ b/sound/soc/qcom/qdsp6/q6apm-dai.c
+@@ -521,6 +521,34 @@ static int q6apm_fullio_both_pa_off(void *ctx)
+ 	return wsa884x_fullio_pa_off(pair.right);
+ }
+ 
++static int q6apm_fullio_dsp_prepare_audit(struct q6apm_graph *graph, struct snd_soc_card *card)
++{
++	struct device_node *node = card->dev->of_node;
++	int ret;
++
++	if (!of_property_read_bool(node, "microsoft,denali-fullio-dsp-prepare-audit"))
++		return 0;
++	if (!of_property_read_bool(node, "microsoft,denali-fullio-clock-off-audit") ||
++	    of_property_read_bool(node, "microsoft,denali-fullio-post-pa-test") ||
++	    !graph->ar_graph || READ_ONCE(graph->ar_graph->start_count) ||
++	    !q6apm_fullio_transport_enabled(graph->apm))
++		return -EPERM;
++	ret = q6apm_fullio_both_pa_off(card);
++	if (ret)
++		return ret;
++	/* No start, trigger, fragment writes or unmute, even on success. */
++	ret = q6apm_graph_prepare(graph);
++	if (ret)
++		return dev_err_probe(graph->dev, ret, "FullIO muted GRAPH_PREPARE rejected\n");
++	ret = audioreach_fullio_verify_mute(graph);
++	if (ret)
++		return ret;
++	ret = q6apm_fullio_both_pa_off(card);
++	if (!ret)
++		dev_info(graph->dev, "FullIO mute survived GRAPH_PREPARE; no GRAPH_START\n");
++	return ret;
++}
++
+ static int q6apm_fullio_prepare_cal(struct q6apm_dai_data *pdata,
+ 				   struct q6apm_dai_rtd *prtd, struct snd_soc_card *card,
+ 				   const struct audioreach_module_config *cfg)
+@@ -591,6 +619,9 @@ static int q6apm_fullio_prepare_cal(struct q6apm_dai_data *pdata,
+ 	unmap_ret = q6apm_fullio_release_cal(prtd);
+ 	if (ret || unmap_ret)
+ 		return ret ?: unmap_ret;
++	ret = q6apm_fullio_dsp_prepare_audit(prtd->graph, card);
++	if (ret)
++		return ret;
+ 	ret = q6apm_fullio_mute_commit(prtd->graph, &ticket);
+ 	if (ret)
+ 		return ret;

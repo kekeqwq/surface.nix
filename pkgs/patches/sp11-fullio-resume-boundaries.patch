@@ -1,0 +1,43 @@
+Expose existing clock-stop resume boundaries on the scoped Denali PM audit.
+
+--- a/drivers/soundwire/qcom.c
++++ b/drivers/soundwire/qcom.c
+@@ -2252,23 +2252,27 @@
+ 		qcom_swrm_get_device_status(ctrl);
+ 		sdw_handle_slave_status(&ctrl->bus, ctrl->status);
+ 	} else {
+-		reset_control_reset(ctrl->audio_cgcr);
++		int ee_ret = 0, start_ret;
+ 
++		swrm_fullio_pm_snapshot(ctrl, "before-cgcr-reset", 0);
++		ret = reset_control_reset(ctrl->audio_cgcr);
++		swrm_fullio_pm_snapshot(ctrl, "after-cgcr-reset-before-clock-start", ret);
++
+ 		if (ctrl->version == SWRM_VERSION_1_7_0) {
+-			ctrl->reg_write(ctrl, SWRM_LINK_MANAGER_EE, ctrl->ee);
+-			ctrl->reg_write(ctrl, SWRM_MCP_BUS_CTRL,
+-					SWRM_MCP_BUS_CLK_START << ctrl->ee);
++			ee_ret = ctrl->reg_write(ctrl, SWRM_LINK_MANAGER_EE, ctrl->ee);
++			start_ret = ctrl->reg_write(ctrl, SWRM_MCP_BUS_CTRL,
++						    SWRM_MCP_BUS_CLK_START << ctrl->ee);
+ 		} else if (ctrl->version >= SWRM_VERSION_2_0_0) {
+-			ctrl->reg_write(ctrl, SWRM_LINK_MANAGER_EE, ctrl->ee);
+-			ctrl->reg_write(ctrl, SWRM_V2_0_CLK_CTRL +
+-					((int)ctrl->ee - SWRM_EE_CPU) *
+-					SWRM_V2_REG_EE_STRIDE,
+-					SWRM_V2_0_CLK_CTRL_CLK_START);
++			ee_ret = ctrl->reg_write(ctrl, SWRM_LINK_MANAGER_EE, ctrl->ee);
++			start_ret = ctrl->reg_write(ctrl, SWRM_V2_0_CLK_CTRL +
++						    ((int)ctrl->ee - SWRM_EE_CPU) *
++						    SWRM_V2_REG_EE_STRIDE,
++						    SWRM_V2_0_CLK_CTRL_CLK_START);
+ 		} else {
+-			ctrl->reg_write(ctrl, SWRM_MCP_BUS_CTRL, SWRM_MCP_BUS_CLK_START);
++			start_ret = ctrl->reg_write(ctrl, SWRM_MCP_BUS_CTRL, SWRM_MCP_BUS_CLK_START);
+ 		}
+ 
+-		swrm_fullio_pm_snapshot(ctrl, "clock-start-before-clash-clear", 0);
++		swrm_fullio_pm_snapshot(ctrl, "clock-start-before-clash-clear", ee_ret ?: start_ret);
+ 		ctrl->reg_write(ctrl, ctrl->reg_layout[SWRM_REG_INTERRUPT_CLEAR],
+ 			SWRM_INTERRUPT_STATUS_MASTER_CLASH_DET);
+ 

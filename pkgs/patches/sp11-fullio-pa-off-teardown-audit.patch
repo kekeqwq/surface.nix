@@ -1,0 +1,141 @@
+Subject: [EXPERIMENT] ASoC: exercise verified teardown with both PAs off
+
+Exercise the verified shutdown on the same card after the muted DSP
+transaction, while both codec transports are still owned. Do not rely
+on ordinary hw_free reaching the amplifier after a rejected prepare.
+Both sides are attempted even if the first fails. Clock audit is read-only;
+no normal PCM, unmute, or active protection clock path is added.
+
+diff --git a/sound/soc/codecs/lpass-wsa-macro.c b/sound/soc/codecs/lpass-wsa-macro.c
+index 30fcd42..8d091de 100755
+--- a/sound/soc/codecs/lpass-wsa-macro.c
++++ b/sound/soc/codecs/lpass-wsa-macro.c
+@@ -1776,9 +1776,15 @@ static int wsa_macro_fullio_clock_off_on_card(struct snd_soc_card *card,
+ int wsa_macro_fullio_clock_off_for_pa(struct snd_soc_component *amp);
+ int wsa_macro_fullio_clock_off_for_pa(struct snd_soc_component *amp)
+ {
+-	if (!wsa_macro_fullio_post_pa_probe(amp))
++	struct snd_soc_card *card = amp->card;
++	bool audit = wsa_macro_fullio_clock_audit(card) &&
++		of_property_read_bool(card->dev->of_node, "microsoft,denali-fullio-muted-test") &&
++		of_property_read_bool(card->dev->of_node, "microsoft,denali-fullio-pa-stop-audit");
++
++	if (!wsa_macro_fullio_post_pa_probe(amp) && !audit)
+ 		return -EOPNOTSUPP;
+-	return wsa_macro_fullio_clock_off_on_card(amp->card, amp);
++	/* The clock-off marker makes the audit a read-only operation. */
++	return wsa_macro_fullio_clock_off_on_card(card, amp);
+ }
+ EXPORT_SYMBOL_GPL(wsa_macro_fullio_clock_off_for_pa);
+ 
+diff --git a/sound/soc/codecs/wsa884x.c b/sound/soc/codecs/wsa884x.c
+index 964dc5e..d82e2cf 100755
+--- a/sound/soc/codecs/wsa884x.c
++++ b/sound/soc/codecs/wsa884x.c
+@@ -2024,6 +2024,47 @@ static int wsa884x_fullio_verified_stop(struct snd_soc_component *component,
+ 	return verify ?: (pa < 0 ? pa : dre < 0 ? dre : clock);
+ }
+ 
++static bool wsa884x_fullio_pa_stop_audit(struct snd_soc_component *component)
++{
++	struct device_node *sound = component->card ? component->card->dev->of_node : NULL;
++
++	return of_machine_is_compatible("microsoft,denali") &&
++	       of_property_read_bool(sound, "microsoft,denali-fullio-muted-test") &&
++	       of_property_read_bool(sound, "microsoft,denali-fullio-clock-off-audit") &&
++	       of_property_read_bool(sound, "microsoft,denali-fullio-pa-stop-audit") &&
++	       !of_property_read_bool(sound, "microsoft,denali-fullio-post-pa-test");
++}
++
++/* Deliberate test call while the muted playback link still owns its
++ * transport. An ALSA prepare that fails may never reach codec mute.
++ */
++int wsa884x_fullio_stop_audit(struct snd_soc_component *component);
++int wsa884x_fullio_stop_audit(struct snd_soc_component *component)
++{
++	struct wsa884x_priv *amp;
++	int ret, before;
++
++	if (!component || component->driver != &wsa884x_component_drv ||
++	    !wsa884x_fullio_pa_stop_audit(component))
++		return -EOPNOTSUPP;
++	amp = dev_get_drvdata(component->dev);
++	if (!amp || !amp->feedback_enabled)
++		return -ENODEV;
++	ret = pm_runtime_resume_and_get(amp->dev);
++	if (ret < 0)
++		return ret;
++	before = wsa884x_fullio_pa_off(component);
++	/* Always attempt shutdown even if the precheck cannot prove PA off. */
++	ret = wsa884x_fullio_verified_stop(component, amp);
++	pm_runtime_mark_last_busy(amp->dev);
++	pm_runtime_put_autosuspend(amp->dev);
++	if (before || ret)
++		return before ?: ret;
++	dev_info(component->dev, "FullIO PA-off teardown verified; clock audit and PA readback passed\n");
++	return 0;
++}
++EXPORT_SYMBOL_GPL(wsa884x_fullio_stop_audit);
++
+ static int wsa884x_mute_stream(struct snd_soc_dai *dai, int mute, int stream)
+ {
+ 	struct snd_soc_component *component = dai->component;
+diff --git a/sound/soc/qcom/qdsp6/q6apm-dai.c b/sound/soc/qcom/qdsp6/q6apm-dai.c
+index 36b8326..02f3038 100644
+--- a/sound/soc/qcom/qdsp6/q6apm-dai.c
++++ b/sound/soc/qcom/qdsp6/q6apm-dai.c
+@@ -365,6 +365,7 @@ static int q6apm_fullio_release_cal(struct q6apm_dai_rtd *prtd)
+ /* Only the two known Denali WSA codecs on the playback link count. */
+ #if IS_REACHABLE(CONFIG_SND_SOC_WSA884X)
+ int wsa884x_fullio_pa_off(struct snd_soc_component *component);
++int wsa884x_fullio_stop_audit(struct snd_soc_component *component);
+ int wsa884x_fullio_pa_ready(struct snd_soc_component *component, s64 *epoch);
+ #else
+ static int wsa884x_fullio_pa_off(struct snd_soc_component *component)
+@@ -372,6 +373,11 @@ static int wsa884x_fullio_pa_off(struct snd_soc_component *component)
+ 	return -EOPNOTSUPP;
+ }
+ 
++static int wsa884x_fullio_stop_audit(struct snd_soc_component *component)
++{
++	return -EOPNOTSUPP;
++}
++
+ static int wsa884x_fullio_pa_ready(struct snd_soc_component *component, s64 *epoch)
+ {
+ 	return -EOPNOTSUPP;
+@@ -522,6 +528,21 @@ static int q6apm_fullio_both_pa_off(void *ctx)
+ 	return wsa884x_fullio_pa_off(pair.right);
+ }
+ 
++static int q6apm_fullio_stop_pair_audit(struct snd_soc_card *card)
++{
++	struct q6apm_fullio_amp_pair pair = {};
++	int left, right;
++
++	left = q6apm_fullio_amp_pair(card, "WSA Playback", &pair);
++	if (left)
++		return left;
++	left = wsa884x_fullio_stop_audit(pair.left);
++	right = wsa884x_fullio_stop_audit(pair.right);
++	if (left || right)
++		dev_err(card->dev, "FullIO PA-off teardown failed: left=%d right=%d\n", left, right);
++	return left ?: right;
++}
++
+ static int q6apm_fullio_dsp_prepare_audit(struct q6apm_graph *graph, struct snd_soc_card *card)
+ {
+ 	struct device_node *node = card->dev->of_node;
+@@ -735,6 +756,12 @@ static int q6apm_fullio_prepare_cal(struct q6apm_dai_data *pdata,
+ 
+ 		ret = q6apm_fullio_audit_start_stop(prtd->graph, card, q6apm_fullio_verify_silent_audit,
+ 						   &audit);
++		if (of_property_read_bool(card->dev->of_node, "microsoft,denali-fullio-pa-stop-audit")) {
++			int stop = q6apm_fullio_stop_pair_audit(card);
++
++			if (stop && !ret)
++				ret = stop;
++		}
+ 		if (ret)
+ 			return ret;
+ 	} else {

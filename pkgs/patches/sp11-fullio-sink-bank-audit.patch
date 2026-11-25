@@ -1,0 +1,100 @@
+Subject: [EXPERIMENT] ASoC: WSA884x: observe a prepared PA-off sink bank
+
+In the prepare-only opt-in fixture, verify channel enable and Golden
+SIMPLE fields on both real codecs in the current bank. No writes or
+changes to the active PA/clock paths.
+
+--- a/sound/soc/codecs/wsa884x.c
++++ b/sound/soc/codecs/wsa884x.c
+@@ -748,6 +748,7 @@
+ 	struct sdw_stream_runtime *attached[WSA884X_NUM_DAIS];
+ 	struct sdw_dpn_prop feedback_ports[2];
+ 	bool feedback_enabled;
++	bool fullio_sink_bank_observed;
+ 	atomic64_t fullio_pa_epoch;
+ 	spinlock_t fullio_fault_lock;
+ 	struct work_struct *fullio_fault_work; /* Protected by fullio_fault_lock. */
+@@ -1890,10 +1891,49 @@
+ struct wsa884x_fullio_pa_snapshot {
+ 	unsigned int enable, sta0, sta1, err0, err1, pdm_wd;
+ 	unsigned int dre0, dre1, vphx;
+-	bool gain_sampled, vphx_sampled;
++	bool gain_sampled, vphx_sampled, sink_sampled;
++	u8 sink_bank;
+ 	s64 epoch;
+ };
+ 
++static int wsa884x_fullio_read_sink_bank(struct wsa884x_priv *amp,
++					 struct wsa884x_fullio_pa_snapshot *snapshot)
++{
++	struct sdw_slave *slave = amp->slave;
++	unsigned int bank, dp;
++	int ret;
++
++	if (READ_ONCE(amp->fullio_sink_bank_observed))
++		return 0;
++	for (dp = 0; dp < 3; dp++)
++		if (!READ_ONCE(amp->port_prepared[dp]))
++			return 0; /* No active triplet to observe yet. */
++	bank = READ_ONCE(slave->bus->params.curr_bank);
++	for (dp = 1; dp <= 3; dp++) {
++		u32 reg = bank ? SDW_DPN_CHANNELEN_B1(dp) : SDW_DPN_CHANNELEN_B0(dp);
++
++		ret = sdw_read_no_pm(slave, reg);
++		if (ret < 0)
++			return ret;
++		if (!(ret & BIT(0)))
++			return 0; /* Prepared, not active yet. */
++		if (dp == 1)
++			reg = bank ? SDW_DPN_BLOCKCTRL3_B1(dp) : SDW_DPN_BLOCKCTRL3_B0(dp);
++		else
++			reg = bank ? SDW_DPN_OFFSETCTRL2_B1(dp) : SDW_DPN_OFFSETCTRL2_B0(dp);
++		ret = sdw_read_no_pm(slave, reg);
++		if (ret < 0)
++			return ret;
++		if (ret != (dp == 1 ? 0 : dp == 2 ? 7 : 0x1f))
++			return -EIO;
++	}
++	if (bank != READ_ONCE(slave->bus->params.curr_bank))
++		return -EAGAIN;
++	snapshot->sink_bank = bank;
++	snapshot->sink_sampled = true;
++	return 0;
++}
++
+ /* Return a hardware snapshot, not a software-mute flag or PA-up claim. */
+ static int wsa884x_fullio_read_pa(struct snd_soc_component *component, bool read_faults,
+ 				 struct wsa884x_fullio_pa_snapshot *result)
+@@ -1944,6 +1984,8 @@
+ 		ret = regmap_read_bypassed(wsa884x->regmap, WSA884X_VPHX_SYS_EN_STATUS,
+ 					   &snapshot.vphx);
+ 		snapshot.vphx_sampled = !ret;
++		if (!ret && of_property_read_bool(sound, "microsoft,denali-fullio-sink-bank-audit"))
++			ret = wsa884x_fullio_read_sink_bank(wsa884x, &snapshot);
+ 	}
+ 	if (!ret && !read_faults && !(before & WSA884X_PA_FSM_EN_GLOBAL_PA_EN_MASK) &&
+ 	    of_machine_is_compatible("microsoft,denali") &&
+@@ -1967,8 +2009,11 @@
+ 		     atomic_read_acquire(&wsa884x->fullio_pa_teardowns) ||
+ 		     snapshot.epoch != atomic64_read_acquire(&wsa884x->fullio_pa_epoch)))
+ 		ret = -EAGAIN;
+-	if (!ret)
++	if (!ret) {
++		if (snapshot.sink_sampled)
++			WRITE_ONCE(wsa884x->fullio_sink_bank_observed, true);
+ 		*result = snapshot;
++	}
+ put:
+ 	pm_runtime_mark_last_busy(wsa884x->dev);
+ 	pm_runtime_put_autosuspend(wsa884x->dev);
+@@ -2018,6 +2063,10 @@
+ 		return ret;
+ 	dev_dbg(component->dev, "FullIO PA snapshot: en=%#x state=%#x/%#x\n",
+ 		snapshot.enable, snapshot.sta0, snapshot.sta1);
++	if (snapshot.sink_sampled)
++		dev_info(component->dev,
++			 "FullIO PA-off sink bank %u: enabled DP1 BlockCtrl3=0x00 DP2 Offset2=0x07 DP3 Offset2=0x1f verified\n",
++			 snapshot.sink_bank);
+ 	if (snapshot.vphx_sampled)
+ 		dev_info(component->dev, "FullIO PA-off VPHX_STATUS=%#x\n", snapshot.vphx);
+ 	if (snapshot.gain_sampled)

@@ -1,0 +1,59 @@
+Subject: [EXPERIMENT] ASoC: read WSA gain registers while the PA is blocked
+
+The ALSA mixer cap is not a live DRE readback. Sample DRE_CTL_0/1
+inside the existing same-codec PA-off snapshot and reject a stale
+sample. No register writes and no PA-on mode are added.
+
+diff --git a/sound/soc/codecs/wsa884x.c b/sound/soc/codecs/wsa884x.c
+index 7a74e74..964dc5e 100755
+--- a/sound/soc/codecs/wsa884x.c
++++ b/sound/soc/codecs/wsa884x.c
+@@ -1810,6 +1810,8 @@ static const struct snd_soc_component_driver wsa884x_component_drv = {
+ 
+ struct wsa884x_fullio_pa_snapshot {
+ 	unsigned int enable, sta0, sta1, err0, err1;
++	unsigned int dre0, dre1;
++	bool gain_sampled;
+ 	s64 epoch;
+ };
+ 
+@@ -1819,6 +1821,7 @@ static int wsa884x_fullio_read_pa(struct snd_soc_component *component, bool read
+ {
+ 	struct wsa884x_fullio_pa_snapshot snapshot = {};
+ 	struct wsa884x_priv *wsa884x;
++	struct device_node *sound;
+ 	unsigned int before;
+ 	int ret;
+ 
+@@ -1849,6 +1852,18 @@ static int wsa884x_fullio_read_pa(struct snd_soc_component *component, bool read
+ 		ret = regmap_read_bypassed(wsa884x->regmap, WSA884X_PA_FSM_ERR_COND0, &snapshot.err0);
+ 	if (!ret && read_faults)
+ 		ret = regmap_read_bypassed(wsa884x->regmap, WSA884X_PA_FSM_ERR_COND1, &snapshot.err1);
++	sound = component->card ? component->card->dev->of_node : NULL;
++	if (!ret && !read_faults && !(before & WSA884X_PA_FSM_EN_GLOBAL_PA_EN_MASK) &&
++	    of_machine_is_compatible("microsoft,denali") &&
++	    of_property_read_bool(sound, "microsoft,denali-fullio-muted-test") &&
++	    of_property_read_bool(sound, "microsoft,denali-fullio-clock-off-audit") &&
++	    of_property_read_bool(sound, "microsoft,denali-fullio-pa-off-gain-audit") &&
++	    !of_property_read_bool(sound, "microsoft,denali-fullio-post-pa-test")) {
++		ret = regmap_read_bypassed(wsa884x->regmap, WSA884X_DRE_CTL_0, &snapshot.dre0);
++		if (!ret)
++			ret = regmap_read_bypassed(wsa884x->regmap, WSA884X_DRE_CTL_1, &snapshot.dre1);
++		snapshot.gain_sampled = !ret;
++	}
+ 	if (!ret)
+ 		ret = regmap_read_bypassed(wsa884x->regmap, WSA884X_PA_FSM_EN, &snapshot.enable);
+ 	if (!ret && READ_ONCE(wsa884x->slave->status) != SDW_SLAVE_ATTACHED)
+@@ -1905,6 +1920,12 @@ int wsa884x_fullio_pa_off(struct snd_soc_component *component)
+ 		return ret;
+ 	dev_dbg(component->dev, "FullIO PA snapshot: en=%#x state=%#x/%#x\n",
+ 		snapshot.enable, snapshot.sta0, snapshot.sta1);
++	if (snapshot.gain_sampled)
++		dev_info(component->dev,
++			 "FullIO PA-off gain snapshot: DRE0=%#x DRE1=%#x CSR_GAIN=%u CSR_GAIN_EN=%u\n",
++			 snapshot.dre0, snapshot.dre1,
++			 (unsigned int)FIELD_GET(WSA884X_DRE_CTL_1_CSR_GAIN_MASK, snapshot.dre1),
++			 !!(snapshot.dre1 & WSA884X_DRE_CTL_1_CSR_GAIN_EN_MASK));
+ 	return snapshot.enable & WSA884X_PA_FSM_EN_GLOBAL_PA_EN_MASK ? -EBUSY : 0;
+ }
+ EXPORT_SYMBOL_GPL(wsa884x_fullio_pa_off);

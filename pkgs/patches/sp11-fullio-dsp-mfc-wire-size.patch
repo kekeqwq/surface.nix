@@ -1,0 +1,32 @@
+Subject: [EXPERIMENT] ASoC: retain the exact FullIO MFC command size
+
+The pinned stereo MFC prelude has a 12-byte body and a 28-byte frame.
+Permit only that one unaligned single frame; keep strict alignment for
+calibration frames and aggregates.
+
+diff --git a/sound/soc/qcom/qdsp6/q6apm.c b/sound/soc/qcom/qdsp6/q6apm.c
+index 09b9a8a..5f315ec 100644
+--- a/sound/soc/qcom/qdsp6/q6apm.c
++++ b/sound/soc/qcom/qdsp6/q6apm.c
+@@ -244,8 +244,20 @@ static int q6apm_fullio_validate_frames(const void *data, size_t bytes, bool sin
+ 	const u8 *frame = data;
+ 	unsigned int count = 0;
+ 
+-	if (!data || !bytes || bytes > SZ_16K || !IS_ALIGNED(bytes, 8))
++	if (!data || !bytes || bytes > SZ_16K)
+ 		return -EINVAL;
++	/* The v19c MFC command is a single 28-byte, unpadded payload.
++	 * Do not relax the alignment rule for other frames or OOB records.
++	 */
++	if (!IS_ALIGNED(bytes, 8)) {
++		if (!single || bytes != 28 || get_unaligned_le32(frame) != 0x466a ||
++		    get_unaligned_le32(frame + 4) != PARAM_ID_MFC_OUTPUT_MEDIA_FORMAT ||
++		    get_unaligned_le32(frame + 8) != 12 || get_unaligned_le32(frame + 12) ||
++		    get_unaligned_le32(frame + 16) != 48000 ||
++		    get_unaligned_le16(frame + 20) != 16 || get_unaligned_le16(frame + 22) != 2)
++			return -EINVAL;
++		return 0;
++	}
+ 	while (bytes) {
+ 		u32 size;
+ 		size_t step;

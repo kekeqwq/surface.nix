@@ -1,0 +1,136 @@
+Subject: [EXPERIMENT] soundwire: qcom: allocate Denali FullIO feedback ports
+
+Adapt the VI/CPS master stream routing and port sharing from the Golden v32
+overlay of geocausa/SP11X1e-audio@3232e1dacdeb580a10a9cb8d4756a4518a7bd83e.
+Opt in only for the Denali WSA controller. Do not change gains or add vendor
+wake-register writes. Both feedback sources are required before allocating.
+
+diff --git a/drivers/soundwire/qcom.c b/drivers/soundwire/qcom.c
+index a4cb628..ef45b97 100755
+--- a/drivers/soundwire/qcom.c
++++ b/drivers/soundwire/qcom.c
+@@ -1288,6 +1288,9 @@ static void qcom_swrm_stream_free_ports(struct qcom_swrm_ctrl *ctrl,
+ 	mutex_lock(&ctrl->port_lock);
+ 
+ 	list_for_each_entry(m_rt, &stream->master_list, stream_node) {
++		if (&ctrl->bus != m_rt->bus)
++			continue;
++
+ 		port_mask = &ctrl->port_mask;
+ 		list_for_each_entry(p_rt, &m_rt->port_list, port_node)
+ 			clear_bit(p_rt->num, port_mask);
+@@ -1368,6 +1371,83 @@ static int qcom_swrm_stream_alloc_ports(struct qcom_swrm_ctrl *ctrl,
+ 	return 0;
+ }
+ 
++/* FullIO exposes the feedback as ALSA companion playback, while the
++ * physical SoundWire data flows from the codecs into the controller.
++ */
++static bool qcom_swrm_denali_feedback(struct qcom_swrm_ctrl *ctrl, int id)
++{
++	return of_machine_is_compatible("microsoft,denali") &&
++	       of_property_read_bool(ctrl->dev->of_node, "qcom,denali-fullio-feedback") &&
++	       ctrl->bus.controller_id == MASTER_ID_WSA &&
++	       ctrl->num_dout_ports == 9 && ctrl->nports >= 13 &&
++	       (id == 9 || id == 10);
++}
++
++static int qcom_swrm_denali_alloc_feedback(struct qcom_swrm_ctrl *ctrl,
++					  struct sdw_stream_runtime *stream,
++					  int dai_id, unsigned int rate)
++{
++	bool cps = dai_id == 10;
++	struct sdw_stream_config config = {
++		.direction = SDW_DATA_DIR_TX,
++		.ch_count = 1,
++		.frame_rate = rate,
++		.type = SDW_STREAM_PDM,
++		.bps = 1,
++	};
++	struct sdw_port_config ports[2] = {};
++	struct sdw_master_runtime *m_rt;
++	struct sdw_slave_runtime *s_rt;
++	struct sdw_port_runtime *p_rt;
++	unsigned long requested = 0;
++	unsigned int nports = 0, sources = 0, port, i;
++	int ret;
++
++	if (!stream || rate != (cps ? 24000 : 8000))
++		return -EINVAL;
++
++	guard(mutex)(&ctrl->port_lock);
++	list_for_each_entry(m_rt, &stream->master_list, stream_node) {
++		if (&ctrl->bus != m_rt->bus)
++			continue;
++
++		list_for_each_entry(s_rt, &m_rt->slave_rt_list, m_rt_node) {
++			if (s_rt->direction != SDW_DATA_DIR_TX ||
++			    !list_is_singular(&s_rt->port_list))
++				return -EINVAL;
++			p_rt = list_first_entry(&s_rt->port_list, struct sdw_port_runtime, port_node);
++			if (p_rt->num != (cps ? 6 : 5) || p_rt->ch_mask != 3)
++				return -EINVAL;
++			port = s_rt->slave->m_port_map[p_rt->num];
++			if (cps ? port != 13 : port != 10 && port != 11)
++				return -EINVAL;
++			if (test_bit(port, &ctrl->port_mask))
++				return -EBUSY;
++			if (++sources > 2)
++				return -EINVAL;
++
++			/* CPS DP6 on both codecs shares exactly one physical master port. */
++			for (i = 0; i < nports; i++)
++				if (ports[i].num == port)
++					break;
++			if (i == nports) {
++				ports[nports++].num = port;
++				set_bit(port, &requested);
++			}
++			ports[i].ch_mask |= p_rt->ch_mask;
++		}
++	}
++
++	if (sources != 2 || nports != (cps ? 1 : 2))
++		return -EINVAL;
++
++	ret = sdw_stream_add_master(&ctrl->bus, &config, ports, nports, stream);
++	if (!ret)
++		ctrl->port_mask |= requested;
++
++	return ret;
++}
++
+ static int qcom_swrm_hw_params(struct snd_pcm_substream *substream,
+ 			       struct snd_pcm_hw_params *params,
+ 			      struct snd_soc_dai *dai)
+@@ -1376,6 +1456,11 @@ static int qcom_swrm_hw_params(struct snd_pcm_substream *substream,
+ 	struct sdw_stream_runtime *sruntime = ctrl->sruntime[dai->id];
+ 	int ret;
+ 
++	if (substream->stream == SNDRV_PCM_STREAM_PLAYBACK &&
++	    qcom_swrm_denali_feedback(ctrl, dai->id))
++		return qcom_swrm_denali_alloc_feedback(ctrl, sruntime, dai->id,
++						      params_rate(params));
++
+ 	ret = qcom_swrm_stream_alloc_ports(ctrl, sruntime, params,
+ 					   substream->stream);
+ 	if (ret)
+@@ -1487,6 +1572,18 @@ static int qcom_swrm_register_dais(struct qcom_swrm_ctrl *ctrl)
+ 		stream->rates = SNDRV_PCM_RATE_48000;
+ 		stream->formats = SNDRV_PCM_FMTBIT_S16_LE;
+ 
++		if (qcom_swrm_denali_feedback(ctrl, i)) {
++			bool cps = i == 10;
++
++			dais[i].playback = (struct snd_soc_pcm_stream) {
++				.stream_name = cps ? "SoundWire CPS Protection" : "SoundWire VI Protection",
++				.channels_min = 1,
++				.channels_max = 1,
++				.rates = cps ? SNDRV_PCM_RATE_24000 : SNDRV_PCM_RATE_8000,
++				.formats = SNDRV_PCM_FMTBIT_S32_LE,
++			};
++		}
++
+ 		dais[i].ops = &qcom_swrm_pdm_dai_ops;
+ 		dais[i].id = i;
+ 	}

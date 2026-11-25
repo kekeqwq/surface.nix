@@ -1,0 +1,112 @@
+Subject: [EXPERIMENT] ASoC: resolve the FullIO amplifier pair on one runtime
+
+Reject missing links, ambiguous roles, foreign card components and
+roles aliasing the same device. Keep PA-off validation and render lockout.
+
+diff --git a/sound/soc/qcom/qdsp6/q6apm-dai.c b/sound/soc/qcom/qdsp6/q6apm-dai.c
+index 7225abf..e289c9e 100644
+--- a/sound/soc/qcom/qdsp6/q6apm-dai.c
++++ b/sound/soc/qcom/qdsp6/q6apm-dai.c
+@@ -389,43 +389,75 @@ static int q6apm_feedback_probe_rate(struct snd_soc_card *card)
+ 	return -EINVAL;
+ }
+ 
++struct q6apm_fullio_amp_pair {
++	struct snd_soc_component *left;
++	struct snd_soc_component *right;
++};
++
++/* Resolve both roles on the same runtime before reading either amplifier.
++ * The caller owns the card's PCM/runtime lifetime; do not cache these pointers.
++ */
++static int q6apm_fullio_amp_pair(struct snd_soc_card *card, const char *link,
++				struct q6apm_fullio_amp_pair *pair)
++{
++	struct snd_soc_pcm_runtime *rtd, *target = NULL;
++	struct snd_soc_dai *codec;
++	int i;
++
++	for_each_card_rtds(card, rtd) {
++		if (strcmp(rtd->dai_link->name, link))
++			continue;
++		if (target)
++			return -EEXIST;
++		target = rtd;
++	}
++	if (!target)
++		return -ENODEV;
++
++	for_each_rtd_codec_dais(target, i, codec) {
++		struct snd_soc_component *component = codec->component;
++		const char *prefix = component->name_prefix;
++		struct snd_soc_component **slot;
++
++		if (prefix && !strcmp(prefix, "SpkrLeft"))
++			slot = &pair->left;
++		else if (prefix && !strcmp(prefix, "SpkrRight"))
++			slot = &pair->right;
++		else
++			continue;
++		if (component->card != card || !component->dev)
++			return -ENODEV;
++		if (*slot)
++			return -EEXIST;
++		*slot = component;
++	}
++
++	if (!pair->left || !pair->right)
++		return -ENODEV;
++	if (pair->left->dev == pair->right->dev)
++		return -EEXIST;
++	return 0;
++}
++
+ static int q6apm_fullio_both_pa_off(void *ctx)
+ {
+ 	struct snd_soc_card *card = ctx;
+-	struct snd_soc_pcm_runtime *rtd;
+-	struct snd_soc_dai *codec;
++	struct q6apm_fullio_amp_pair pair = {};
+ 	const char *link = "WSA Playback";
+-	unsigned int seen = 0, bit;
+-	int i, ret, probe_rate = q6apm_feedback_probe_rate(card);
++	int ret, probe_rate = q6apm_feedback_probe_rate(card);
+ 
+ 	if (probe_rate < 0)
+ 		return probe_rate;
+ 	if (probe_rate)
+ 		link = probe_rate == 8000 ? "WSA VI Protection" : "WSA CPS Protection";
+ 
+-	for_each_card_rtds(card, rtd) {
+-		if (strcmp(rtd->dai_link->name, link))
+-			continue;
+-		for_each_rtd_codec_dais(rtd, i, codec) {
+-			const char *prefix = codec->component->name_prefix;
+-
+-			if (!prefix)
+-				continue;
+-			if (!strcmp(prefix, "SpkrLeft"))
+-				bit = BIT(0);
+-			else if (!strcmp(prefix, "SpkrRight"))
+-				bit = BIT(1);
+-			else
+-				continue;
+-			if (seen & bit)
+-				return -EEXIST;
+-			ret = wsa884x_fullio_pa_off(codec->component);
+-			if (ret)
+-				return ret;
+-			seen |= bit;
+-		}
+-	}
+-	return seen == (BIT(0) | BIT(1)) ? 0 : -ENODEV;
++	ret = q6apm_fullio_amp_pair(card, link, &pair);
++	if (ret)
++		return ret;
++	ret = wsa884x_fullio_pa_off(pair.left);
++	if (ret)
++		return ret;
++	return wsa884x_fullio_pa_off(pair.right);
+ }
+ 
+ static int q6apm_fullio_prepare_cal(struct q6apm_dai_data *pdata,

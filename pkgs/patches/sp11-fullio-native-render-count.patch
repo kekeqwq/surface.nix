@@ -1,0 +1,35 @@
+ASoC: q6apm: keep the render owner count on the native FullIO graph
+
+The endpoint controls and CLOSE proof resolve a running render by start_count. Publish it only after the tokened DSP START and clear it only after the tokened STOP.
+
+--- a/sound/soc/qcom/qdsp6/q6apm.c
++++ b/sound/soc/qcom/qdsp6/q6apm.c
+@@ -1915,13 +1915,15 @@
+ 	    !q6apm_fullio_mute_is_verified(graph))
+ 		return -EPERM;
+ 	if (ring->state == FULLIO_PULL_RUNNING)
+-		return 0;
++		return READ_ONCE(ar->start_count) ? 0 : -ENOTRECOVERABLE;
+ 	if (ring->state != FULLIO_PULL_NEW || !ring->pcm_buffer.bytes || ar->start_count)
+ 		return -ENOTRECOVERABLE;
+ 	ring->state = FULLIO_PULL_UNCERTAIN;
+ 	ret = audioreach_graph_mgmt_transaction(ar, APM_CMD_GRAPH_START, true);
+ 	if (ret)
+ 		return ret;
++	/* The endpoint controls and CLOSE proof track this owner count. */
++	WRITE_ONCE(ar->start_count, 1);
+ 	ring->state = FULLIO_PULL_RUNNING;
+ 	return q6apm_fullio_mute_is_verified(graph) ? 0 : -ESTALE;
+ }
+@@ -1942,8 +1944,10 @@
+ 		return -ENOTRECOVERABLE;
+ 	ring->state = FULLIO_PULL_STOP_UNVERIFIED;
+ 	ret = audioreach_graph_mgmt_transaction(ar, APM_CMD_GRAPH_STOP, true);
+-	if (!ret)
++	if (!ret) {
+ 		ring->state = FULLIO_PULL_STOPPED;
++		WRITE_ONCE(ar->start_count, 0);
++	}
+ 	return ret;
+ }
+ EXPORT_SYMBOL_GPL(q6apm_fullio_pcm_stop);

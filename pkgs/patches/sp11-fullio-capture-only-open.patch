@@ -1,0 +1,46 @@
+Subject: [EXPERIMENT] ASoC: deny all render opens in the MicArray desktop fixture
+
+A Mic-only UCM profile was not sufficient to avoid ACP playback PCM
+probes. Reject PCM playback and compressed playback at component open,
+before opening any DSP graph or configuring any render backend. Keep
+capture and all other fixtures unchanged.
+
+--- a/sound/soc/qcom/qdsp6/q6apm-dai.c
++++ b/sound/soc/qcom/qdsp6/q6apm-dai.c
+@@ -1016,6 +1016,15 @@
+ 	}
+ 
+ 	return ret;
++}
++
++static bool q6apm_fullio_capture_only(struct snd_soc_component *component)
++{
++	struct snd_soc_card *card = component->card;
++
++	return card && of_machine_is_compatible("microsoft,denali") &&
++	       of_property_read_bool(card->dev->of_node,
++				     "microsoft,denali-fullio-capture-only");
+ }
+ 
+ static int q6apm_dai_open(struct snd_soc_component *component,
+@@ -1029,6 +1038,10 @@
+ 	struct q6apm_dai_rtd *prtd;
+ 	int graph_id, probe_rate, ret;
+ 
++	/* Desktop device probes must not allocate or open a render graph. */
++	if (substream->stream == SNDRV_PCM_STREAM_PLAYBACK && q6apm_fullio_capture_only(component))
++		return -EOPNOTSUPP;
++
+ 	graph_id = cpu_dai->driver->id;
+ 	probe_rate = q6apm_feedback_probe_rate(component->card);
+ 	if (probe_rate < 0)
+@@ -1386,6 +1399,9 @@
+ 	int ret, size;
+ 	int graph_id;
+ 
++	if (q6apm_fullio_capture_only(component))
++		return -EOPNOTSUPP;
++
+ 	graph_id = cpu_dai->driver->id;
+ 	pdata = snd_soc_component_get_drvdata(component);
+ 	if (!pdata)

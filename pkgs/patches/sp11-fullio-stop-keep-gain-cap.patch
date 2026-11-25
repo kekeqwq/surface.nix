@@ -1,0 +1,70 @@
+Subject: [EXPERIMENT] ASoC: WSA884x: preserve FullIO gain cap through shutdown
+
+Do not clear manual DRE gain while the PA may still be enabled.
+Retain the cap during the FullIO mute paths and reject an epoch
+change during uncached PA-off verification. Non-FullIO behavior
+remains unchanged. No PA-on or shutdown fallback is added.
+
+--- a/sound/soc/codecs/wsa884x.c
++++ b/sound/soc/codecs/wsa884x.c
+@@ -2132,21 +2132,20 @@
+ 
+ /* Stop path for a future, explicitly armed post-PA transaction. Never
+  * invoked from an IRQ or a SoundWire status notifier. Check readback even
+- * if either write failed: a write error is not evidence that PA is off.
++ * if the PA write failed: a write error is not evidence that PA is off.
+  */
+ static int wsa884x_fullio_verified_stop(struct snd_soc_component *component,
+ 					struct wsa884x_priv *amp)
+ {
+ 	unsigned int value;
+-	int dre, pa, verify, clock;
++	int pa, verify, clock;
++	s64 epoch;
+ 
+ 	atomic_inc_return(&amp->fullio_pa_teardowns);
+-	atomic64_inc_return(&amp->fullio_pa_epoch);
++	epoch = atomic64_inc_return(&amp->fullio_pa_epoch);
+ 	clock = wsa_macro_fullio_clock_off_for_pa(component);
+ 
+-	/* Try both writes regardless of the clock or DRE result. */
+-	dre = regmap_write_bits(amp->regmap, WSA884X_DRE_CTL_1,
+-				WSA884X_DRE_CTL_1_CSR_GAIN_EN_MASK, 0);
++	/* Keep the gain cap in force even if the PA-off write fails. */
+ 	pa = regmap_write_bits(amp->regmap, WSA884X_PA_FSM_EN,
+ 			       WSA884X_PA_FSM_EN_GLOBAL_PA_EN_MASK, 0);
+ 	verify = regmap_read_bypassed(amp->regmap, WSA884X_PA_FSM_EN, &value);
+@@ -2154,12 +2153,14 @@
+ 		verify = -EBUSY;
+ 	if (!verify && READ_ONCE(amp->slave->status) != SDW_SLAVE_ATTACHED)
+ 		verify = -ENODEV;
++	if (!verify && epoch != atomic64_read_acquire(&amp->fullio_pa_epoch))
++		verify = -ESTALE;
+ 	atomic_dec_return(&amp->fullio_pa_teardowns);
+-	if (clock || dre < 0 || pa < 0 || verify)
++	if (clock || pa < 0 || verify)
+ 		dev_err_ratelimited(component->dev,
+-			"FullIO PA shutdown not fully verified: clock=%d DRE=%d PA=%d readback=%d\n",
+-			clock, dre, pa, verify);
+-	return verify ?: (pa < 0 ? pa : dre < 0 ? dre : clock);
++			"FullIO PA shutdown not fully verified: clock=%d PA=%d readback=%d\n",
++			clock, pa, verify);
++	return verify ?: (pa < 0 ? pa : clock);
+ }
+ 
+ static bool wsa884x_fullio_pa_stop_audit(struct snd_soc_component *component)
+@@ -2278,10 +2279,11 @@
+ 				return wsa884x_fullio_verified_stop(component, wsa884x);
+ 			atomic_inc_return(&wsa884x->fullio_pa_teardowns);
+ 			atomic64_inc_return(&wsa884x->fullio_pa_epoch);
++		} else {
++			snd_soc_component_write_field(component, WSA884X_DRE_CTL_1,
++						      WSA884X_DRE_CTL_1_CSR_GAIN_EN_MASK,
++						      0x0);
+ 		}
+-		snd_soc_component_write_field(component, WSA884X_DRE_CTL_1,
+-					      WSA884X_DRE_CTL_1_CSR_GAIN_EN_MASK,
+-					      0x0);
+ 		snd_soc_component_write_field(component, WSA884X_PA_FSM_EN,
+ 					      WSA884X_PA_FSM_EN_GLOBAL_PA_EN_MASK,
+ 					      0x0);

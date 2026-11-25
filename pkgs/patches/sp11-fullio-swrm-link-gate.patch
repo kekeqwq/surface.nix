@@ -1,0 +1,115 @@
+Subject: [EXPERIMENT] soundwire: qcom: gate new FullIO streams after a reported link fault
+
+A reported clash or failed clock-stop exit is unsafe for new FullIO
+streams even if the runtime PM state subsequently reads active. Latch
+the first failure for the scoped controller. Do not change bus/IRQ
+recovery or teardown. A policy-only test setting seeds the same latch
+without making any hardware operation fail or forging a bus status.
+
+--- a/drivers/soundwire/qcom.c
++++ b/drivers/soundwire/qcom.c
+@@ -217,6 +217,8 @@
+ 	u32 cps_saved_route;
+ 	u32 cps_saved_pcm;
+ 	u32 intr_mask;
++	bool fullio_link_gate;
++	int fullio_link_error; /* First failure, sticky for the controller lifetime. */
+ 	u8 rcmd_id;
+ 	u8 wcmd_id;
+ 	/* Port numbers are 1 - 14 */
+@@ -636,6 +638,18 @@
+ 	return SDW_CMD_IGNORED;
+ }
+ 
++static void qcom_swrm_fullio_latch_link_error(struct qcom_swrm_ctrl *ctrl, int error)
++{
++	if (ctrl->fullio_link_gate && error < 0 &&
++	    !cmpxchg(&ctrl->fullio_link_error, 0, error))
++		dev_err(ctrl->dev, "FullIO SoundWire new streams locked: first link error %d\n", error);
++}
++
++static int qcom_swrm_fullio_new_stream_ok(struct qcom_swrm_ctrl *ctrl)
++{
++	return READ_ONCE(ctrl->fullio_link_error) ? -ENOTRECOVERABLE : 0;
++}
++
+ static bool qcom_swrm_fullio_pm_audit(struct qcom_swrm_ctrl *ctrl)
+ {
+ 	return !ctrl->clock_stop_not_supported &&
+@@ -832,6 +846,7 @@
+ 				}
+ 				break;
+ 			case SWRM_INTERRUPT_STATUS_MASTER_CLASH_DET:
++				qcom_swrm_fullio_latch_link_error(ctrl, -EIO);
+ 				dev_err_ratelimited(ctrl->dev,
+ 						"%s: SWR bus clsh detected\n",
+ 						__func__);
+@@ -1599,6 +1614,9 @@
+ 	struct sdw_stream_runtime *sruntime = ctrl->sruntime[dai->id];
+ 	int ret;
+ 
++	ret = qcom_swrm_fullio_new_stream_ok(ctrl);
++	if (ret)
++		return ret;
+ 	if (qcom_swrm_denali_feedback(ctrl, dai->id)) {
+ 		if (qcom_swrm_fullio_capture_probe(ctrl)) {
+ 			struct snd_soc_pcm_runtime *rtd = snd_soc_substream_to_rtd(substream);
+@@ -1663,6 +1681,9 @@
+ 	struct qcom_swrm_ctrl *ctrl = dev_get_drvdata(dai->dev);
+ 	int ret;
+ 
++	ret = qcom_swrm_fullio_new_stream_ok(ctrl);
++	if (ret)
++		return ret;
+ 	ret = pm_runtime_get_sync(ctrl->dev);
+ 	if (ret < 0 && ret != -EACCES) {
+ 		dev_err_ratelimited(ctrl->dev,
+@@ -1672,7 +1693,10 @@
+ 		return ret;
+ 	}
+ 
+-	return 0;
++	ret = qcom_swrm_fullio_new_stream_ok(ctrl);
++	if (ret)
++		pm_runtime_put_autosuspend(ctrl->dev);
++	return ret;
+ }
+ 
+ static void qcom_swrm_shutdown(struct snd_pcm_substream *substream,
+@@ -1941,6 +1965,15 @@
+ 	clk_prepare_enable(ctrl->hclk);
+ 
+ 	ctrl->dev = dev;
++	ctrl->fullio_link_gate = of_machine_is_compatible("microsoft,denali") &&
++		of_property_read_bool(dev->of_node, "qcom,denali-fullio-feedback") &&
++		of_property_read_bool(dev->of_node, "qcom,denali-fullio-link-gate");
++	if (ctrl->fullio_link_gate &&
++	    of_property_read_bool(dev->of_node, "qcom,denali-fullio-link-gate-test")) {
++		/* Synthetic policy denial only; never touch the bus or IRQ state. */
++		dev_info(dev, "FullIO test: seed new-stream denial without a hardware fault\n");
++		qcom_swrm_fullio_latch_link_error(ctrl, -ECANCELED);
++	}
+ 	dev_set_drvdata(&pdev->dev, ctrl);
+ 	mutex_init(&ctrl->port_lock);
+ 	init_completion(&ctrl->broadcast);
+@@ -2141,14 +2174,18 @@
+ 				ctrl->intr_mask);
+ 
+ 		usleep_range(100, 105);
+-		if (!swrm_wait_for_frame_gen_enabled(ctrl))
++		if (!swrm_wait_for_frame_gen_enabled(ctrl)) {
++			qcom_swrm_fullio_latch_link_error(ctrl, -ETIMEDOUT);
+ 			dev_err(ctrl->dev, "link failed to connect\n");
++		}
+ 
+ 		swrm_fullio_pm_snapshot(ctrl, "before-exit-clock-stop", 0);
+ 		ret = sdw_bus_exit_clk_stop(&ctrl->bus);
+ 		swrm_fullio_pm_snapshot(ctrl, "after-exit-clock-stop", ret);
+-		if (ret < 0)
++		if (ret < 0) {
++			qcom_swrm_fullio_latch_link_error(ctrl, ret);
+ 			dev_err(ctrl->dev, "bus failed to exit clock stop %d\n", ret);
++		}
+ 	}
+ 
+ 	return 0;

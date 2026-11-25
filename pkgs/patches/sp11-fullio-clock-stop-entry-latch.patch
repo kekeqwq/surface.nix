@@ -1,0 +1,25 @@
+Subject: [EXPERIMENT] soundwire: qcom: refuse new FullIO streams after failed clock-stop entry
+
+A failed prepare or clock-stop command can leave the link in an unknown
+state after masking clash notification. Preserve the existing error and
+IRQ/clock handling, but latch the first failure for opted-in FullIO
+controllers. Keep the existing empty-bus (-ENODATA) handling. This is
+an admission guard, not a recovery attempt or a loaded PA shutdown.
+
+--- a/drivers/soundwire/qcom.c
++++ b/drivers/soundwire/qcom.c
+@@ -2321,12 +2321,14 @@
+ 		/* Prepare slaves for clock stop */
+ 		ret = sdw_bus_prep_clk_stop(&ctrl->bus);
+ 		if (ret < 0 && ret != -ENODATA) {
++			qcom_swrm_fullio_latch_link_error(ctrl, ret);
+ 			dev_err(dev, "prepare clock stop failed %d", ret);
+ 			return ret;
+ 		}
+ 
+ 		ret = sdw_bus_clk_stop(&ctrl->bus);
+ 		swrm_fullio_pm_snapshot(ctrl, "after-enter-clock-stop", ret);
+ 		if (ret < 0 && ret != -ENODATA) {
++			qcom_swrm_fullio_latch_link_error(ctrl, ret);
+ 			dev_err(dev, "bus clock stop failed %d", ret);
+ 			return ret;

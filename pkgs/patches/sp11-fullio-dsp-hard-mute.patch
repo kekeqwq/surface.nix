@@ -1,0 +1,59 @@
+Subject: [EXPERIMENT] ASoC: require acknowledged stereo mute after FullIO calibration
+
+Send only a fixed FL/FR mute transaction after the existing sequence, with
+both PAs confirmed off before and after. Do not send gain, unmute, or start.
+
+diff --git a/sound/soc/qcom/qdsp6/audioreach.c b/sound/soc/qcom/qdsp6/audioreach.c
+index 7f8da28..d85221a 100644
+--- a/sound/soc/qcom/qdsp6/audioreach.c
++++ b/sound/soc/qcom/qdsp6/audioreach.c
+@@ -318,6 +318,37 @@ static int audioreach_fullio_bootstrap(struct q6apm_graph *graph,
+ 				      input_bytes - query_span, false);
+ }
+ 
++static int audioreach_fullio_acknowledge_mute(struct q6apm_graph *graph,
++					     const struct audioreach_fullio_stages *stages)
++{
++	/* The pinned endpoint ABI has eight slots, but only FL and FR are
++	 * selected. Unlike the reference stage, this packet has no unmute
++	 * variant, and it never writes a gain parameter.
++	 */
++	static const __le32 mute[30] = {
++		[0] = cpu_to_le32(0x4a63),
++		[1] = cpu_to_le32(0x08001039),
++		[2] = cpu_to_le32(104),
++		[4] = cpu_to_le32(8),
++		[5] = cpu_to_le32(0x2),
++		[7] = cpu_to_le32(1),
++		[8] = cpu_to_le32(0x4),
++		[10] = cpu_to_le32(1),
++	};
++	const struct audioreach_module_priv_data *stage = stages->stage[AR_FULLIO_MUTE];
++	int ret;
++
++	if (!stage || le32_to_cpu(stage->size) != sizeof(mute) ||
++	    get_unaligned_le32(stage->data) != 0x4a63 ||
++	    get_unaligned_le32(stage->data + 1) != 0x08001039)
++		return -EINVAL;
++	ret = q6apm_fullio_set_cfg_inband(graph, mute, sizeof(mute));
++	if (ret)
++		return dev_err_probe(graph->dev, ret, "FullIO endpoint stereo mute rejected\n");
++	dev_info(graph->dev, "FullIO endpoint stereo mute acknowledged\n");
++	return 0;
++}
++
+ /* Bootstrap includes reference VOL_CTRL defaults; no final-volume stage or
+  * GRAPH_START here. Validate hardware PA-off and conservative caps first.
+  */
+@@ -390,6 +421,11 @@ int audioreach_fullio_calibrate(struct q6apm_graph *graph,
+ 					     "FullIO calibration step %d (stage %d, op %d) failed\n",
+ 					     i + 1, steps[i].stage, steps[i].op);
+ 	}
++	ret = assert_pa_off(ctx);
++	if (!ret)
++		ret = audioreach_fullio_acknowledge_mute(graph, stages);
++	if (ret)
++		return ret;
+ 	return assert_pa_off(ctx);
+ }
+ EXPORT_SYMBOL_GPL(audioreach_fullio_calibrate);

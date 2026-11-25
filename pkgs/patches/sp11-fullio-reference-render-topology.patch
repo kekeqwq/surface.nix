@@ -1,0 +1,22 @@
+Subject: [EXPERIMENT] ASoC: accept the FullIO topology for the native Denali route
+
+The topology gate was introduced for the separate silent fixture. The
+native protected render route is also an explicitly selected Denali
+fixture (DT `microsoft,denali-fullio-reference-render`) and must load
+the same v19c graph. Everything else still rejects FullIO records.
+
+--- a/sound/soc/qcom/qdsp6/topology.c
++++ b/sound/soc/qcom/qdsp6/topology.c
+@@ -1186,6 +1186,9 @@ static int audioreach_widget_ready(struct snd_soc_component *component,
+ 				   struct snd_soc_tplg_dapm_widget *tplg_w)
+ {
+-	bool muted_fixture = of_machine_is_compatible("microsoft,denali") &&
+-		of_property_read_bool(component->card->dev->of_node,
+-				      "microsoft,denali-fullio-muted-test");
++	/* Explicit diagnostic or native fixtures may load the FullIO graph. */
++	bool muted_fixture = of_machine_is_compatible("microsoft,denali") &&
++		(of_property_read_bool(component->card->dev->of_node,
++				      "microsoft,denali-fullio-muted-test") ||
++		 of_property_read_bool(component->card->dev->of_node,
++				      "microsoft,denali-fullio-reference-render"));
+ 	int ret = audioreach_validate_private(&tplg_w->priv, muted_fixture);

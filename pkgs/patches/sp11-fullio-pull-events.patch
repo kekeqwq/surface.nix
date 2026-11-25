@@ -1,0 +1,100 @@
+FullIO: match Golden pull event registration in the PA-off DMA audit
+
+--- a/sound/soc/qcom/qdsp6/q6apm.c
++++ b/sound/soc/qcom/qdsp6/q6apm.c
+@@ -1314,10 +1314,9 @@
+ 	if (hdr->opcode == GPR_BASIC_RSP_RESULT) {
+ 		if (!result || data->payload_size < (int)sizeof(*result))
+ 			return -EINVAL;
+-		/* Async PCM buffer tokens can also use high bits. Only route
+-		 * reserved SET_CFG acknowledgements to the calibration waiter.
+-		 */
+-		if ((result->opcode == APM_CMD_SET_CFG || result->opcode == APM_CMD_GET_CFG) &&
++		/* Route only reserved FullIO control acknowledgements. */
++		if ((result->opcode == APM_CMD_SET_CFG || result->opcode == APM_CMD_GET_CFG ||
++		     result->opcode == APM_CMD_REGISTER_MODULE_EVENTS) &&
+ 		    q6apm_fullio_oob_reply(graph->apm, data))
+ 			return 0;
+ 	}
+@@ -1416,7 +1415,58 @@
+ 		break;
+ 	}
+ 	return 0;
++}
++
++static int q6apm_fullio_register_event(struct q6apm_graph *graph, u32 iid, u32 event_id,
++				     const void *config, size_t config_size)
++{
++	struct apm_module_register_events *event;
++	size_t payload_size = ALIGN(sizeof(*event) + config_size, 8);
++	struct gpr_pkt *pkt __free(kfree) =
++		audioreach_alloc_cmd_pkt(payload_size, APM_CMD_REGISTER_MODULE_EVENTS, 0,
++				       graph->port->id, iid);
++
++	if (IS_ERR(pkt))
++		return PTR_ERR(pkt);
++
++	event = (void *)pkt + GPR_HDR_SIZE + APM_CMD_HDR_SIZE;
++	memset(event, 0, payload_size);
++	event->module_instance_id = iid;
++	event->event_id = event_id;
++	event->is_register = 1;
++	event->event_config_payload_size = config_size;
++	if (config_size)
++		memcpy(event + 1, config, config_size);
++
++	return q6apm_fullio_oob_rpc(graph->apm, graph->port, pkt, NULL, NULL);
++}
++
++int q6apm_fullio_register_pull_events(struct q6apm_graph *graph, u32 period_bytes)
++{
++	const struct audioreach_module *pause;
++	const struct q6apm_fullio_ring *ring = graph->ar_graph->fullio_ring;
++	const __le32 levels[] = { cpu_to_le32(2), cpu_to_le32(period_bytes),
++				 cpu_to_le32(2 * period_bytes) };
++	int ret;
++
++	if (!audioreach_fullio_graph(graph->info) || graph->shm_iid != 0x4660 ||
++	    !ring || period_bytes != 1920 || ring->config_bytes != 2 * period_bytes)
++		return -EINVAL;
++	pause = q6apm_find_module_by_mid(graph, 0x07001019);
++	if (!pause || pause->instance_id != 0x466b)
++		return -EINVAL;
++
++	ret = q6apm_fullio_register_event(graph, graph->shm_iid,
++					 EVENT_ID_SH_MEM_PULL_PUSH_MODE_WATERMARK,
++					 levels, sizeof(levels));
++	if (ret)
++		return ret;
++	ret = q6apm_fullio_register_event(graph, pause->instance_id, 0x0800103f, NULL, 0);
++	if (ret)
++		return ret;
++	return q6apm_fullio_register_event(graph, pause->instance_id, 0x08001043, NULL, 0);
+ }
++EXPORT_SYMBOL_GPL(q6apm_fullio_register_pull_events);
+ 
+ int q6apm_register_watermark_event(struct q6apm_graph *graph, int water_mark_level_bytes,
+ 				   int num_levels)
+--- a/sound/soc/qcom/qdsp6/q6apm-dai.c
++++ b/sound/soc/qcom/qdsp6/q6apm-dai.c
+@@ -981,10 +981,10 @@
+ 			return ret;
+ 		if (dma_audit) {
+ 			WRITE_ONCE(prtd->fullio_ring_watermark_audit, true);
+-			ret = q6apm_register_watermark_event(prtd->graph, audit_period, 2);
++			ret = q6apm_fullio_register_pull_events(prtd->graph, audit_period);
+ 			if (ret)
+-				return dev_err_probe(dev, ret, "FullIO independent ring pull watermarks rejected\n");
+-			dev_info(dev, "FullIO independent ring pull watermarks accepted\n");
++				return dev_err_probe(dev, ret, "FullIO independent ring event registration rejected\n");
++			dev_info(dev, "FullIO independent ring pull watermarks and SOFT_PAUSE events acknowledged\n");
+ 			ret = q6apm_graph_media_format_shmem(prtd->graph, &cfg);
+ 			if (ret)
+ 				return dev_err_probe(dev, ret, "FullIO independent ring SHMEM media rejected\n");
+--- a/sound/soc/qcom/qdsp6/q6apm.h
++++ b/sound/soc/qcom/qdsp6/q6apm.h
+@@ -156,3 +156,4 @@
+ 			       size_t bytes, int sid, u32 config_bytes);
+ int q6apm_fullio_ring_position_audit(struct q6apm_graph *graph, bool started);
++int q6apm_fullio_register_pull_events(struct q6apm_graph *graph, u32 period_bytes);
+ /* For validated calibration only. These functions do not authorize playback. */

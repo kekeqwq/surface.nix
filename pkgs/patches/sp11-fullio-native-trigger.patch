@@ -1,0 +1,80 @@
+ASoC: q6apm: coordinate the reference paired PA start from PCM trigger
+
+PREPARE already runs the muted DSP graph. START only proves the mute epoch and coordinates both PAs plus protection clocks.
+Do not send a second DSP START and keep every muted/audit fixture on its existing path.
+--- a/sound/soc/qcom/qdsp6/q6apm-dai.c
++++ b/sound/soc/qcom/qdsp6/q6apm-dai.c
+@@ -418,6 +418,9 @@
+ 			      struct work_struct *work, bool arm);
+ int wsa884x_fullio_fault_inject(struct snd_soc_component *component);
+ int wsa884x_fullio_pa_ready(struct snd_soc_component *component, s64 *epoch);
++int wsa884x_fullio_start_pair(struct snd_soc_component *left,
++			     struct snd_soc_component *right,
++			     int (*verify_graph)(void *), void *context, int *stop_error);
+ #else
+ static int wsa884x_fullio_pa_off(struct snd_soc_component *component)
+ {
+@@ -444,6 +447,13 @@
+ {
+ 	return -EOPNOTSUPP;
+ }
++
++static int wsa884x_fullio_start_pair(struct snd_soc_component *left,
++				    struct snd_soc_component *right,
++				    int (*verify_graph)(void *), void *context, int *stop_error)
++{
++	return -EOPNOTSUPP;
++}
+ #endif
+ 
+ static int q6apm_feedback_probe_rate(struct snd_soc_card *card)
+@@ -1355,6 +1365,32 @@
+ 	return ret;
+ }
+ 
++static int q6apm_fullio_verify_start(void *arg)
++{
++	struct q6apm_graph *graph = arg;
++
++	if (!q6apm_fullio_mute_is_verified(graph))
++		return -ESTALE;
++	return 0;
++}
++
++/* The DSP graph is already running muted from PREPARE. Trigger START only
++ * coordinates the two PA transitions and the protection clocks, and never
++ * sends a second DSP transaction.
++ */
++static int q6apm_fullio_reference_start(struct q6apm_dai_rtd *prtd,
++					struct snd_soc_card *card)
++{
++	struct q6apm_fullio_amp_pair pair = {};
++	int ret, stop_error = 0;
++
++	ret = q6apm_fullio_amp_pair(card, "WSA Playback", &pair);
++	if (ret)
++		return ret;
++	return wsa884x_fullio_start_pair(pair.left, pair.right, q6apm_fullio_verify_start,
++					 prtd->graph, &stop_error);
++}
++
+ static int q6apm_dai_trigger(struct snd_soc_component *component,
+ 			     struct snd_pcm_substream *substream, int cmd)
+ {
+@@ -1366,8 +1402,15 @@
+ 	case SNDRV_PCM_TRIGGER_START:
+ 	case SNDRV_PCM_TRIGGER_RESUME:
+ 	case SNDRV_PCM_TRIGGER_PAUSE_RELEASE:
+-		if (audioreach_fullio_graph(prtd->graph->info))
++		if (prtd->fullio_reference_pcm) {
++			if (!prtd->fullio_reference_prepared)
++				return -EINVAL;
++			ret = q6apm_fullio_reference_start(prtd, component->card);
++			if (ret)
++				return ret;
++		} else if (audioreach_fullio_graph(prtd->graph->info)) {
+ 			return -EOPNOTSUPP;
++		}
+ 		q6apm_pcm_watermark_enable(prtd, true);
+ 		break;
+ 	case SNDRV_PCM_TRIGGER_STOP:

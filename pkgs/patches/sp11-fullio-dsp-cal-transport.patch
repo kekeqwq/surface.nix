@@ -1,0 +1,189 @@
+Subject: [EXPERIMENT] ASoC: q6apm: add token-checked FullIO calibration SET_CFG
+
+Build bounded in-band or mapped OOB SET_CFG packets for future use by the
+FullIO frontend. Require both enabled transports and do not reuse an OOB
+buffer after a failed command. No call sites or gain controls are enabled.
+
+diff --git a/sound/soc/qcom/qdsp6/q6apm.c b/sound/soc/qcom/qdsp6/q6apm.c
+index 527eab2..f95c4ce 100644
+--- a/sound/soc/qcom/qdsp6/q6apm.c
++++ b/sound/soc/qcom/qdsp6/q6apm.c
+@@ -4,6 +4,8 @@
+ #include <dt-bindings/soc/qcom,gpr.h>
+ #include <linux/cleanup.h>
+ #include <linux/delay.h>
++#include <linux/dma-mapping.h>
++#include <linux/unaligned.h>
+ #include <linux/jiffies.h>
+ #include <linux/kernel.h>
+ #include <linux/module.h>
+@@ -111,7 +113,8 @@ out:
+ 	return true;
+ }
+ 
+-static int q6apm_fullio_oob_rpc(struct q6apm *apm, struct gpr_pkt *pkt, u32 *handle)
++static int q6apm_fullio_oob_rpc(struct q6apm *apm, gpr_port_t *port,
++			       struct gpr_pkt *pkt, u32 *handle)
+ {
+ 	gpr_device_t *gdev = apm->gdev;
+ 	unsigned long flags;
+@@ -131,7 +134,7 @@ static int q6apm_fullio_oob_rpc(struct q6apm *apm, struct gpr_pkt *pkt, u32 *han
+ 	apm->fullio_oob_token = pkt->hdr.token;
+ 	spin_unlock_irqrestore(&apm->fullio_oob_lock, flags);
+ 
+-	ret = gpr_send_pkt(gdev, pkt);
++	ret = port ? gpr_send_port_pkt(port, pkt) : gpr_send_pkt(gdev, pkt);
+ 	if (ret >= 0 && !wait_for_completion_timeout(&apm->fullio_oob_done, 5 * HZ))
+ 		ret = -ETIMEDOUT;
+ 
+@@ -172,7 +175,7 @@ int q6apm_fullio_oob_map(struct q6apm *apm, struct q6apm_fullio_oob_region *regi
+ 	map->shm_addr_msw = upper_32_bits(region->dsp_addr);
+ 	map->mem_size_bytes = region->size;
+ 
+-	ret = q6apm_fullio_oob_rpc(apm, pkt, &region->handle);
++	ret = q6apm_fullio_oob_rpc(apm, NULL, pkt, &region->handle);
+ 	if (ret)
+ 		region->poisoned = true;
+ 	return ret;
+@@ -194,7 +197,7 @@ int q6apm_fullio_oob_unmap(struct q6apm *apm, struct q6apm_fullio_oob_region *re
+ 
+ 	cmd = (void *)pkt + GPR_HDR_SIZE;
+ 	cmd->mem_map_handle = region->handle;
+-	ret = q6apm_fullio_oob_rpc(apm, pkt, NULL);
++	ret = q6apm_fullio_oob_rpc(apm, NULL, pkt, NULL);
+ 	if (ret)
+ 		region->poisoned = true;
+ 	else
+@@ -203,6 +206,98 @@ int q6apm_fullio_oob_unmap(struct q6apm *apm, struct q6apm_fullio_oob_region *re
+ }
+ EXPORT_SYMBOL_GPL(q6apm_fullio_oob_unmap);
+ 
++static int q6apm_fullio_validate_frames(const void *data, size_t bytes, bool single)
++{
++	const u8 *frame = data;
++	unsigned int count = 0;
++
++	if (!data || !bytes || bytes > SZ_16K || !IS_ALIGNED(bytes, 8))
++		return -EINVAL;
++	while (bytes) {
++		u32 size;
++		size_t step;
++
++		if (bytes < APM_MODULE_PARAM_DATA_SIZE ||
++		    !get_unaligned_le32(frame) || !get_unaligned_le32(frame + 4) ||
++		    get_unaligned_le32(frame + 12))
++			return -EINVAL;
++		size = get_unaligned_le32(frame + 8);
++		if (!size || size > bytes - APM_MODULE_PARAM_DATA_SIZE)
++			return -EINVAL;
++		step = ALIGN(APM_MODULE_PARAM_DATA_SIZE + (size_t)size, 8);
++		if (step > bytes)
++			return -EINVAL;
++		frame += step;
++		bytes -= step;
++		count++;
++	}
++	return single && count != 1 ? -EINVAL : 0;
++}
++
++int q6apm_fullio_set_cfg_oob(struct q6apm_graph *graph,
++			   struct q6apm_fullio_oob_region *region, void *buffer,
++			   const void *data, size_t bytes, bool use_graph_port)
++{
++	struct apm_cmd_header *cmd;
++	int ret;
++
++	if (!graph->ar_graph || !buffer || !region->handle || region->poisoned ||
++	    bytes > region->size || (use_graph_port && !graph->port))
++		return -EINVAL;
++	ret = q6apm_fullio_validate_frames(data, bytes, false);
++	if (ret)
++		return ret;
++	if (!q6apm_fullio_transport_enabled(graph->apm))
++		return -EAGAIN;
++
++	struct gpr_pkt *pkt __free(kfree) = use_graph_port ?
++		audioreach_alloc_cmd_pkt(0, APM_CMD_SET_CFG, 0, graph->port->id,
++					APM_MODULE_INSTANCE_ID) :
++		audioreach_alloc_apm_cmd_pkt(0, APM_CMD_SET_CFG, 0);
++	if (IS_ERR(pkt))
++		return PTR_ERR(pkt);
++
++	cmd = (void *)pkt + GPR_HDR_SIZE;
++	cmd->payload_address_lsw = lower_32_bits(region->dsp_addr);
++	cmd->payload_address_msw = upper_32_bits(region->dsp_addr);
++	cmd->mem_map_handle = region->handle;
++	cmd->payload_size = bytes;
++
++	memset(buffer, 0, region->size);
++	memcpy(buffer, data, bytes);
++	dma_wmb();
++	ret = q6apm_fullio_oob_rpc(graph->apm, use_graph_port ? graph->port : NULL,
++				 pkt, NULL);
++	if (ret)
++		region->poisoned = true;
++	return ret;
++}
++EXPORT_SYMBOL_GPL(q6apm_fullio_set_cfg_oob);
++
++int q6apm_fullio_set_cfg_inband(struct q6apm_graph *graph, const void *data,
++			      size_t bytes)
++{
++	int ret;
++
++	if (!graph->ar_graph || !graph->port)
++		return -EINVAL;
++	ret = q6apm_fullio_validate_frames(data, bytes, true);
++	if (ret)
++		return ret;
++	if (!q6apm_fullio_transport_enabled(graph->apm))
++		return -EAGAIN;
++
++	struct gpr_pkt *pkt __free(kfree) =
++		audioreach_alloc_cmd_pkt(bytes, APM_CMD_SET_CFG, 0, graph->port->id,
++					APM_MODULE_INSTANCE_ID);
++	if (IS_ERR(pkt))
++		return PTR_ERR(pkt);
++
++	memcpy((void *)pkt + GPR_HDR_SIZE + APM_CMD_HDR_SIZE, data, bytes);
++	return q6apm_fullio_oob_rpc(graph->apm, graph->port, pkt, NULL);
++}
++EXPORT_SYMBOL_GPL(q6apm_fullio_set_cfg_inband);
++
+ static struct audioreach_graph *q6apm_get_audioreach_graph(struct q6apm *apm, uint32_t graph_id)
+ {
+ 	struct audioreach_graph_info *info;
+@@ -744,6 +839,16 @@ static int graph_callback(const struct gpr_resp_pkt *data, void *priv, int op)
+ 	int token;
+ 
+ 	result = data->payload;
++	if (hdr->opcode == GPR_BASIC_RSP_RESULT) {
++		if (!result || data->payload_size < (int)sizeof(*result))
++			return -EINVAL;
++		/* Async PCM buffer tokens can also use high bits. Only route
++		 * reserved SET_CFG acknowledgements to the calibration waiter.
++		 */
++		if (result->opcode == APM_CMD_SET_CFG &&
++		    q6apm_fullio_oob_reply(graph->apm, data))
++			return 0;
++	}
+ 
+ 	switch (hdr->opcode) {
+ 	case APM_EVENT_MODULE_TO_CLIENT:
+diff --git a/sound/soc/qcom/qdsp6/q6apm.h b/sound/soc/qcom/qdsp6/q6apm.h
+index 7e07efe..8f27e4d 100644
+--- a/sound/soc/qcom/qdsp6/q6apm.h
++++ b/sound/soc/qcom/qdsp6/q6apm.h
+@@ -150,6 +150,12 @@ struct q6apm_fullio_oob_region {
+ };
+ int q6apm_fullio_oob_map(struct q6apm *apm, struct q6apm_fullio_oob_region *region);
+ int q6apm_fullio_oob_unmap(struct q6apm *apm, struct q6apm_fullio_oob_region *region);
++/* For validated calibration only. These functions do not authorize playback. */
++int q6apm_fullio_set_cfg_oob(struct q6apm_graph *graph,
++			   struct q6apm_fullio_oob_region *region, void *buffer,
++			   const void *data, size_t bytes, bool use_graph_port);
++int q6apm_fullio_set_cfg_inband(struct q6apm_graph *graph, const void *data,
++			      size_t bytes);
+ 
+ int q6apm_find_integrated_backend(struct device *dev, u32 backend, int *owner);
+ struct q6apm_graph *q6apm_graph_open(struct device *dev, q6apm_cb cb,

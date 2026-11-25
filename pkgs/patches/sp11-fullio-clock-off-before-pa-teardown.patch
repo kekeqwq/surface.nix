@@ -1,0 +1,114 @@
+Subject: [EXPERIMENT] ASoC: request clock shutdown before the first FullIO PA teardown
+
+Under the post-PA marker, revoke readiness and resolve the clock owner on
+the emitting PA playback link. Even if shutdown is unverified, still mute
+the amplifier. Default and muted fixtures do not enter this branch.
+
+diff --git a/sound/soc/codecs/lpass-wsa-macro.c b/sound/soc/codecs/lpass-wsa-macro.c
+index c5eecc1..8d15008 100755
+--- a/sound/soc/codecs/lpass-wsa-macro.c
++++ b/sound/soc/codecs/lpass-wsa-macro.c
+@@ -1697,6 +1697,45 @@ int wsa_macro_fullio_protclk(struct snd_soc_component *component, bool enable,
+ }
+ EXPORT_SYMBOL_GPL(wsa_macro_fullio_protclk);
+ 
++/* Called synchronously from playback mute, never from a SoundWire status
++ * notification. Resolve the clock owner from the emitter's own playback link.
++ */
++int wsa_macro_fullio_clock_off_for_pa(struct snd_soc_component *amp);
++int wsa_macro_fullio_clock_off_for_pa(struct snd_soc_component *amp)
++{
++	struct snd_soc_card *card = amp->card;
++	struct snd_soc_pcm_runtime *rtd, *target = NULL;
++	struct snd_soc_component *owner = NULL;
++	struct snd_soc_dai *codec;
++	unsigned int emitters = 0;
++	int i;
++
++	if (!wsa_macro_fullio_post_pa_probe(amp))
++		return -EOPNOTSUPP;
++	for_each_card_rtds(card, rtd) {
++		if (strcmp(rtd->dai_link->name, "WSA Playback"))
++			continue;
++		if (target)
++			return -EEXIST;
++		target = rtd;
++	}
++	if (!target)
++		return -ENODEV;
++	for_each_rtd_codec_dais(target, i, codec) {
++		if (codec->component == amp)
++			emitters++;
++		if (codec->component->driver != &wsa_macro_component_drv)
++			continue;
++		if (owner)
++			return -EEXIST;
++		owner = codec->component;
++	}
++	if (emitters != 1 || !owner || owner->card != card)
++		return -ENODEV;
++	return wsa_macro_fullio_protclk(owner, false, NULL, NULL);
++}
++EXPORT_SYMBOL_GPL(wsa_macro_fullio_clock_off_for_pa);
++
+ static void wsa_macro_enable_disable_vi_feedback(struct snd_soc_component *component,
+ 						 bool enable, u32 rate)
+ {
+diff --git a/sound/soc/codecs/wsa884x.c b/sound/soc/codecs/wsa884x.c
+index e2a903d..ec7c4ee 100755
+--- a/sound/soc/codecs/wsa884x.c
++++ b/sound/soc/codecs/wsa884x.c
+@@ -14,6 +14,7 @@
+ #include <linux/kernel.h>
+ #include <linux/module.h>
+ #include <linux/mutex.h>
++#include <linux/of.h>
+ #include <linux/pm_runtime.h>
+ #include <linux/property.h>
+ #include <linux/regmap.h>
+@@ -1961,10 +1962,20 @@ static int wsa884x_hw_free(struct snd_pcm_substream *substream,
+ 	return 0;
+ }
+ 
++#if IS_REACHABLE(CONFIG_SND_SOC_LPASS_WSA_MACRO)
++int wsa_macro_fullio_clock_off_for_pa(struct snd_soc_component *amp);
++#else
++static int wsa_macro_fullio_clock_off_for_pa(struct snd_soc_component *amp)
++{
++	return -EOPNOTSUPP;
++}
++#endif
++
+ static int wsa884x_mute_stream(struct snd_soc_dai *dai, int mute, int stream)
+ {
+ 	struct snd_soc_component *component = dai->component;
+ 	struct wsa884x_priv *wsa884x = dev_get_drvdata(dai->dev);
++	int clock_ret = 0;
+ 
+ 	if (dai->id != WSA884X_DAI_PLAYBACK)
+ 		return 0;
+@@ -1977,7 +1988,15 @@ static int wsa884x_mute_stream(struct snd_soc_dai *dai, int mute, int stream)
+ 		if (wsa884x->feedback_enabled) {
+ 			atomic_inc_return(&wsa884x->fullio_pa_teardowns);
+ 			atomic64_inc_return(&wsa884x->fullio_pa_epoch);
++			if (component->card && of_machine_is_compatible("microsoft,denali") &&
++			    of_property_read_bool(component->card->dev->of_node,
++						  "microsoft,denali-fullio-post-pa-test"))
++				clock_ret = wsa_macro_fullio_clock_off_for_pa(component);
++			if (clock_ret)
++				dev_err_ratelimited(component->dev,
++					"FullIO clock shutdown failed before PA mute: %d\n", clock_ret);
+ 		}
++		/* Do not abandon PA shutdown even if the clock write/readback failed. */
+ 		snd_soc_component_write_field(component, WSA884X_DRE_CTL_1,
+ 					      WSA884X_DRE_CTL_1_CSR_GAIN_EN_MASK,
+ 					      0x0);
+@@ -1995,7 +2014,7 @@ static int wsa884x_mute_stream(struct snd_soc_dai *dai, int mute, int stream)
+ 					      0x1);
+ 	}
+ 
+-	return 0;
++	return clock_ret;
+ }
+ 
+ static int wsa884x_set_stream(struct snd_soc_dai *dai,

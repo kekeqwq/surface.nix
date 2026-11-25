@@ -1,0 +1,46 @@
+Subject: [EXPERIMENT] ASoC: WSA884x: observe Denali supply status at PA-off PREPARE
+
+Read VPHX status only in an explicitly opted-in PA-off fixture with
+no DSP START capability, inside the existing PA epoch check. No
+change to speaker gain, supply configuration or analog setup.
+
+--- a/sound/soc/codecs/wsa884x.c
++++ b/sound/soc/codecs/wsa884x.c
+@@ -1889,8 +1889,8 @@
+ 
+ struct wsa884x_fullio_pa_snapshot {
+ 	unsigned int enable, sta0, sta1, err0, err1, pdm_wd;
+-	unsigned int dre0, dre1;
+-	bool gain_sampled;
++	unsigned int dre0, dre1, vphx;
++	bool gain_sampled, vphx_sampled;
+ 	s64 epoch;
+ };
+ 
+@@ -1938,6 +1938,17 @@
+ 	    of_machine_is_compatible("microsoft,denali") &&
+ 	    of_property_read_bool(sound, "microsoft,denali-fullio-muted-test") &&
+ 	    of_property_read_bool(sound, "microsoft,denali-fullio-clock-off-audit") &&
++	    of_property_read_bool(sound, "microsoft,denali-fullio-vphx-audit") &&
++	    !of_property_read_bool(sound, "microsoft,denali-fullio-dsp-start-audit") &&
++	    !of_property_read_bool(sound, "microsoft,denali-fullio-post-pa-test")) {
++		ret = regmap_read_bypassed(wsa884x->regmap, WSA884X_VPHX_SYS_EN_STATUS,
++					   &snapshot.vphx);
++		snapshot.vphx_sampled = !ret;
++	}
++	if (!ret && !read_faults && !(before & WSA884X_PA_FSM_EN_GLOBAL_PA_EN_MASK) &&
++	    of_machine_is_compatible("microsoft,denali") &&
++	    of_property_read_bool(sound, "microsoft,denali-fullio-muted-test") &&
++	    of_property_read_bool(sound, "microsoft,denali-fullio-clock-off-audit") &&
+ 	    of_property_read_bool(sound, "microsoft,denali-fullio-pa-off-gain-audit") &&
+ 	    !of_property_read_bool(sound, "microsoft,denali-fullio-post-pa-test")) {
+ 		ret = regmap_read_bypassed(wsa884x->regmap, WSA884X_DRE_CTL_0, &snapshot.dre0);
+@@ -2007,6 +2018,8 @@
+ 		return ret;
+ 	dev_dbg(component->dev, "FullIO PA snapshot: en=%#x state=%#x/%#x\n",
+ 		snapshot.enable, snapshot.sta0, snapshot.sta1);
++	if (snapshot.vphx_sampled)
++		dev_info(component->dev, "FullIO PA-off VPHX_STATUS=%#x\n", snapshot.vphx);
+ 	if (snapshot.gain_sampled)
+ 		dev_info(component->dev,
+ 			 "FullIO PA-off gain snapshot: DRE0=%#x DRE1=%#x CSR_GAIN=%u CSR_GAIN_EN=%u\n",

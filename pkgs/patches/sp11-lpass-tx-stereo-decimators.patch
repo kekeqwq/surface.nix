@@ -1,0 +1,110 @@
+Subject: [PATCH] ASoC: lpass-tx-macro: track each active capture decimator
+
+The TX mixer remembers only the last enabled decimator independently of
+its bitmap. Turning off DEC1 after enabling DEC0 and DEC1 then prevents
+DEC0 from being turned off. Repeat enables can also inflate the count.
+Use the same bitmap for the mixer, channel map and DAI mute, updating
+only bits that change and applying DAI mute consistently to both lanes.
+
+--- a/sound/soc/codecs/lpass-tx-macro.c
++++ b/sound/soc/codecs/lpass-tx-macro.c
+@@ -1,6 +1,7 @@
+ // SPDX-License-Identifier: GPL-2.0-only
+ // Copyright (c) 2018-2020, The Linux Foundation. All rights reserved.
+ 
++#include <linux/bitops.h>
+ #include <linux/module.h>
+ #include <linux/init.h>
+ #include <linux/clk.h>
+@@ -270,8 +271,6 @@
+ 	struct hpf_work tx_hpf_work[NUM_DECIMATORS];
+ 	struct tx_mute_work tx_mute_dwork[NUM_DECIMATORS];
+ 	unsigned long active_ch_mask[TX_MACRO_MAX_DAIS];
+-	unsigned long active_ch_cnt[TX_MACRO_MAX_DAIS];
+-	int active_decimator[TX_MACRO_MAX_DAIS];
+ 	struct regmap *regmap;
+ 	struct clk *mclk;
+ 	struct clk *npl;
+@@ -935,19 +934,10 @@
+ 	struct tx_macro *tx = snd_soc_component_get_drvdata(component);
+ 
+ 	if (enable) {
+-		if (tx->active_decimator[dai_id] == dec_id)
+-			return 0;
+-
+-		set_bit(dec_id, &tx->active_ch_mask[dai_id]);
+-		tx->active_ch_cnt[dai_id]++;
+-		tx->active_decimator[dai_id] = dec_id;
+-	} else {
+-		if (tx->active_decimator[dai_id] == -1)
++		if (test_and_set_bit(dec_id, &tx->active_ch_mask[dai_id]))
+ 			return 0;
+-
+-		tx->active_ch_cnt[dai_id]--;
+-		clear_bit(dec_id, &tx->active_ch_mask[dai_id]);
+-		tx->active_decimator[dai_id] = -1;
++	} else if (!test_and_clear_bit(dec_id, &tx->active_ch_mask[dai_id])) {
++		return 0;
+ 	}
+ 	snd_soc_dapm_mixer_update_power(widget->dapm, kcontrol, enable, update);
+ 
+@@ -1225,8 +1215,8 @@
+ 	case TX_MACRO_AIF1_CAP:
+ 	case TX_MACRO_AIF2_CAP:
+ 	case TX_MACRO_AIF3_CAP:
+-		*tx_slot = tx->active_ch_mask[dai->id];
+-		*tx_num = tx->active_ch_cnt[dai->id];
++		*tx_slot = READ_ONCE(tx->active_ch_mask[dai->id]);
++		*tx_num = hweight32(*tx_slot);
+ 		break;
+ 	default:
+ 		break;
+@@ -1238,24 +1228,20 @@
+ {
+ 	struct snd_soc_component *component = dai->component;
+ 	struct tx_macro *tx = snd_soc_component_get_drvdata(component);
+-	u8 decimator;
+-
+-	/* active decimator not set yet */
+-	if (tx->active_decimator[dai->id] == -1)
+-		return 0;
+-
+-	decimator = tx->active_decimator[dai->id];
++	unsigned long channels = READ_ONCE(tx->active_ch_mask[dai->id]);
++	unsigned int decimator;
++	int ret = 0;
+ 
+-	if (mute)
+-		snd_soc_component_write_field(component,
+-					      CDC_TXn_TX_PATH_CTL(decimator),
+-					      CDC_TXn_PGA_MUTE_MASK, 0x1);
+-	else
+-		snd_soc_component_update_bits(component,
+-					      CDC_TXn_TX_PATH_CTL(decimator),
+-					      CDC_TXn_PGA_MUTE_MASK, 0x0);
++	for_each_set_bit(decimator, &channels, TX_MACRO_DEC_MAX) {
++		int err = snd_soc_component_write_field(component,
++							CDC_TXn_TX_PATH_CTL(decimator),
++							CDC_TXn_PGA_MUTE_MASK, !!mute);
+ 
+-	return 0;
++		if (err < 0 && !ret)
++			ret = err;
++	}
++
++	return ret;
+ }
+ 
+ static const struct snd_soc_dai_ops tx_macro_dai_ops = {
+@@ -2360,11 +2346,6 @@
+ 
+ 	tx->dev = dev;
+ 
+-	/* Set active_decimator default value */
+-	tx->active_decimator[TX_MACRO_AIF1_CAP] = -1;
+-	tx->active_decimator[TX_MACRO_AIF2_CAP] = -1;
+-	tx->active_decimator[TX_MACRO_AIF3_CAP] = -1;
+-
+ 	/* set MCLK and NPL rates */
+ 	ret = clk_set_rate(tx->mclk, MCLK_FREQ);
+ 	if (ret)

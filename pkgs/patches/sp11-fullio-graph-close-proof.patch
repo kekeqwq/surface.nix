@@ -1,0 +1,65 @@
+Require a token-matched final CLOSE for FullIO graphs.
+
+--- a/sound/soc/qcom/qdsp6/q6apm.c
++++ b/sound/soc/qcom/qdsp6/q6apm.c
+@@ -654,6 +654,12 @@
+ 	return q6apm_fullio_oob_rpc(graph->apm, graph->port, pkt, NULL, &get);
+ }
+ EXPORT_SYMBOL_GPL(q6apm_fullio_get_cfg);
++
++static bool q6apm_fullio_close_blocks_open(struct q6apm *apm, struct audioreach_graph_info *info)
++{
++	lockdep_assert_held(&apm->graph_lock);
++	return apm->fullio_close_failed && audioreach_fullio_graph(info);
++}
+ 
+ static struct audioreach_graph *q6apm_get_audioreach_graph(struct q6apm *apm, uint32_t graph_id)
+ {
+@@ -664,6 +670,8 @@
+ 	guard(mutex)(&apm->graph_lock);
+ 	graph = idr_find(&apm->graph_idr, graph_id);
+ 	if (graph) {
++		if (q6apm_fullio_close_blocks_open(apm, graph->info))
++			return ERR_PTR(-ENOTRECOVERABLE);
+ 		kref_get(&graph->refcount);
+ 		return graph;
+ 	}
+@@ -673,6 +681,8 @@
+ 	mutex_unlock(&apm->lock);
+ 	if (!info)
+ 		return ERR_PTR(-ENODEV);
++	if (q6apm_fullio_close_blocks_open(apm, info))
++		return ERR_PTR(-ENOTRECOVERABLE);
+ 
+ 	graph = kzalloc_obj(*graph);
+ 	if (!graph)
+@@ -753,10 +763,20 @@
+ 
+ 	graph = container_of(ref, struct audioreach_graph, refcount);
+ 	apm = graph->apm;
++	lockdep_assert_held(&apm->graph_lock);
+ 
+-	audioreach_graph_mgmt_cmd(graph, APM_CMD_GRAPH_CLOSE);
++	if (audioreach_fullio_graph(graph->info)) {
++		int ret = audioreach_graph_mgmt_transaction(graph, APM_CMD_GRAPH_CLOSE, true);
+ 
+-	lockdep_assert_held(&apm->graph_lock);
++		if (ret) {
++			apm->fullio_close_failed = true;
++			dev_err(&apm->gdev->dev, "FullIO GRAPH_CLOSE unverified (%d); graph reopen blocked\n", ret);
++		} else {
++			dev_info(&apm->gdev->dev, "FullIO GRAPH_CLOSE acknowledged\n");
++		}
++	} else {
++		audioreach_graph_mgmt_cmd(graph, APM_CMD_GRAPH_CLOSE);
++	}
+ 	idr_remove(&apm->graph_idr, graph->id);
+ 
+ 	kfree(graph->graph);
+--- a/sound/soc/qcom/qdsp6/q6apm.h
++++ b/sound/soc/qcom/qdsp6/q6apm.h
+@@ -50,3 +50,4 @@
+ 	u64 fullio_transport_epoch; /* Protected by fullio_oob_lock. */
+ 	bool fullio_start_audit_attempted; /* Protected by graph_lock. */
++	bool fullio_close_failed; /* Protected by graph_lock; sticky. */
+ 	/* Dedicated, token-matched OOB mapping acknowledgement. */

@@ -1,0 +1,33 @@
+ASoC: wsa884x: keep the DT CPS sidechain enabled
+
+Port the reference board-wiring semantics: preset the CPS port when DT enables feedback and refuse userspace/alsa-restore disable of it.
+--- a/sound/soc/codecs/wsa884x.c
++++ b/sound/soc/codecs/wsa884x.c
+@@ -1794,6 +1794,17 @@
+ 	struct wsa884x_priv *wsa884x = snd_soc_component_get_drvdata(comp);
+ 	struct soc_mixer_control *mixer = (struct soc_mixer_control *)kcontrol->private_value;
+ 	int portidx = mixer->reg;
++
++	/* A DT-enabled CPS path is board wiring, not an optional userspace
++	 * route. alsa-restore may replay a state that predates CPS support;
++	 * keep the firmware-selected sidechain enabled.
++	 */
++	if (portidx == WSA884X_PORT_CPS && wsa884x->feedback_enabled) {
++		if (wsa884x->port_enable[portidx])
++			return 0;
++		wsa884x->port_enable[portidx] = true;
++		return 1;
++	}
+ 
+ 	if (ucontrol->value.integer.value[0]) {
+ 		if (wsa884x->port_enable[portidx])
+@@ -3020,6 +3031,9 @@
+ 	if (wsa884x->fullio_reference_codec &&
+ 	    (!of_machine_is_compatible("microsoft,denali") || !wsa884x->feedback_enabled))
+ 		return dev_err_probe(dev, -EINVAL, "FullIO cold setup requires Denali feedback hardware\n");
++	/* A DT-enabled CPS sidechain is board wiring, not an optional route. */
++	if (wsa884x->feedback_enabled)
++		wsa884x->port_enable[WSA884X_PORT_CPS] = true;
+ 
+ 	for (i = 0; i < WSA884X_SUPPLIES_NUM; i++)
+ 		wsa884x->supplies[i].supply = wsa884x_supply_name[i];

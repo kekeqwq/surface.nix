@@ -1,0 +1,48 @@
+Require aligned observed byte progress in the PA-off diagnostic pull ring.
+
+--- a/sound/soc/qcom/qdsp6/q6apm.c
++++ b/sound/soc/qcom/qdsp6/q6apm.c
+@@ -557,7 +557,8 @@
+ {
+ 	struct q6apm_fullio_ring *ring = graph->ar_graph->fullio_ring;
+ 	const __le32 *pos;
+-	u32 previous = 0, index, seq;
++	const u32 frame_bytes = 2 * sizeof(__le16); /* Fixed stereo S16_LE audit. */
++	u32 previous = 0, previous_index = 0, index, seq;
+ 
+ 	lockdep_assert_held(&graph->apm->graph_lock);
+ 	if (!ring || !ring->config_bytes || ring->start_attempted != started)
+@@ -569,8 +570,9 @@
+ 		dma_wmb();
+ 		return 0;
+ 	}
+-	/* Require two distinct, coherent DSP publications, not a START ACK
+-	 * or a single initial position. A zero counter is not a publication.
++	/* The publication sequence can advance with a stationary byte cursor.
++	 * Require movement within this bounded window as well. Zero sequence
++	 * marks an in-progress publication; an index of zero is valid.
+ 	 */
+ 	for (int i = 0; i < 8; i++) {
+ 		seq = le32_to_cpu(READ_ONCE(pos[0]));
+@@ -578,13 +580,18 @@
+ 		index = le32_to_cpu(READ_ONCE(pos[1]));
+ 		dma_rmb();
+ 		if (seq && seq == le32_to_cpu(READ_ONCE(pos[0]))) {
+-			if (index >= ring->config_bytes)
++			if (index >= ring->config_bytes || !IS_ALIGNED(index, frame_bytes))
+ 				return -ERANGE;
+-			if (previous && seq > previous) {
+-				dev_info(graph->dev, "FullIO independent ring: DSP position counter progressed\n");
++			if (previous && (seq < previous || (seq == previous && index != previous_index)))
++				return -EILSEQ;
++			if (previous && seq > previous && index != previous_index) {
++				dev_info(graph->dev,
++					 "FullIO independent ring: DSP byte cursor advanced: seq=%u->%u bytes=%u->%u\n",
++					 previous, seq, previous_index, index);
+ 				return 0;
+ 			}
+ 			previous = seq;
++			previous_index = index;
+ 		}
+ 		if (i < 7)
+ 			usleep_range(3000, 4000);

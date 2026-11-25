@@ -1,0 +1,37 @@
+Keep the FullIO mute ticket scoped to the silent START/STOP audit.
+
+--- a/sound/soc/qcom/qdsp6/q6apm-dai.c
++++ b/sound/soc/qcom/qdsp6/q6apm-dai.c
+@@ -844,9 +844,6 @@
+ 	if (ret || unmap_ret)
+ 		return ret ?: unmap_ret;
+ 	ret = q6apm_fullio_dsp_prepare_audit(prtd->graph, card, &stages);
+-	if (ret)
+-		return ret;
+-	ret = q6apm_fullio_mute_commit(prtd->graph, &ticket);
+ 	if (ret)
+ 		return ret;
+ 	if (of_property_read_bool(card->dev->of_node, "microsoft,denali-fullio-dsp-start-audit")) {
+@@ -858,13 +855,21 @@
+ 							       BUFFER_BYTES_MAX,
+ 		};
+ 
++		ret = q6apm_fullio_mute_commit(prtd->graph, &ticket);
++		if (ret)
++			return ret;
+ 		ret = q6apm_fullio_audit_start_stop(prtd->graph, card, q6apm_fullio_verify_silent_audit,
+ 						   &audit);
++		/* Clear any ticket left by a rejection before START. A real
++		 * attempt already revokes it before sending STOP.
++		 */
++		if (q6apm_fullio_mute_is_verified(prtd->graph))
++			q6apm_fullio_mute_invalidate(prtd->graph);
+ 		ret = q6apm_fullio_finish_audit(card, ret, audit.stop_worker_done);
+ 		if (ret)
+ 			return ret;
+ 	} else {
+-		dev_info(prtd->graph->dev, "FullIO graph-local mute verified; render stays disabled\n");
++		dev_info(prtd->graph->dev, "FullIO prepare-only audit: no mute ticket published; render stays disabled\n");
+ 	}
+ 	return -EOPNOTSUPP;
+ 

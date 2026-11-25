@@ -1,0 +1,31 @@
+Subject: [EXPERIMENT] ASoC: report malformed FullIO mute reply header
+
+Report only the metadata of the matched GET_CFG reply on EPROTO.
+Keep strict validation; never dump the mute payload or start playback.
+
+diff --git a/sound/soc/qcom/qdsp6/q6apm.c b/sound/soc/qcom/qdsp6/q6apm.c
+index 7681699..9d0eb36 100644
+--- a/sound/soc/qcom/qdsp6/q6apm.c
++++ b/sound/soc/qcom/qdsp6/q6apm.c
+@@ -117,6 +117,21 @@ static bool q6apm_fullio_oob_reply(struct q6apm *apm, const struct gpr_resp_pkt
+ 
+ 	if (hdr->opcode == APM_CMD_RSP_GET_CFG && apm->fullio_oob_op == APM_CMD_GET_CFG) {
+ 		status = q6apm_fullio_readback(data, apm->fullio_get);
++		/* Diagnose only the pinned mute query. Do not log parameter data
++		 * or change the protocol validation for any readback.
++		 */
++		if (status == -EPROTO && apm->fullio_get &&
++		    apm->fullio_get->instance == 0x4a63 &&
++		    apm->fullio_get->param == 0x08001039 && data->payload &&
++		    data->payload_size >= (int)(sizeof(u32) + APM_MODULE_PARAM_DATA_SIZE)) {
++			const u8 *p = data->payload;
++
++			dev_warn_ratelimited(&apm->gdev->dev,
++				"FullIO mute reply header: token=%#x bytes=%d status=%#x iid=%#x param=%#x size=%u param_status=%#x\n",
++				hdr->token, data->payload_size, get_unaligned_le32(p),
++				get_unaligned_le32(p + 4), get_unaligned_le32(p + 8),
++				get_unaligned_le32(p + 12), get_unaligned_le32(p + 16));
++		}
+ 	} else if (hdr->opcode == APM_CMD_RSP_SHARED_MEM_MAP_REGIONS &&
+ 	    apm->fullio_oob_op == APM_CMD_SHARED_MEM_MAP_REGIONS &&
+ 	    data->payload && data->payload_size >= (int)sizeof(*map)) {

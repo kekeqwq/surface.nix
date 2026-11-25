@@ -1,0 +1,70 @@
+Subject: [EXPERIMENT] soundwire: qcom: record FullIO broadcast timeout before new admission
+
+An expired broadcast leaves completion ownership uncertain. Report
+FIFO drain and latch against new streams only on the clock-gated
+FullIO fixture. Preserve transport return codes and cleanup commands;
+do not claim to repair stale IRQ arbitration.
+
+--- a/drivers/soundwire/qcom.c
++++ b/drivers/soundwire/qcom.c
+@@ -536,6 +536,13 @@
+ 
+ 
+ 	return false;
++}
++
++static void qcom_swrm_fullio_latch_link_error(struct qcom_swrm_ctrl *ctrl, int error)
++{
++	if (ctrl->fullio_link_gate && error < 0 &&
++	    !cmpxchg(&ctrl->fullio_link_error, 0, error))
++		dev_err(ctrl->dev, "FullIO SoundWire new streams locked: first link error %d\n", error);
+ }
+ 
+ static int qcom_swrm_cmd_fifo_wr_cmd(struct qcom_swrm_ctrl *ctrl, u8 cmd_data,
+@@ -568,17 +575,28 @@
+ 		usleep_range(150, 155);
+ 
+ 	if (cmd_id == SWR_BROADCAST_CMD_ID) {
+-		swrm_wait_for_wr_fifo_done(ctrl);
++		bool drained = swrm_wait_for_wr_fifo_done(ctrl);
++
+ 		/*
+ 		 * sleep for 10ms for MSM soundwire variant to allow broadcast
+ 		 * command to complete.
+ 		 */
+ 		ret = wait_for_completion_timeout(&ctrl->broadcast,
+ 						  msecs_to_jiffies(TIMEOUT_MS));
+-		if (!ret)
+-			ret = SDW_CMD_IGNORED;
+-		else
++		if (!ret) {
++			if (ctrl->fullio_link_gate) {
++				dev_warn_ratelimited(ctrl->dev,
++					"FullIO broadcast timeout: reg=%#x fifo_drained=%d\n",
++					reg_addr, drained);
++				/* No later ACK can make this controller safe for new
++				 * streams. Leave teardown transfers available.
++				 */
++				qcom_swrm_fullio_latch_link_error(ctrl, -ETIMEDOUT);
++			}
++			ret = SDW_CMD_IGNORED;
++		} else {
+ 			ret = SDW_CMD_OK;
++		}
+ 
+ 	} else {
+ 		ret = SDW_CMD_OK;
+@@ -637,13 +655,6 @@
+ 		reg_addr, ctrl->rcmd_id, dev_addr, cmd_data);
+ 
+ 	return SDW_CMD_IGNORED;
+-}
+-
+-static void qcom_swrm_fullio_latch_link_error(struct qcom_swrm_ctrl *ctrl, int error)
+-{
+-	if (ctrl->fullio_link_gate && error < 0 &&
+-	    !cmpxchg(&ctrl->fullio_link_error, 0, error))
+-		dev_err(ctrl->dev, "FullIO SoundWire new streams locked: first link error %d\n", error);
+ }
+ 
+ static int qcom_swrm_fullio_new_stream_ok(struct qcom_swrm_ctrl *ctrl)

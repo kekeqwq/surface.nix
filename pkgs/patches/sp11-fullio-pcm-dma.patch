@@ -1,0 +1,165 @@
+ASoC: q6apm: borrow the independent pull ring as ALSA sample backing
+
+Expose a sample-only view of the confirmed graph-owned ring, never its position page. Do not allocate or map a second PCM buffer for this path.
+--- a/sound/soc/qcom/qdsp6/q6apm.c
++++ b/sound/soc/qcom/qdsp6/q6apm.c
+@@ -390,6 +390,7 @@
+ 	dma_addr_t dma;
+ 	size_t bytes;
+ 	u32 config_bytes;
++	struct snd_dma_buffer pcm_buffer;
+ 	int sid;
+ 	bool start_attempted, stop_acked;
+ 	struct q6apm_fullio_oob_region data, pos;
+@@ -512,6 +513,7 @@
+ 	struct gpr_pkt *pkt __free(kfree) =
+ 		audioreach_alloc_push_pull_pkt(graph, ring->data.dsp_addr, ring->pos.dsp_addr,
+ 					      ring->data.handle, ring->pos.handle, config_bytes, direct);
++	int ret;
+ 
+ 	/* Any failed SET_CFG may still have reached the DSP. Bind the lifetime
+ 	 * to the last graph reference before sending and even on failure.
+@@ -520,7 +522,16 @@
+ 	smp_store_release(&graph->ar_graph->fullio_ring, ring);
+ 	if (IS_ERR(pkt))
+ 		return PTR_ERR(pkt);
+-	return q6apm_fullio_oob_rpc(graph->apm, direct ? graph->port : NULL, pkt, NULL, NULL);
++	ret = q6apm_fullio_oob_rpc(graph->apm, direct ? graph->port : NULL, pkt, NULL, NULL);
++	if (ret)
++		return ret;
++
++	ring->pcm_buffer.dev.type = SNDRV_DMA_TYPE_DEV;
++	ring->pcm_buffer.dev.dev = ring->dev;
++	ring->pcm_buffer.area = ring->cpu;
++	ring->pcm_buffer.addr = ring->dma;
++	smp_store_release(&ring->pcm_buffer.bytes, config_bytes);
++	return 0;
+ }
+ 
+ /* Mapping-only or never-started attachment, selected by the fixture DT. */
+@@ -595,6 +606,19 @@
+ 	return 0;
+ }
+ 
++/* A borrowed sample-only view. ALSA never owns or frees the allocation;
++ * the FE must detach the view before dropping its graph reference.
++ */
++struct snd_dma_buffer *q6apm_fullio_pcm_buffer(struct q6apm_graph *graph, size_t bytes)
++{
++	struct q6apm_fullio_ring *ring = smp_load_acquire(&graph->ar_graph->fullio_ring);
++
++	if (!ring || !bytes || bytes != smp_load_acquire(&ring->pcm_buffer.bytes))
++		return NULL;
++	return &ring->pcm_buffer;
++}
++EXPORT_SYMBOL_GPL(q6apm_fullio_pcm_buffer);
++
+ /* Nonblocking PCM accessor. The open PCM retains a graph reference, so
+  * the attached coherent allocation cannot be released during a sample.
+  */
+--- a/sound/soc/qcom/qdsp6/q6apm.h
++++ b/sound/soc/qcom/qdsp6/q6apm.h
+@@ -174,6 +174,7 @@
+ int q6apm_fullio_oob_unmap(struct q6apm *apm, struct q6apm_fullio_oob_region *region);
+ int q6apm_fullio_ring_map_audit(struct q6apm_graph *graph, struct snd_soc_card *card,
+ 			       size_t bytes, int sid, u32 config_bytes);
++struct snd_dma_buffer *q6apm_fullio_pcm_buffer(struct q6apm_graph *graph, size_t bytes);
+ int q6apm_fullio_pcm_cursor(struct q6apm_graph *graph, u32 frame_bytes, u32 *offset);
+ int q6apm_fullio_ring_position_audit(struct q6apm_graph *graph, bool started);
+ int q6apm_fullio_register_pull_events(struct q6apm_graph *graph, u32 period_bytes);
+--- a/sound/soc/qcom/qdsp6/q6apm-dai.c
++++ b/sound/soc/qcom/qdsp6/q6apm-dai.c
+@@ -1152,6 +1152,7 @@
+ 	}
+ 	if (q6apm_fullio_independent_pcm(component, prtd->graph->id, substream->stream)) {
+ 		const unsigned int audit_period = 1920; /* Golden: 10 ms stereo S16_LE. */
++		struct snd_dma_buffer *buffer;
+ 		struct device_node *node = component->card->dev->of_node;
+ 		bool prepare_ring = of_property_read_bool(node, "microsoft,denali-fullio-ring-dma-audit") ||
+ 				    of_property_read_bool(node, "microsoft,denali-fullio-sink-readback-audit");
+@@ -1178,7 +1179,16 @@
+ 		ret = q6apm_fullio_prepare_pull_media(prtd->graph, &cfg, audit_period);
+ 		if (ret)
+ 			return ret;
+-		return q6apm_fullio_prepare_cal(pdata, prtd, component->card, &cfg) ?: -EOPNOTSUPP;
++		/* Some audit clients intentionally negotiate a different ALSA
++		 * size. They still exercise the fixed DSP ring, but only exact
++		 * PCM geometry can borrow its samples for direct writes.
++		 */
++		buffer = q6apm_fullio_pcm_buffer(prtd->graph, prtd->pcm_size);
++		if (buffer)
++			snd_pcm_set_runtime_buffer(substream, buffer);
++		ret = q6apm_fullio_prepare_cal(pdata, prtd, component->card, &cfg);
++		snd_pcm_set_runtime_buffer(substream, NULL);
++		return ret ?: -EOPNOTSUPP;
+ 	}
+ 	if (prtd->state) {
+ 		/* clear the previous setup if any  */
+@@ -1383,9 +1393,9 @@
+ 		runtime->hw = q6apm_dai_hardware_capture;
+ 	if (independent)
+ 		runtime->hw.info &= ~(SNDRV_PCM_INFO_PAUSE | SNDRV_PCM_INFO_RESUME);
+-	if (substream->stream == SNDRV_PCM_STREAM_PLAYBACK &&
++	if (independent || (substream->stream == SNDRV_PCM_STREAM_PLAYBACK &&
+ 	    audioreach_fullio_graph(prtd->graph->info) &&
+-	    of_property_read_bool(component->card->dev->of_node, "microsoft,denali-fullio-dsp-start-audit")) {
++	    of_property_read_bool(component->card->dev->of_node, "microsoft,denali-fullio-dsp-start-audit"))) {
+ 		runtime->hw.info &= ~(SNDRV_PCM_INFO_MMAP | SNDRV_PCM_INFO_MMAP_VALID);
+ 		ret = snd_pcm_hw_constraint_mask64(runtime, SNDRV_PCM_HW_PARAM_ACCESS,
+ 						  BIT_ULL(SNDRV_PCM_ACCESS_RW_INTERLEAVED));
+@@ -1432,6 +1442,8 @@
+ 	}
+ 
+ 	runtime->private_data = prtd;
++	if (independent)
++		return 0;
+ 	runtime->dma_bytes = pdata->has_reserved_mem ? pdata->reserved_buf_size :
+ 						       BUFFER_BYTES_MAX;
+ 	if (pdata->sid < 0)
+@@ -1439,7 +1451,7 @@
+ 	else
+ 		prtd->phys = substream->dma_buffer.addr | (pdata->sid << 32);
+ 
+-	if (!independent && q6apm_is_graph_in_push_pull_mode(prtd->graph)) {
++	if (q6apm_is_graph_in_push_pull_mode(prtd->graph)) {
+ 		size_t buf_max = pdata->has_reserved_mem ? pdata->reserved_buf_size :
+ 							   BUFFER_BYTES_MAX;
+ 		void *pos_buffer;
+@@ -1475,6 +1487,8 @@
+ 		q6apm_free_fragments(prtd->graph, substream->stream);
+ 	}
+ 
++	if (prtd->independent_pcm)
++		snd_pcm_set_runtime_buffer(substream, NULL);
+ 	q6apm_fullio_release_cal(prtd);
+ 	q6apm_graph_close(prtd->graph);
+ 	prtd->graph = NULL;
+@@ -1654,21 +1668,20 @@
+ 		is_push_pull = q6apm_is_graph_in_push_pull_mode_from_id(component->dev,
+ 									graph_id,
+ 									substream->stream);
+-		if (is_push_pull)
+-			size += POS_BUFFER_BYTES;
+-
+-		ret = snd_pcm_set_fixed_buffer_all(pcm, SNDRV_DMA_TYPE_DEV, component->dev, size);
+-		if (ret)
+-			return ret;
+-
+ 		if (q6apm_fullio_independent_pcm(component, graph_id, substream->stream)) {
+ 			if (!is_push_pull || pdata->has_reserved_mem || pdata->use_scm_assign ||
+ 			    pcm->streams[SNDRV_PCM_STREAM_CAPTURE].substream)
+ 				return -EPERM;
+-			/* ALSA backing is local only; the audit separately owns DSP DMA. */
++			/* The independent owner supplies ALSA's sample-only view. */
+ 			dev_info(dev, "FullIO independent PCM: no legacy DSP map\n");
+ 			return 0;
+ 		}
++		if (is_push_pull)
++			size += POS_BUFFER_BYTES;
++
++		ret = snd_pcm_set_fixed_buffer_all(pcm, SNDRV_DMA_TYPE_DEV, component->dev, size);
++		if (ret)
++			return ret;
+ 
+ 		if (pdata->use_scm_assign && !pdata->has_reserved_mem) {
+ 			ret = q6apm_dai_scm_assign(pdata,

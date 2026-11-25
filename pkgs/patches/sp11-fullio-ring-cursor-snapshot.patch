@@ -1,0 +1,83 @@
+ASoC: split FullIO ring cursor sampling from audit polling
+
+Use a bounded non-sleeping cursor read for the firmware publication protocol.
+
+Audit progress separately and accept sequence wrap, not regression.
+
+--- a/sound/soc/qcom/qdsp6/q6apm.c
++++ b/sound/soc/qcom/qdsp6/q6apm.c
+@@ -568,19 +568,44 @@
+ }
+ EXPORT_SYMBOL_GPL(q6apm_fullio_ring_map_audit);
+ 
++/* One non-sleeping sample. The firmware writes zero, then index and time,
++ * then the next sequence. Do not use a transient index to report PCM progress.
++ * The caller holds the backing alive; no pointer escapes this function.
++ */
++static int q6apm_fullio_ring_cursor(const struct q6apm_fullio_ring *ring,
++				    u32 frame_bytes, u32 *sequence, u32 *offset)
++{
++	const __le32 *pos = ring->cpu + ring->data.size;
++	u32 seq, bytes;
++
++	seq = le32_to_cpu(READ_ONCE(pos[0]));
++	if (!seq)
++		return -EAGAIN;
++	dma_rmb();
++	bytes = le32_to_cpu(READ_ONCE(pos[1]));
++	dma_rmb();
++	if (seq != le32_to_cpu(READ_ONCE(pos[0])))
++		return -EAGAIN;
++	if (!frame_bytes || bytes >= ring->config_bytes || bytes % frame_bytes)
++		return -ERANGE;
++	*sequence = seq;
++	*offset = bytes;
++	return 0;
++}
++
+ int q6apm_fullio_ring_position_audit(struct q6apm_graph *graph, bool started)
+ {
+ 	struct q6apm_fullio_ring *ring = graph->ar_graph->fullio_ring;
+-	const __le32 *pos;
+ 	const u32 frame_bytes = 2 * sizeof(__le16); /* Fixed stereo S16_LE audit. */
+ 	u32 previous = 0, previous_index = 0, index, seq;
++	int ret;
+ 
+ 	lockdep_assert_held(&graph->apm->graph_lock);
+ 	if (!ring || !ring->config_bytes || ring->start_attempted != started)
+ 		return -EPERM;
+-	pos = ring->cpu + ring->data.size;
+ 	if (!started) {
+-		if (memchr_inv(pos, 0, ring->pos.size) || memchr_inv(ring->cpu, 0, ring->data.size))
++		if (memchr_inv(ring->cpu + ring->data.size, 0, ring->pos.size) ||
++		    memchr_inv(ring->cpu, 0, ring->data.size))
+ 			return -EILSEQ;
+ 		dma_wmb();
+ 		return 0;
+@@ -590,16 +615,17 @@
+ 	 * marks an in-progress publication; an index of zero is valid.
+ 	 */
+ 	for (int i = 0; i < 8; i++) {
+-		seq = le32_to_cpu(READ_ONCE(pos[0]));
+-		dma_rmb();
+-		index = le32_to_cpu(READ_ONCE(pos[1]));
+-		dma_rmb();
+-		if (seq && seq == le32_to_cpu(READ_ONCE(pos[0]))) {
+-			if (index >= ring->config_bytes || !IS_ALIGNED(index, frame_bytes))
+-				return -ERANGE;
+-			if (previous && (seq < previous || (seq == previous && index != previous_index)))
++		ret = q6apm_fullio_ring_cursor(ring, frame_bytes, &seq, &index);
++		if (ret && ret != -EAGAIN)
++			return ret;
++		if (!ret) {
++			/* Modular serial arithmetic distinguishes wrap from a reset.
++			 * A half-range jump cannot be produced in the audit window.
++			 */
++			if (previous && (seq - previous >= BIT(31) ||
++					 (seq == previous && index != previous_index)))
+ 				return -EILSEQ;
+-			if (previous && seq > previous && index != previous_index) {
++			if (previous && seq != previous && index != previous_index) {
+ 				dev_info(graph->dev,
+ 					 "FullIO independent ring: DSP byte cursor advanced: seq=%u->%u bytes=%u->%u\n",
+ 					 previous, seq, previous_index, index);

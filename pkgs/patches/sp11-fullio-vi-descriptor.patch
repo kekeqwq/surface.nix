@@ -1,0 +1,64 @@
+Subject: [EXPERIMENT] ASoC: WSA884x: reuse upstream VI port capability in FullIO
+
+The local FullIO DP5 copy incorrectly retained max_ch=1 while the
+upstream descriptor and the requested VI mask have two channels.
+Copy that descriptor rather than duplicating it; keep CPS private.
+
+--- a/sound/soc/codecs/wsa884x.c
++++ b/sound/soc/codecs/wsa884x.c
+@@ -891,30 +891,19 @@
+ 	}
+ };
+ 
+-static const struct sdw_dpn_prop wsa884x_feedback_ports[] = {
+-	{
+-		.num = WSA884X_PORT_VISENSE + 1,
+-		.type = SDW_DPN_SIMPLE,
+-		.min_ch = 1,
+-		.max_ch = 1,
+-		.simple_ch_prep_sm = true,
+-		.read_only_wordlength = true,
+-	},
+-	{
+-		.num = WSA884X_PORT_CPS + 1,
+-		.type = SDW_DPN_SIMPLE,
+-		.min_ch = 1,
+-		.max_ch = 2,
+-		.simple_ch_prep_sm = true,
+-		/* CPS DP6 BlockCtrl1 is writable and Windows programs the
+-		 * master-derived 0x18 word-length value on both slaves.
+-		 */
+-		.read_only_wordlength = false,
+-		.simple_transport_registers =
+-			SDW_DPN_SIMPLE_TRANSPORT_BLOCKCTRL3 |
+-			SDW_DPN_SIMPLE_TRANSPORT_SAMPLECTRL2 |
+-			SDW_DPN_SIMPLE_TRANSPORT_HCTRL,
+-	},
++static const struct sdw_dpn_prop wsa884x_fullio_cps_port = {
++	.num = WSA884X_PORT_CPS + 1,
++	.type = SDW_DPN_SIMPLE,
++	.min_ch = 1,
++	.max_ch = 2,
++	.simple_ch_prep_sm = true,
++	/* CPS DP6 BlockCtrl1 is writable and Windows programs the
++	 * master-derived 0x18 word-length value on both slaves.
++	 */
++	.read_only_wordlength = false,
++	.simple_transport_registers = SDW_DPN_SIMPLE_TRANSPORT_BLOCKCTRL3 |
++				      SDW_DPN_SIMPLE_TRANSPORT_SAMPLECTRL2 |
++				      SDW_DPN_SIMPLE_TRANSPORT_HCTRL,
+ };
+ 
+ static const struct sdw_port_config wsa884x_pconfig[WSA884X_MAX_SWR_PORTS] = {
+@@ -2632,8 +2621,9 @@
+ 		ret = device_property_read_u32(dev, "qcom,cps-offset1", &offset);
+ 		if (ret || offset > U8_MAX)
+ 			return dev_err_probe(dev, ret ?: -ERANGE, "invalid CPS offset\n");
+-		memcpy(wsa884x->feedback_ports, wsa884x_feedback_ports,
+-		       sizeof(wsa884x->feedback_ports));
++		/* DP5 already has the upstream two-channel capability. */
++		wsa884x->feedback_ports[0] = wsa884x_sink_dpn_prop[WSA884X_PORT_VISENSE];
++		wsa884x->feedback_ports[1] = wsa884x_fullio_cps_port;
+ 		wsa884x->feedback_ports[1].override_offset1 = true;
+ 		wsa884x->feedback_ports[1].offset1 = offset;
+ 		wsa884x->feedback_enabled = true;

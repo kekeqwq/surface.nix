@@ -1,0 +1,96 @@
+Subject: [EXPERIMENT] soundwire: verify integrated Denali sidechain register parity
+
+Isolate the already tested CPS wake transaction and active Offset2 for
+VI DP10/11 and CPS DP13 behind the integrated diagnostic DT marker.
+Verify the saved CPS values on teardown. Do not touch PAs or TX clocks.
+
+diff --git a/drivers/soundwire/qcom.c b/drivers/soundwire/qcom.c
+index ff285cc..e8121c8 100755
+--- a/drivers/soundwire/qcom.c
++++ b/drivers/soundwire/qcom.c
+@@ -1111,27 +1111,62 @@ static int qcom_swrm_port_params(struct sdw_bus *bus,
+ #define DENALI_CPS_WAKE_ROUTE_REG 0x105c
+ #define DENALI_CPS_WAKE_PCM_REG   0x1d54
+ 
+-static bool qcom_swrm_cps_wake_probe(struct qcom_swrm_ctrl *ctrl)
++static bool qcom_swrm_integrated_sidechain_audit(struct qcom_swrm_ctrl *ctrl)
+ {
++	struct device_node *node = ctrl->dev->of_node;
++
+ 	return ctrl->bus.controller_id == MASTER_ID_WSA &&
+ 	       of_machine_is_compatible("microsoft,denali") &&
+-	       of_property_read_bool(ctrl->dev->of_node, "qcom,denali-fullio-feedback-capture-test") &&
+-	       of_property_read_bool(ctrl->dev->of_node, "qcom,denali-cps-probe-wake-test");
++	       of_property_read_bool(node, "qcom,denali-fullio-feedback") &&
++	       !of_property_read_bool(node, "qcom,denali-fullio-feedback-capture-test") &&
++	       of_property_read_bool(node, "qcom,denali-fullio-sidechain-audit");
++}
++
++static bool qcom_swrm_cps_wake_probe(struct qcom_swrm_ctrl *ctrl)
++{
++	return qcom_swrm_integrated_sidechain_audit(ctrl) ||
++	       (ctrl->bus.controller_id == MASTER_ID_WSA &&
++		of_machine_is_compatible("microsoft,denali") &&
++		of_property_read_bool(ctrl->dev->of_node, "qcom,denali-fullio-feedback-capture-test") &&
++		of_property_read_bool(ctrl->dev->of_node, "qcom,denali-cps-probe-wake-test"));
++}
++
++static bool qcom_swrm_audit_active_offset2(struct qcom_swrm_ctrl *ctrl, unsigned int port)
++{
++	if (qcom_swrm_integrated_sidechain_audit(ctrl))
++		return port == 10 || port == 11 || port == 13;
++	return port == 13 && qcom_swrm_cps_wake_probe(ctrl) &&
++	       of_property_read_bool(ctrl->dev->of_node, "qcom,denali-cps-probe-active-offset2-test");
+ }
+ 
+ static int qcom_swrm_restore_cps_wake(struct qcom_swrm_ctrl *ctrl)
+ {
+ 	int pcm, route;
++	u32 value;
+ 
+ 	if (!ctrl->cps_wake_active)
+ 		return 0;
+ 	pcm = ctrl->reg_write(ctrl, DENALI_CPS_WAKE_PCM_REG, ctrl->cps_saved_pcm);
+ 	route = ctrl->reg_write(ctrl, DENALI_CPS_WAKE_ROUTE_REG, ctrl->cps_saved_route);
++	if (qcom_swrm_integrated_sidechain_audit(ctrl)) {
++		if (!pcm) {
++			pcm = ctrl->reg_read(ctrl, DENALI_CPS_WAKE_PCM_REG, &value);
++			if (!pcm && value != ctrl->cps_saved_pcm)
++				pcm = -EIO;
++		}
++		if (!route) {
++			route = ctrl->reg_read(ctrl, DENALI_CPS_WAKE_ROUTE_REG, &value);
++			if (!route && value != ctrl->cps_saved_route)
++				route = -EIO;
++		}
++	}
+ 	if (pcm || route) {
+ 		dev_err(ctrl->dev, "CPS probe wake restore failed: %d/%d\n", pcm, route);
+ 		return pcm ?: route;
+ 	}
+ 	ctrl->cps_wake_active = false;
++	if (qcom_swrm_integrated_sidechain_audit(ctrl))
++		dev_info_ratelimited(ctrl->dev, "FullIO CPS wake registers restored and verified\n");
+ 	return 0;
+ }
+ 
+@@ -1259,8 +1294,7 @@ static int qcom_swrm_port_enable(struct sdw_bus *bus,
+ 
+ 	reg = SWRM_DPn_PORT_CTRL_BANK(offset, enable_ch->port_num, bank);
+ 
+-	if (enable_ch->enable && enable_ch->port_num == 13 && qcom_swrm_cps_wake_probe(ctrl) &&
+-	    of_property_read_bool(ctrl->dev->of_node, "qcom,denali-cps-probe-active-offset2-test")) {
++	if (enable_ch->enable && qcom_swrm_audit_active_offset2(ctrl, enable_ch->port_num)) {
+ 		u32 check;
+ 		int ret;
+ 
+@@ -1277,7 +1311,8 @@ static int qcom_swrm_port_enable(struct sdw_bus *bus,
+ 			return ret;
+ 		if (check != val)
+ 			return -EIO;
+-		dev_info_ratelimited(ctrl->dev, "CPS probe DP13 bank %u active Offset2=0 verified\n", bank);
++		dev_info_ratelimited(ctrl->dev, "FullIO DP%u bank %u active Offset2=0 verified\n",
++				     enable_ch->port_num, bank);
+ 		return 0;
+ 	}
+ 

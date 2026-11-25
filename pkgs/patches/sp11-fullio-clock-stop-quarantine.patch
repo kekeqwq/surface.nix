@@ -1,0 +1,108 @@
+Quarantine ambiguous FullIO ClockStop entry before gating iface or retrying.
+
+--- a/drivers/soundwire/qcom.c
++++ b/drivers/soundwire/qcom.c
+@@ -219,7 +219,7 @@
+ 	u32 intr_mask;
+ 	bool fullio_link_gate;
+ 	int fullio_link_error; /* First failure, sticky for the controller lifetime. */
+-	bool fullio_resume_incomplete; /* Sticky; also read by the transfer path. */
++	bool fullio_pm_incomplete; /* Sticky; also read by the transfer path. */
+ 	unsigned long fullio_seen_attached;
+ 	u8 rcmd_id;
+ 	u8 wcmd_id;
+@@ -1160,10 +1160,10 @@
+ 	struct qcom_swrm_ctrl *ctrl = to_qcom_sdw(bus);
+ 	int ret, i, len;
+ 
+-	/* PM retains iface/IRQ ownership after an incomplete resume. That
+-	 * does not make the bus usable for codec cache replay or enumeration.
++	/* PM retains iface/IRQ ownership after an incomplete transition.
++	 * That does not make the bus usable for codec replay or enumeration.
+ 	 */
+-	if (READ_ONCE(ctrl->fullio_resume_incomplete))
++	if (READ_ONCE(ctrl->fullio_pm_incomplete))
+ 		return SDW_CMD_FAIL_OTHER;
+ 	if (msg->page) {
+ 		if (ctrl->page1_cache[msg->dev_num] != msg->addr_page1) {
+@@ -2371,9 +2371,34 @@
+ 	 * Keep that ownership for diagnosis/cleanup, but do not clock-stop
+ 	 * an uncertain bus again. Link admission separately stays locked.
+ 	 */
+-	WRITE_ONCE(ctrl->fullio_resume_incomplete, true);
++	WRITE_ONCE(ctrl->fullio_pm_incomplete, true);
+ 	qcom_swrm_fullio_latch_link_error(ctrl, ret < 0 ? ret : -EIO);
+ 	return 0;
++}
++
++static int swrm_fullio_clock_stop_result(struct qcom_swrm_ctrl *ctrl, int ret)
++{
++	int error;
++
++	if (!ctrl->fullio_link_gate)
++		return ret;
++
++	/* A broadcast completion timeout can be surfaced as CMD_IGNORED
++	 * (-ENODATA) by SoundWire core. Never treat a known pair as empty.
++	 */
++	error = READ_ONCE(ctrl->fullio_link_error);
++	if (!error && ret == -ENODATA && !READ_ONCE(ctrl->fullio_seen_attached))
++		return ret;
++	error = error ?: ret;
++	if (!error)
++		return 0;
++
++	if (error == -ENODATA)
++		error = -ENODEV;
++	WRITE_ONCE(ctrl->fullio_pm_incomplete, true);
++	qcom_swrm_fullio_latch_link_error(ctrl, error);
++	error = READ_ONCE(ctrl->fullio_link_error);
++	return error == -ENODATA ? -ENODEV : error;
+ }
+ 
+ static int __maybe_unused swrm_runtime_suspend(struct device *dev)
+@@ -2381,8 +2406,11 @@
+ 	struct qcom_swrm_ctrl *ctrl = dev_get_drvdata(dev);
+ 	int ret;
+ 
+-	if (ctrl->fullio_resume_incomplete)
++	if (READ_ONCE(ctrl->fullio_pm_incomplete))
+ 		return -EBUSY;
++	ret = READ_ONCE(ctrl->fullio_link_error);
++	if (ret)
++		return ret;
+ 	if (!swrm_wait_for_wr_fifo_done(ctrl) && ctrl->fullio_link_gate) {
+ 		/* Keep the IRQ/clock ownership unchanged, and do not retry here. */
+ 		qcom_swrm_fullio_latch_link_error(ctrl, -ETIMEDOUT);
+@@ -2398,26 +2426,26 @@
+ 		ctrl->reg_write(ctrl, ctrl->reg_layout[SWRM_REG_INTERRUPT_CPU_EN],
+ 				ctrl->intr_mask);
+ 		/* Prepare slaves for clock stop */
+-		ret = sdw_bus_prep_clk_stop(&ctrl->bus);
++		ret = swrm_fullio_clock_stop_result(ctrl, sdw_bus_prep_clk_stop(&ctrl->bus));
+ 		if (ret < 0 && ret != -ENODATA) {
+-			qcom_swrm_fullio_latch_link_error(ctrl, ret);
+ 			dev_err(dev, "prepare clock stop failed %d", ret);
+ 			return ret;
+ 		}
+ 
+ 		ret = sdw_bus_clk_stop(&ctrl->bus);
+ 		swrm_fullio_pm_snapshot(ctrl, "after-enter-clock-stop", ret);
++		ret = swrm_fullio_clock_stop_result(ctrl, ret);
+ 		if (ret < 0 && ret != -ENODATA) {
+-			qcom_swrm_fullio_latch_link_error(ctrl, ret);
+ 			dev_err(dev, "bus clock stop failed %d", ret);
+ 			return ret;
+ 		}
+-		/* An empty bus (-ENODATA) did not send ClockStopNow. */
++		/* An ignored command on a never-seen bus has no frame proof. */
+ 		if (!ret && ctrl->fullio_link_gate &&
+ 		    of_property_read_bool(dev->of_node, "qcom,denali-fullio-wait-frame-stop")) {
+ 			ret = swrm_fullio_wait_for_frame_stop(ctrl);
++			/* A failed status read cannot prove an empty bus. */
++			ret = swrm_fullio_clock_stop_result(ctrl, ret == -ENODATA ? -EIO : ret);
+ 			if (ret) {
+-				qcom_swrm_fullio_latch_link_error(ctrl, ret);
+ 				dev_err(dev, "FullIO frame stop unverified; iface kept on: %d\n", ret);
+ 				return ret;
+ 			}

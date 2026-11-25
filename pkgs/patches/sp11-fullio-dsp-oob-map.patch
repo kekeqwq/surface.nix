@@ -1,0 +1,229 @@
+Subject: [EXPERIMENT] ASoC: q6apm: give FullIO calibration its own OOB mapping
+
+Adapt the reference OOB memory commands with separate, unique request tokens.
+Keep a caller-owned DMA region poisoned on uncertain DSP completion. Nothing
+allocates, maps, submits calibration or frees a DMA region in the live driver yet.
+
+diff --git a/sound/soc/qcom/qdsp6/q6apm.c b/sound/soc/qcom/qdsp6/q6apm.c
+index 337a080..527eab2 100644
+--- a/sound/soc/qcom/qdsp6/q6apm.c
++++ b/sound/soc/qcom/qdsp6/q6apm.c
+@@ -11,6 +11,7 @@
+ #include <linux/of_platform.h>
+ #include <linux/sched.h>
+ #include <linux/slab.h>
++#include <linux/sizes.h>
+ #include <linux/soc/qcom/apr.h>
+ #include <linux/wait.h>
+ #include <sound/soc.h>
+@@ -63,6 +64,145 @@ int q6apm_send_cmd_sync(struct q6apm *apm, struct gpr_pkt *pkt,
+ 					NULL, &apm->wait, pkt, rsp_opcode);
+ }
+ 
++/* The ordinary APM map tokens use the graph ID and a position-buffer flag.
++ * Use a separate token namespace; late replies must never satisfy another map.
++ */
++#define Q6APM_FULLIO_OOB_TOKEN BIT(31)
++
++static bool q6apm_fullio_oob_reply(struct q6apm *apm, const struct gpr_resp_pkt *data)
++{
++	const struct gpr_ibasic_rsp_result_t *basic;
++	const struct apm_cmd_rsp_shared_mem_map_regions *map;
++	const struct gpr_hdr *hdr = &data->hdr;
++	unsigned long flags;
++	int status = -EPROTO;
++	u32 handle = 0;
++
++	if (!(hdr->token & Q6APM_FULLIO_OOB_TOKEN))
++		return false;
++
++	spin_lock_irqsave(&apm->fullio_oob_lock, flags);
++	if (hdr->token != apm->fullio_oob_token)
++		goto out;
++
++	if (hdr->opcode == APM_CMD_RSP_SHARED_MEM_MAP_REGIONS &&
++	    apm->fullio_oob_op == APM_CMD_SHARED_MEM_MAP_REGIONS &&
++	    data->payload && data->payload_size >= (int)sizeof(*map)) {
++		map = data->payload;
++		handle = map->mem_map_handle;
++		if (handle)
++			status = 0;
++	} else if (hdr->opcode == GPR_BASIC_RSP_RESULT && data->payload &&
++		   data->payload_size >= (int)sizeof(*basic)) {
++		basic = data->payload;
++		if (basic->opcode != apm->fullio_oob_op)
++			goto out;
++		if (!basic->status && apm->fullio_oob_op == APM_CMD_SHARED_MEM_MAP_REGIONS)
++			goto out; /* Mapping needs the actual handle, not just BASIC success. */
++		status = basic->status ? -EIO : 0;
++	}
++
++	apm->fullio_oob_status = status;
++	apm->fullio_oob_handle = handle;
++	apm->fullio_oob_token = 0;
++	complete(&apm->fullio_oob_done);
++out:
++	spin_unlock_irqrestore(&apm->fullio_oob_lock, flags);
++	return true;
++}
++
++static int q6apm_fullio_oob_rpc(struct q6apm *apm, struct gpr_pkt *pkt, u32 *handle)
++{
++	gpr_device_t *gdev = apm->gdev;
++	unsigned long flags;
++	int ret;
++
++	/* Serialize against legacy APM commands, without using their reply slot. */
++	guard(mutex)(&apm->lock);
++	if (apm->fullio_oob_sequence >= Q6APM_FULLIO_OOB_TOKEN - 1)
++		return -EOVERFLOW;
++
++	pkt->hdr.token = Q6APM_FULLIO_OOB_TOKEN | ++apm->fullio_oob_sequence;
++	pkt->hdr.dest_domain = audioreach_gpr_dest_domain(gdev);
++	reinit_completion(&apm->fullio_oob_done);
++	spin_lock_irqsave(&apm->fullio_oob_lock, flags);
++	apm->fullio_oob_status = -ETIMEDOUT;
++	apm->fullio_oob_op = pkt->hdr.opcode;
++	apm->fullio_oob_token = pkt->hdr.token;
++	spin_unlock_irqrestore(&apm->fullio_oob_lock, flags);
++
++	ret = gpr_send_pkt(gdev, pkt);
++	if (ret >= 0 && !wait_for_completion_timeout(&apm->fullio_oob_done, 5 * HZ))
++		ret = -ETIMEDOUT;
++
++	spin_lock_irqsave(&apm->fullio_oob_lock, flags);
++	apm->fullio_oob_token = 0;
++	if (ret >= 0) {
++		ret = apm->fullio_oob_status;
++		if (!ret && handle)
++			*handle = apm->fullio_oob_handle;
++	}
++	spin_unlock_irqrestore(&apm->fullio_oob_lock, flags);
++	return ret;
++}
++
++int q6apm_fullio_oob_map(struct q6apm *apm, struct q6apm_fullio_oob_region *region)
++{
++	struct apm_cmd_shared_mem_map_regions *cmd;
++	struct apm_shared_map_region_payload *map;
++	int ret;
++
++	if (region->handle || region->poisoned || !region->size ||
++	    region->size > SZ_64K || !IS_ALIGNED(region->size, SZ_4K) ||
++	    !IS_ALIGNED(region->dsp_addr, SZ_4K))
++		return -EINVAL;
++
++	struct gpr_pkt *pkt __free(kfree) =
++		audioreach_alloc_apm_cmd_pkt(sizeof(*cmd) + sizeof(*map),
++					    APM_CMD_SHARED_MEM_MAP_REGIONS, 0);
++	if (IS_ERR(pkt))
++		return PTR_ERR(pkt);
++
++	cmd = (void *)pkt + GPR_HDR_SIZE;
++	cmd->mem_pool_id = APM_MEMORY_MAP_SHMEM8_4K_POOL;
++	cmd->num_regions = 1;
++	cmd->property_flag = 0;
++	map = (void *)cmd + sizeof(*cmd);
++	map->shm_addr_lsw = lower_32_bits(region->dsp_addr);
++	map->shm_addr_msw = upper_32_bits(region->dsp_addr);
++	map->mem_size_bytes = region->size;
++
++	ret = q6apm_fullio_oob_rpc(apm, pkt, &region->handle);
++	if (ret)
++		region->poisoned = true;
++	return ret;
++}
++EXPORT_SYMBOL_GPL(q6apm_fullio_oob_map);
++
++int q6apm_fullio_oob_unmap(struct q6apm *apm, struct q6apm_fullio_oob_region *region)
++{
++	struct apm_cmd_shared_mem_unmap_regions *cmd;
++	int ret;
++
++	if (region->poisoned || !region->handle)
++		return -EINVAL;
++
++	struct gpr_pkt *pkt __free(kfree) =
++		audioreach_alloc_apm_cmd_pkt(sizeof(*cmd), APM_CMD_SHARED_MEM_UNMAP_REGIONS, 0);
++	if (IS_ERR(pkt))
++		return PTR_ERR(pkt);
++
++	cmd = (void *)pkt + GPR_HDR_SIZE;
++	cmd->mem_map_handle = region->handle;
++	ret = q6apm_fullio_oob_rpc(apm, pkt, NULL);
++	if (ret)
++		region->poisoned = true;
++	else
++		region->handle = 0;
++	return ret;
++}
++EXPORT_SYMBOL_GPL(q6apm_fullio_oob_unmap);
++
+ static struct audioreach_graph *q6apm_get_audioreach_graph(struct q6apm *apm, uint32_t graph_id)
+ {
+ 	struct audioreach_graph_info *info;
+@@ -958,6 +1098,8 @@ static int apm_probe(gpr_device_t *gdev)
+ 
+ 	mutex_init(&apm->lock);
+ 	mutex_init(&apm->graph_lock);
++	spin_lock_init(&apm->fullio_oob_lock);
++	init_completion(&apm->fullio_oob_done);
+ 	apm->dev = dev;
+ 	apm->gdev = gdev;
+ 	init_waitqueue_head(&apm->wait);
+@@ -1015,7 +1157,7 @@ static int apm_callback(const struct gpr_resp_pkt *data, void *priv, int op)
+ 	const struct gpr_hdr *hdr = &data->hdr;
+ 	int graph_id, is_pos_buf;
+ 
+-	if (!apm)
++	if (!apm || q6apm_fullio_oob_reply(apm, data))
+ 		return 0;
+ 
+ 	result = data->payload;
+diff --git a/sound/soc/qcom/qdsp6/q6apm.h b/sound/soc/qcom/qdsp6/q6apm.h
+index 3b4b833..c47135d 100644
+--- a/sound/soc/qcom/qdsp6/q6apm.h
++++ b/sound/soc/qcom/qdsp6/q6apm.h
+@@ -3,6 +3,8 @@
+ #define __Q6APM_H__
+ #include <linux/types.h>
+ #include <linux/atomic.h>
++#include <linux/completion.h>
++#include <linux/spinlock.h>
+ #include <linux/slab.h>
+ #include <linux/wait.h>
+ #include <linux/kernel.h>
+@@ -66,6 +68,14 @@ struct q6apm {
+ 	/* Serializes DSP graph open, publication and final close. */
+ 	struct mutex graph_lock;
+ 	unsigned long fullio_transport;
++	/* Dedicated, token-matched OOB mapping acknowledgement. */
++	spinlock_t fullio_oob_lock;
++	struct completion fullio_oob_done;
++	u32 fullio_oob_sequence;
++	u32 fullio_oob_token;
++	u32 fullio_oob_op;
++	u32 fullio_oob_handle;
++	int fullio_oob_status;
+ 	struct idr graph_idr;
+ 	struct idr graph_info_idr;
+ 	struct idr sub_graphs_idr;
+@@ -126,6 +136,18 @@ void q6apm_fullio_set_transport(struct device *dev, enum q6apm_fullio_feedback p
+ 			      bool enabled);
+ bool q6apm_fullio_transport_enabled(struct q6apm *apm);
+ 
++/* The caller serializes access and owns the DMA allocation. A poisoned
++ * region stays pinned and untouched until the owning DSP has been reset.
++ */
++struct q6apm_fullio_oob_region {
++	u64 dsp_addr;
++	size_t size;
++	u32 handle;
++	bool poisoned;
++};
++int q6apm_fullio_oob_map(struct q6apm *apm, struct q6apm_fullio_oob_region *region);
++int q6apm_fullio_oob_unmap(struct q6apm *apm, struct q6apm_fullio_oob_region *region);
++
+ int q6apm_find_integrated_backend(struct device *dev, u32 backend, int *owner);
+ struct q6apm_graph *q6apm_graph_open(struct device *dev, q6apm_cb cb,
+ 				     void *priv, int graph_id, int dir);

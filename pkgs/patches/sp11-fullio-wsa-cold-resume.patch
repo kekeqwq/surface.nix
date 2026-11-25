@@ -1,0 +1,76 @@
+ASoC: wsa884x: follow the reference cold lifecycle across SoundWire re-attach
+
+The reference re-runs the cold table at every slave attach; an idle clock collapse must not dead-end the codec (observed: set_hw_params -ENODEV and a dead sink). VPHX is diagnostic-only as in the reference (a late status read at re-attach previously refused initialization). Keep the PA-off pre-write gate; a FAILED table still leaves partial analog state and is never retried.
+--- a/sound/soc/codecs/wsa884x.c
++++ b/sound/soc/codecs/wsa884x.c
+@@ -749,7 +749,7 @@
+ 	struct sdw_dpn_prop feedback_ports[2];
+ 	bool feedback_enabled;
+ 	bool fullio_reference_codec;
+-	bool fullio_cold_attempted;
++	bool fullio_cold_failed;
+ 	bool fullio_sink_bank_observed;
+ 	atomic64_t fullio_pa_epoch;
+ 	spinlock_t fullio_fault_lock;
+@@ -1617,14 +1617,21 @@
+ 	unsigned int value;
+ 	int ret;
+ 
+-	if (amp->fullio_cold_attempted)
+-		return -ENOTRECOVERABLE;
+-	amp->fullio_cold_attempted = true;
++	/* The reference lifecycle re-runs the cold table after every SoundWire
++	 * attach (idle clock collapse is routine). Only a failed table — which
++	 * leaves partially written analog state — is never retried.
++	 */
++	if (amp->fullio_cold_failed)
++		return -ENOTRECOVERABLE;
+ 
+-	/* Only the verified Denali 2S supply is supported by this sequence. */
++	/* VPHX is diagnostic on this fixed 2S Denali hardware: the reference
++	 * logs a mismatch and applies the table anyway. Never dead-end the
++	 * codec on a status-read race at SoundWire re-attach.
++	 */
+ 	ret = regmap_read_bypassed(amp->regmap, WSA884X_VPHX_SYS_EN_STATUS, &value);
+ 	if (ret || value != 0x02)
+-		return ret ?: -ENODEV;
++		dev_warn(amp->dev, "FullIO cold setup: VPHX status %#x (read %d), applying the 2S reference table\n",
++			 value, ret);
+ 	ret = regmap_read_bypassed(amp->regmap, WSA884X_PA_FSM_EN, &value);
+ 	if (ret || (value & WSA884X_PA_FSM_EN_GLOBAL_PA_EN_MASK))
+ 		return ret ?: -EBUSY;
+@@ -1633,12 +1640,16 @@
+ 		const struct reg_sequence *entry = &wsa884x_fullio_cold_init[i];
+ 
+ 		ret = regmap_write(amp->regmap, entry->reg, entry->def);
+-		if (ret)
++		if (ret) {
++			amp->fullio_cold_failed = true;
+ 			return ret;
++		}
+ 	}
+ 	ret = regmap_read_bypassed(amp->regmap, WSA884X_PA_FSM_EN, &value);
+-	if (ret || (value & WSA884X_PA_FSM_EN_GLOBAL_PA_EN_MASK))
++	if (ret || (value & WSA884X_PA_FSM_EN_GLOBAL_PA_EN_MASK)) {
++		amp->fullio_cold_failed = true;
+ 		return ret ?: -EIO;
++	}
+ 	WRITE_ONCE(amp->hw_init, true);
+ 	return 0;
+ }
+@@ -1706,14 +1717,12 @@
+ 
+ 	if (wsa884x->hw_init || status != SDW_SLAVE_ATTACHED)
+ 		return 0;
+-	if (wsa884x->fullio_reference_codec && wsa884x->fullio_cold_attempted)
+-		return -ENOTRECOVERABLE;
+ 
+ 	regcache_cache_only(wsa884x->regmap, false);
+ 	ret = regcache_sync(wsa884x->regmap);
+ 	if (ret < 0) {
+ 		if (wsa884x->fullio_reference_codec)
+-			wsa884x->fullio_cold_attempted = true;
++			wsa884x->fullio_cold_failed = true;
+ 		dev_err(&slave->dev, "Cannot sync regmap cache\n");
+ 		return ret;
+ 	}

@@ -1,0 +1,79 @@
+Subject: [EXPERIMENT] ASoC: expose stable FullIO PA state snapshots
+
+Sample both hardware state registers without regcache; detect detach and
+changing enable state. Nothing writes the amplifier or uses the snapshots
+to release mute or change the clocks yet.
+
+diff --git a/sound/soc/codecs/wsa884x.c b/sound/soc/codecs/wsa884x.c
+index 5851641..f3c23ee 100755
+--- a/sound/soc/codecs/wsa884x.c
++++ b/sound/soc/codecs/wsa884x.c
+@@ -1802,12 +1802,14 @@ static const struct snd_soc_component_driver wsa884x_component_drv = {
+ 	.num_dapm_routes = ARRAY_SIZE(wsa884x_audio_map),
+ };
+ 
+-/* A software mute flag is not proof that the physical PA is disabled. */
+-int wsa884x_fullio_pa_off(struct snd_soc_component *component);
+-int wsa884x_fullio_pa_off(struct snd_soc_component *component)
++/* Return a hardware snapshot, not a software-mute flag or PA-up claim. */
++int wsa884x_fullio_read_pa(struct snd_soc_component *component,
++			 unsigned int *enable, unsigned int *state0, unsigned int *state1);
++int wsa884x_fullio_read_pa(struct snd_soc_component *component,
++			 unsigned int *enable, unsigned int *state0, unsigned int *state1)
+ {
+ 	struct wsa884x_priv *wsa884x;
+-	unsigned int value;
++	unsigned int before, after, sta0, sta1;
+ 	int ret;
+ 
+ 	if (!component || component->driver != &wsa884x_component_drv)
+@@ -1821,17 +1823,43 @@ int wsa884x_fullio_pa_off(struct snd_soc_component *component)
+ 		return ret;
+ 	if (READ_ONCE(wsa884x->slave->status) != SDW_SLAVE_ATTACHED) {
+ 		ret = -ENODEV;
+-	} else {
+-		ret = regmap_read_bypassed(wsa884x->regmap, WSA884X_PA_FSM_EN, &value);
+-		if (!ret && READ_ONCE(wsa884x->slave->status) != SDW_SLAVE_ATTACHED)
+-			ret = -ENODEV;
+-		if (!ret && (value & WSA884X_PA_FSM_EN_GLOBAL_PA_EN_MASK))
+-			ret = -EBUSY;
++		goto put;
++	}
++	ret = regmap_read_bypassed(wsa884x->regmap, WSA884X_PA_FSM_EN, &before);
++	if (!ret)
++		ret = regmap_read_bypassed(wsa884x->regmap, WSA884X_PA_FSM_STA0, &sta0);
++	if (!ret)
++		ret = regmap_read_bypassed(wsa884x->regmap, WSA884X_PA_FSM_STA1, &sta1);
++	if (!ret)
++		ret = regmap_read_bypassed(wsa884x->regmap, WSA884X_PA_FSM_EN, &after);
++	if (!ret && READ_ONCE(wsa884x->slave->status) != SDW_SLAVE_ATTACHED)
++		ret = -ENODEV;
++	if (!ret && before != after)
++		ret = -EAGAIN;
++	if (!ret) {
++		*enable = after;
++		*state0 = sta0;
++		*state1 = sta1;
+ 	}
++put:
+ 	pm_runtime_mark_last_busy(wsa884x->dev);
+ 	pm_runtime_put_autosuspend(wsa884x->dev);
+ 	return ret;
+ }
++EXPORT_SYMBOL_GPL(wsa884x_fullio_read_pa);
++
++int wsa884x_fullio_pa_off(struct snd_soc_component *component);
++int wsa884x_fullio_pa_off(struct snd_soc_component *component)
++{
++	unsigned int enable, state0, state1;
++	int ret = wsa884x_fullio_read_pa(component, &enable, &state0, &state1);
++
++	if (ret)
++		return ret;
++	dev_dbg(component->dev, "FullIO PA snapshot: en=%#x state=%#x/%#x\n",
++		enable, state0, state1);
++	return enable & WSA884X_PA_FSM_EN_GLOBAL_PA_EN_MASK ? -EBUSY : 0;
++}
+ EXPORT_SYMBOL_GPL(wsa884x_fullio_pa_off);
+ 
+ static int wsa884x_hw_params(struct snd_pcm_substream *substream,

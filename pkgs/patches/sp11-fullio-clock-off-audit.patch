@@ -1,0 +1,121 @@
+Subject: [EXPERIMENT] ASoC: audit hardware protection clocks off at feedback teardown
+
+An opt-in PA-off fixture can exercise the same card-local routing and
+read TX0–TX3 without a clock-enable path or speaker PCM trigger.
+
+diff --git a/sound/soc/codecs/lpass-wsa-macro.c b/sound/soc/codecs/lpass-wsa-macro.c
+index 633ebb7..30fcd42 100755
+--- a/sound/soc/codecs/lpass-wsa-macro.c
++++ b/sound/soc/codecs/lpass-wsa-macro.c
+@@ -1634,6 +1634,12 @@ static bool wsa_macro_fullio_post_pa_probe(struct snd_soc_component *component)
+ 				     "microsoft,denali-fullio-post-pa-test");
+ }
+ 
++static bool wsa_macro_fullio_clock_audit(struct snd_soc_card *card)
++{
++	return card && of_machine_is_compatible("microsoft,denali") &&
++	       of_property_read_bool(card->dev->of_node, "microsoft,denali-fullio-clock-off-audit");
++}
++
+ /* Only a future card-local coordinator can supply hardware/mute verification.
+  * There is deliberately no caller and no board opt-in in this patch.
+  */
+@@ -1653,7 +1659,7 @@ int wsa_macro_fullio_protclk(struct snd_soc_component *component, bool enable,
+ 	if (!enable && !wsa->fullio_clock_pm)
+ 		return 0;
+ 	if (enable) {
+-		if (!verify_ready || wsa->fullio_clock_fault)
++		if (wsa_macro_fullio_clock_audit(component->card) || !verify_ready || wsa->fullio_clock_fault)
+ 			return -EPERM;
+ 		ret = verify_ready(ctx);
+ 		if (ret)
+@@ -1697,6 +1703,40 @@ int wsa_macro_fullio_protclk(struct snd_soc_component *component, bool enable,
+ }
+ EXPORT_SYMBOL_GPL(wsa_macro_fullio_protclk);
+ 
++/* No clock-control writes in the PA-off audit. Read all four lanes so
++ * an unexpected enabling path is visible even when the DSP stays silent.
++ */
++static int wsa_macro_fullio_verify_clocks_off(struct snd_soc_component *owner)
++{
++	struct wsa_macro *wsa = snd_soc_component_get_drvdata(owner);
++	unsigned int i, value, on = 0;
++	int ret;
++
++	guard(mutex)(&wsa->fullio_clock_lock);
++	if (wsa->fullio_clock_pm || wsa->fullio_clock_fault)
++		return -EBUSY;
++	ret = pm_runtime_resume_and_get(wsa->dev);
++	if (ret < 0)
++		return ret;
++	for (i = 0; i < ARRAY_SIZE(fullio_tx_regs); i++) {
++		ret = regmap_read_bypassed(wsa->regmap, fullio_tx_regs[i], &value);
++		if (ret)
++			break;
++		if (value & CDC_WSA_TX_SPKR_PROT_CLK_EN_MASK)
++			on |= BIT(i);
++	}
++	pm_runtime_mark_last_busy(wsa->dev);
++	pm_runtime_put_autosuspend(wsa->dev);
++	if (ret)
++		return ret;
++	if (on) {
++		dev_err_ratelimited(wsa->dev, "FullIO clock-off audit found enabled TX lanes: %#x\n", on);
++		return -EBUSY;
++	}
++	dev_info_ratelimited(wsa->dev, "FullIO clock-off audit: TX0-TX3 hardware readback off\n");
++	return 0;
++}
++
+ /* Resolve clock ownership from the card's playback link, not global state. */
+ static int wsa_macro_fullio_clock_off_on_card(struct snd_soc_card *card,
+ 					     struct snd_soc_component *amp)
+@@ -1727,6 +1767,8 @@ static int wsa_macro_fullio_clock_off_on_card(struct snd_soc_card *card,
+ 	}
+ 	if ((amp && emitters != 1) || !owner || owner->card != card)
+ 		return -ENODEV;
++	if (wsa_macro_fullio_clock_audit(card))
++		return wsa_macro_fullio_verify_clocks_off(owner);
+ 	return wsa_macro_fullio_protclk(owner, false, NULL, NULL);
+ }
+ 
+@@ -1744,7 +1786,8 @@ int wsa_macro_fullio_clock_off_for_feedback(struct snd_soc_card *card);
+ int wsa_macro_fullio_clock_off_for_feedback(struct snd_soc_card *card)
+ {
+ 	if (!card || !of_machine_is_compatible("microsoft,denali") ||
+-	    !of_property_read_bool(card->dev->of_node, "microsoft,denali-fullio-post-pa-test"))
++	    (!of_property_read_bool(card->dev->of_node, "microsoft,denali-fullio-post-pa-test") &&
++	     !wsa_macro_fullio_clock_audit(card)))
+ 		return -EOPNOTSUPP;
+ 	return wsa_macro_fullio_clock_off_on_card(card, NULL);
+ }
+@@ -1785,7 +1828,7 @@ static int wsa_macro_enable_vi_feedback(struct snd_soc_dapm_widget *w,
+ 	u32 rate_val;
+ 
+ 	/* The ordinary DAPM event is too early for the post-PA experiment. */
+-	if (wsa_macro_fullio_post_pa_probe(component))
++	if (wsa_macro_fullio_post_pa_probe(component) || wsa_macro_fullio_clock_audit(component->card))
+ 		return 0;
+ 
+ 	switch (wsa->pcm_rate_vi) {
+diff --git a/sound/soc/qcom/x1e80100.c b/sound/soc/qcom/x1e80100.c
+index 30b57e3..7bb205e 100644
+--- a/sound/soc/qcom/x1e80100.c
++++ b/sound/soc/qcom/x1e80100.c
+@@ -188,12 +188,13 @@ static void x1e80100_fullio_feedback(struct snd_pcm_substream *substream, bool e
+ 	/* Revoke the graph's transport epoch before touching clocks. The
+ 	 * machine caller still performs hw_free/shutdown on an error here.
+ 	 */
+-	if (!enabled && of_property_read_bool(rtd->card->dev->of_node,
+-					      "microsoft,denali-fullio-post-pa-test")) {
++	if (!enabled &&
++	    (of_property_read_bool(rtd->card->dev->of_node, "microsoft,denali-fullio-post-pa-test") ||
++	     of_property_read_bool(rtd->card->dev->of_node, "microsoft,denali-fullio-clock-off-audit"))) {
+ 		ret = wsa_macro_fullio_clock_off_for_feedback(rtd->card);
+ 		if (ret)
+ 			dev_err_ratelimited(rtd->card->dev,
+-					    "FullIO clock shutdown failed at feedback teardown: %d\n", ret);
++					    "FullIO clock shutdown/audit failed at feedback teardown: %d\n", ret);
+ 	}
+ }
+ 
