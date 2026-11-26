@@ -78,6 +78,10 @@
           {
             contract = builtins.toJSON {
               networkmanager = live.config.networking.networkmanager.enable;
+              wifiBackend = live.config.networking.networkmanager.wifi.backend;
+              wifiEnabled = live.config.networking.wireless.enable;
+              wifiDbus = live.config.networking.wireless.dbusControlled;
+              wifiUnit = live.config.systemd.services.wpa_supplicant.enable;
               ssh = live.config.services.openssh.enable;
               root = live.config.services.openssh.settings.PermitRootLogin;
               empty = live.config.services.openssh.settings.PermitEmptyPasswords;
@@ -92,6 +96,10 @@
           ''
             printf '%s\n' "$contract" > "$out"
             grep -q '"networkmanager":true' "$out"
+            grep -Fq '"wifiBackend":"wpa_supplicant"' "$out"
+            grep -Fq '"wifiEnabled":true' "$out"
+            grep -Fq '"wifiDbus":true' "$out"
+            grep -Fq '"wifiUnit":true' "$out"
             grep -q '"ssh":true' "$out"
             grep -q '"root":"yes"' "$out"
             grep -q '"empty":true' "$out"

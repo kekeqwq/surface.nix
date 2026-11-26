@@ -111,8 +111,9 @@ in
   networking.hostName = "surface-live";
   # A new, stateless Live environment; not the installed host's compatibility baseline.
   system.stateVersion = "26.11";
+  # NetworkManager enables its D-Bus-controlled wpa_supplicant backend.
+  # Do not force networking.wireless.enable off: that removes the backend.
   networking.networkmanager.enable = true;
-  networking.wireless.enable = lib.mkForce false;
   documentation.enable = false;
   documentation.man.enable = false;
   documentation.doc.enable = false;
