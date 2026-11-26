@@ -1,0 +1,35 @@
+Surface Pro 11 Denali OLED: private NixOS installation media
+
+This is a text installer, not the installed desktop. Boot only on a trusted
+isolated network: the Live root SSH account accepts an empty password.
+Do not repartition an existing installation to try the Live environment.
+
+For a fresh installation, prepare and mount the target root at /mnt and its
+EFI system partition at /mnt/boot. Use the consuming flakes repository, not
+surface.nix, for the installed system. Confirm that its #surface filesystem
+configuration matches the target mounts before running nixos-install.
+
+From the Live root console, stage the MSI firmware before installing:
+
+    mountpoint -q /mnt && mountpoint -q /mnt/boot
+    mountpoint -q /iso
+    cd /iso/surface-install
+    awk '$1 == "file" {print $2 "  firmware/" $4}' manifest.txt | sha256sum -c -
+    install -d -m 0700 /mnt/var/lib/surface-firmware
+    for p in qcom/x1e80100/microsoft/qcdxkmsuc8380.mbn \
+             qcom/x1e80100/microsoft/Denali/adsp_dtb.mbn \
+             qcom/x1e80100/microsoft/Denali/qcadsp8380.mbn; do
+      install -D -m 0600 "firmware/$p" "/mnt/var/lib/surface-firmware/$p" || break
+    done
+
+Stop if any check or copy fails. After preparing the consuming flake in
+/mnt/etc/nixos, the normal installation command is:
+
+    nixos-install --root /mnt --flake /mnt/etc/nixos#surface
+
+Its hardware module reads the staged GPU zap when writing the target UKI.
+The ADSP pair remains on the installed root. Remove this USB before verifying
+the target's default boot, Niri and protected speaker/MicArray audio.
+
+Do not upload this image, its blobs, or any firmware-bearing UKI. Remove any
+test-only SSH/sudo exemptions from the installed host before formal use.

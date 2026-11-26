@@ -17,17 +17,26 @@ Set `nixpkgs.hostPlatform` to `aarch64-linux`. Follow the consuming flake's `nix
 
 ## Installer image
 
-`nix build .#surface-live-iso` produces a text-only aarch64 ISO. It uses the
-aligned zboot UKI and appended EFI partition that this firmware can boot. It
-includes NetworkManager, Git, and the install tools (`fdisk` from
-`util-linux`, `btrfs-progs`, `cryptsetup`, `libfido2`). The console uses the built-in
-`TER16x32` font. There is no desktop.
+Build locally with native AArch64 Linux and an owner-downloaded Surface driver
+MSI (see below):
 
-Root SSH accepts an empty password from any source. Boot it only on a trusted
-network, and do not reuse that access on an installed system. The image does
-not contain private GPU or audio firmware and does not modify an existing
-installation. GitHub Actions builds it on `ubuntu-24.04-arm` when the live
-files change, or when the workflow is started manually.
+```sh
+nix develop .#surface-live -c \
+  python3 build.py --msi '/path/to/SurfacePro11_ARM.msi' --out "$HOME/surface-private.iso"
+```
+
+`build.py` builds the text-only `surface-live-iso` base, then adds the three
+private files and installation instructions under `/surface-install` outside
+Nix. With `--base-iso /path/to/nixos-surface-live-aarch64.iso`, a locally built
+AArch64 base can be reused without another Nix build. The remaster verifies
+that the EFI payload and Live squashfs are unchanged and reads back the
+embedded firmware hashes. It does not write a USB device.
+
+The Live environment includes NetworkManager, Git, `fdisk`, `btrfs-progs`,
+`cryptsetup`, `libfido2` and the `TER16x32` console font, but no desktop. Root
+SSH accepts an empty password from any reachable host; boot only on an
+isolated trusted network. Do not publish the private ISO. Installing to a new
+disk is a separate step; see [`live/install.txt`](live/install.txt).
 
 ## Private firmware
 
@@ -39,7 +48,14 @@ qcom/x1e80100/microsoft/Denali/adsp_dtb.mbn
 qcom/x1e80100/microsoft/Denali/qcadsp8380.mbn
 ```
 
-The Microsoft GPU zap file is required with this option; the two matching ADSP files enable native audio. They can be extracted offline from the [official Surface Pro 11 Snapdragon driver MSI](https://www.microsoft.com/en-us/download/details.aspx?id=106119), without installing Windows or running the installer. Windows names its ADSP DT file `adsp_dtbs.elf`. Keep the two ADSP files from the same driver package. The tested installation retained its previously extracted WOA zap; Microsoft's `31.0.137.0` zap was extracted and checked structurally, not hardware-accepted in that test. See [graphics validation](docs/gpu-rendering-investigation.md).
+The Microsoft GPU zap file is required with this option; the two matching ADSP files enable native audio. Download the [official Surface Pro 11 Snapdragon driver MSI](https://www.microsoft.com/en-us/download/details.aspx?id=106119) yourself, then stage the three files offline without Windows:
+
+```sh
+nix shell nixpkgs#msitools nixpkgs#python3 -c \
+  python3 scripts/surface-install-usb.py --msi /path/to/SurfacePro11_ARM.msi
+```
+
+The script leaves the MSI untouched and writes a private firmware tree and hash manifest beside it (or to `--out`). The known `26.094.41119.0` package passed [Denali OLED hardware regression](docs/gpu-rendering-investigation.md#msi-hardware-regression-2026-11-25). Other MSI hashes warn but aren't blocked solely by the hash; the required files still have to be present. This command does not build an ISO or write a USB device.
 
 On boot the activation script makes the private/public firmware union available **before root coldplug**. The boot installer adds the private zap to the embedded initrd on the local ESP, outside Nix. Treat installed private UKIs as owner-only files; do not redistribute them. Use `nixos-rebuild switch --flake <system-flake>#<host>` and retain an independently verified recovery UKI. Recovery entries must not be named `nixos-*.conf` or store their payload under `/EFI/nixos/`, where the ordinary NixOS boot installer performs cleanup.
 

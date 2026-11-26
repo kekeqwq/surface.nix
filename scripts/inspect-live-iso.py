@@ -151,7 +151,7 @@ def report(iso, profile):
                     'missing NixOS init path')
             require('fbcon=font:TER16x32' in cmdline, 'missing large console font')
             report.update(profile=profile, iso_sha256=sha256(iso), live_root=root,
-                          loader={'bytes': loader.stat().st_size, 'sha256': sha256(loader), 'config': config},
+                          esp_sha256=sha256(esp), loader={'bytes': loader.stat().st_size, 'sha256': sha256(loader), 'config': config},
                           uki=measured)
             return report
         entries = {}

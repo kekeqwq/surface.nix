@@ -12,51 +12,79 @@
   ...
 }:
 let
+  # Keep install-media filesystems out of the ordinary Denali kernel.
+  baseConfig = builtins.readFile ../pkgs/config-denali-next.aarch64;
+  liveConfig = pkgs.writeText "denali-live.config" (
+    lib.replaceStrings
+      [ "# CONFIG_ISO9660_FS is not set" "# CONFIG_SQUASHFS is not set" ]
+      [ "CONFIG_ISO9660_FS=m" "CONFIG_SQUASHFS=m\nCONFIG_SQUASHFS_ZSTD=y" ]
+      baseConfig
+  );
+  liveKernel = pkgs.surfacePackages.surfaceNext.override {
+    configfile = liveConfig;
+    localVersion = "-surface-live";
+  };
+  isoInspector = pkgs.runCommand "surface-live-inspector" { } ''
+    mkdir -p "$out"
+    cp ${../scripts/inspect-live-iso.py} "$out/inspect-live-iso.py"
+    cp ${../scripts/inspect-efi-payload.py} "$out/inspect-efi-payload.py"
+  '';
   efi = config.boot.uki.settings.UKI;
   ukiFile = "surface-live.efi";
   cmdline = "init=${config.system.build.toplevel}/init ${toString config.boot.kernelParams}";
-  uki = pkgs.runCommand "surface-live-uki" {
-    nativeBuildInputs = [
-      pkgs.systemdUkify
-      pkgs.python3
-      pkgs.zstd
-    ];
-  } ''
-    ukify build \
-      --linux ${efi.Linux} \
-      --initrd ${config.system.build.initialRamdisk}/${config.system.boot.loader.initrdFile} \
-      --devicetree ${efi.DeviceTree} \
-      --cmdline ${lib.escapeShellArg cmdline} \
-      --stub ${config.systemd.package}/lib/systemd/boot/efi/linuxaa64.efi.stub \
-      --uname ${lib.escapeShellArg efi.Uname} \
-      --output "$out"
-    python3 ${../scripts/inspect-efi-payload.py} "$out" \
-      --expect-uki ${lib.escapeShellArg efi.Uname} \
-      --expect-linux ${efi.Linux} \
-      --expect-dtb ${efi.DeviceTree} \
-      --expect-initrd ${config.system.build.initialRamdisk}/${config.system.boot.loader.initrdFile} \
-      --expect-cmdline ${lib.escapeShellArg cmdline}
-  '';
+  uki =
+    pkgs.runCommand "surface-live-uki"
+      {
+        nativeBuildInputs = [
+          pkgs.systemdUkify
+          pkgs.python3
+          pkgs.zstd
+        ];
+      }
+      ''
+        ukify build \
+          --linux ${efi.Linux} \
+          --initrd ${config.system.build.initialRamdisk}/${config.system.boot.loader.initrdFile} \
+          --devicetree ${efi.DeviceTree} \
+          --cmdline ${lib.escapeShellArg cmdline} \
+          --stub ${config.systemd.package}/lib/systemd/boot/efi/linuxaa64.efi.stub \
+          --os-release @${config.system.build.toplevel}/etc/os-release \
+          --uname ${lib.escapeShellArg efi.Uname} \
+          --output "$out"
+        python3 ${../scripts/inspect-efi-payload.py} "$out" \
+          --expect-uki ${lib.escapeShellArg efi.Uname} \
+          --expect-linux ${efi.Linux} \
+          --expect-dtb ${efi.DeviceTree} \
+          --expect-initrd ${config.system.build.initialRamdisk}/${config.system.boot.loader.initrdFile} \
+          --expect-cmdline ${lib.escapeShellArg cmdline}
+      '';
   loader = "${config.systemd.package}/lib/systemd/boot/efi/systemd-bootaa64.efi";
   loaderConf = pkgs.writeText "loader.conf" ''
     default ${ukiFile}
     timeout 5
     editor no
   '';
-  esp = pkgs.runCommand "surface-live-esp.img" {
-    nativeBuildInputs = [ pkgs.dosfstools pkgs.libfaketime pkgs.mtools ];
-  } ''
-    truncate -s "$(( $(stat -c %s ${uki}) + 96 * 1024 * 1024 ))" "$out"
-    mkfs.vfat --invariant -F 32 -n SURFACE "$out"
-    export TZ=UTC
-    fat() { faketime -f '2000-01-01 00:00:00' "$@"; }
-    fat mmd -i "$out" ::EFI ::EFI/BOOT ::EFI/Linux ::loader
-    fat mcopy -i "$out" ${loader} ::EFI/BOOT/BOOTAA64.EFI
-    fat mcopy -i "$out" ${uki} ::EFI/Linux/${ukiFile}
-    fat mcopy -i "$out" ${loaderConf} ::loader/loader.conf
-    mcopy -i "$out" ::EFI/Linux/${ukiFile} embedded.efi
-    cmp ${uki} embedded.efi
-  '';
+  esp =
+    pkgs.runCommand "surface-live-esp.img"
+      {
+        nativeBuildInputs = [
+          pkgs.dosfstools
+          pkgs.libfaketime
+          pkgs.mtools
+        ];
+      }
+      ''
+        truncate -s "$(( $(stat -c %s ${uki}) + 96 * 1024 * 1024 ))" "$out"
+        mkfs.vfat --invariant -F 32 -n SURFACE "$out"
+        export TZ=UTC
+        fat() { faketime -f '2000-01-01 00:00:00' "$@"; }
+        fat mmd -i "$out" ::EFI ::EFI/BOOT ::EFI/Linux ::loader
+        fat mcopy -i "$out" ${loader} ::EFI/BOOT/BOOTAA64.EFI
+        fat mcopy -i "$out" ${uki} ::EFI/Linux/${ukiFile}
+        fat mcopy -i "$out" ${loaderConf} ::loader/loader.conf
+        mcopy -i "$out" ::EFI/Linux/${ukiFile} embedded.efi
+        cmp ${uki} embedded.efi
+      '';
   image = pkgs.callPackage (modulesPath + "/../lib/make-iso9660-image.nix") {
     isoName = "nixos-surface-live-aarch64.iso";
     inherit (config.isoImage) volumeID squashfsCompression contents;
@@ -76,6 +104,8 @@ in
   surface.devices.denali.enable = true;
   hardware.enableAllHardware = lib.mkForce false;
   networking.hostName = "surface-live";
+  # A new, stateless Live environment; not the installed host's compatibility baseline.
+  system.stateVersion = "26.11";
   networking.networkmanager.enable = true;
   networking.wireless.enable = lib.mkForce false;
   documentation.enable = false;
@@ -85,8 +115,19 @@ in
 
   # The installed host remains ext4. The installer itself must be able to
   # create the secret-lab layout: LUKS2 plus compressed Btrfs.
-  boot.supportedFilesystems = lib.mkForce [ "btrfs" "ext4" "vfat" ];
-  boot.initrd.supportedFilesystems = lib.mkForce [ "iso9660" "squashfs" "overlay" ];
+  boot.kernelPackages = lib.mkForce (pkgs.linuxPackagesFor liveKernel);
+  boot.swraid.enable = lib.mkForce false;
+  boot.initrd.services.lvm.enable = lib.mkForce false;
+  boot.supportedFilesystems = lib.mkForce [
+    "btrfs"
+    "ext4"
+    "vfat"
+  ];
+  boot.initrd.supportedFilesystems = lib.mkForce [
+    "iso9660"
+    "squashfs"
+    "overlay"
+  ];
   boot.initrd.availableKernelModules = {
     iso9660 = true;
     squashfs = true;
@@ -143,7 +184,11 @@ in
   };
 
   system.build.surfaceLiveIso = image.overrideAttrs (old: {
-    nativeBuildInputs = old.nativeBuildInputs ++ [ pkgs.mtools pkgs.python3 ];
+    nativeBuildInputs = old.nativeBuildInputs ++ [
+      pkgs.libarchive
+      pkgs.mtools
+      pkgs.python3
+    ];
     buildCommandPath = pkgs.writeText "make-surface-live-iso.sh" (
       lib.replaceStrings
         [ "-e $efiBootImage" "-isohybrid-gpt-basdat" ]
@@ -153,7 +198,7 @@ in
         ]
         (builtins.readFile old.buildCommandPath)
       + ''
-        python3 ${../scripts/inspect-live-iso.py} nixos-uki "$out/iso/$isoName"
+        python3 ${isoInspector}/inspect-live-iso.py nixos-uki "$out/iso/$isoName"
       ''
     );
   });
