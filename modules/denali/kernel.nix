@@ -4,10 +4,21 @@
   pkgs,
   ...
 }:
+let
+  hhkb = config.surface.devices.denali.keyboard.hhkb.enable;
+  withHhkb = import ./with-hhkb.nix;
+in
 {
   config = lib.mkIf config.surface.devices.denali.enable {
     # The opted-in Denali device needs its kernel instead of a desktop default.
-    boot.kernelPackages = pkgs.surfacePackages.kernelPackages;
+    boot.kernelPackages =
+      if hhkb then
+        pkgs.linuxPackagesFor (withHhkb {
+          enabled = true;
+          kernel = pkgs.surfacePackages.surfaceNext;
+        })
+      else
+        pkgs.surfacePackages.kernelPackages;
 
     # Explicit Denali initrd drivers for boot, display, input and rescue media.
     # NVMe, ext4, xHCI, usbhid and hid-generic are built into this kernel.
@@ -39,7 +50,7 @@
     boot.kernelParams = [
       "clk_ignore_unused"
       "pd_ignore_unused"
-    ];
+    ] ++ lib.optional hhkb "surface_hid_core.denali_hhkb=1";
     hardware.deviceTree = {
       enable = true;
       name = "qcom/x1e80100-microsoft-denali-oled.dtb";

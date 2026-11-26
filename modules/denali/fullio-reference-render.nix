@@ -8,11 +8,14 @@ packages:
 let
   dtb = "x1e80100-microsoft-denali-oled.dtb";
   feedbackParity = config.surface.fullio.feedbackParityAudit || config.surface.fullio.feedbackParityRender;
-  kernel =
-    if config.surface.fullio.checkedCapture then
-      packages.fullio-checked-capture-kernel
-    else
-      packages.fullio-reference-kernel;
+  kernel = import ./with-hhkb.nix {
+    enabled = config.surface.devices.denali.keyboard.hhkb.enable or false;
+    kernel =
+      if config.surface.fullio.checkedCapture then
+        packages.fullio-checked-capture-kernel
+      else
+        packages.fullio-reference-kernel;
+  };
   renderDtbs =
     pkgs.runCommand "denali-fullio-reference-render-dtbs"
       {

@@ -14,6 +14,9 @@
 
   options.surface.devices.denali = {
     enable = lib.mkEnableOption "Microsoft Surface Pro 11 Denali non-5G OLED hardware support";
+    keyboard.hhkb.enable = lib.mkEnableOption ''
+      the experimental HHKB layer on the verified Denali magnetic keyboard
+    '';
     niriOutputs = lib.mkOption {
       type = lib.types.lines;
       readOnly = true;

@@ -1,0 +1,268 @@
+diff --git a/drivers/hid/surface-hid/denali_hhkb.h b/drivers/hid/surface-hid/denali_hhkb.h
+new file mode 100644
+index 0000000..f45500f
+--- /dev/null
++++ b/drivers/hid/surface-hid/denali_hhkb.h
+@@ -0,0 +1,93 @@
++/* SPDX-License-Identifier: GPL-2.0+ */
++#ifndef _SURFACE_DENALI_HHKB_H
++#define _SURFACE_DENALI_HHKB_H
++
++#define DENALI_KBD_REPORT 0x01
++#define DENALI_KBD_SIZE 12
++#define DENALI_EJECT_REPORT 0x7f
++#define DENALI_EJECT_USAGE 0xff /* Internal only. */
++#define DENALI_RIGHT 0x4f
++
++struct denali_hhkb {
++	u8 held[256]; /* Mapping selected on physical key-down. */
++	bool enabled;
++	bool eject_sent;
++};
++
++/* Studio US Profile2, using the stock Surface number row and Backspace. */
++static inline u8 denali_hhkb_layer(u8 usage)
++{
++	static const u8 fn[] = {
++		[0x04] = 0x81, [0x07] = 0x7f, /* A: quieter, D: mute */
++		[0x09] = DENALI_EJECT_USAGE, /* F: Eject */
++		[0x0b] = 0x55, [0x0c] = 0x46, [0x0d] = 0x54, /* H I J */
++		[0x0e] = 0x4a, [0x0f] = 0x4b, [0x10] = 0x56, /* K L M */
++		[0x11] = 0x57, [0x12] = 0x47, [0x13] = 0x48, /* N O P */
++		[0x16] = 0x80, /* S: louder */
++		[0x28] = 0x58, [0x29] = 0x66, /* Enter: keypad, Esc: Power */
++		[0x2a] = 0x53, [0x2b] = 0x39, /* Backspace: keypad Clear, Tab: Caps */
++		[0x2f] = 0x52, [0x31] = 0x49, /* [: Up, backslash: Insert */
++		[0x33] = 0x50, [0x34] = 0x4f, /* ; ' */
++		[0x35] = 0x4c, /* Grave: Forward Delete */
++		[0x36] = 0x4d, [0x37] = 0x4e, [0x38] = 0x51, /* , . / */
++	};
++
++	if (usage >= 0x1e && usage <= 0x27)
++		return 0x3a + usage - 0x1e;
++	if (usage == 0x2d || usage == 0x2e)
++		return 0x44 + usage - 0x2d;
++	return usage < sizeof(fn) && fn[usage] ? fn[usage] : usage;
++}
++
++/* Translate one complete ten-slot keyboard snapshot. */
++static inline bool denali_hhkb_translate(struct denali_hhkb *state, const u8 *in,
++				  u8 *out, bool *eject)
++{
++	bool physical[256] = { false };
++	bool emitted[256] = { false };
++	bool fn;
++	u8 mods;
++	unsigned int i, n = 2;
++
++	for (i = 2; i < DENALI_KBD_SIZE; i++) {
++		if ((in[i] && in[i] < 4) || in[i] > 0x91)
++			return false; /* Rollover or unknown slot value. */
++		physical[in[i]] = true;
++	}
++	fn = physical[DENALI_RIGHT];
++	for (i = 4; i < sizeof(state->held); i++) {
++		if (!physical[i])
++			state->held[i] = 0;
++	}
++
++	out[0] = DENALI_KBD_REPORT;
++	mods = in[1];
++	/* Drop physical left Ctrl and exchange the two left Alt/Super keys. */
++	out[1] = (mods & ~0x0d) | ((mods & 0x04) << 1) | ((mods & 0x08) >> 1);
++	if (physical[0x39])
++		out[1] |= 0x01;
++	*eject = false;
++	for (i = 2; i < DENALI_KBD_SIZE; i++) {
++		u8 key = in[i];
++		u8 mapped;
++
++		/* Right is Fn; the other physical arrows never emit. */
++		if (!key || key == 0x39 || (key >= 0x4f && key <= 0x52))
++			continue;
++		mapped = state->held[key];
++		if (!mapped) {
++			mapped = fn ? denali_hhkb_layer(key) : key;
++			state->held[key] = mapped;
++		}
++		if (mapped == DENALI_EJECT_USAGE)
++			*eject = true;
++		else if (!emitted[mapped]) {
++			out[n++] = mapped;
++			emitted[mapped] = true;
++		}
++	}
++	while (n < DENALI_KBD_SIZE)
++		out[n++] = 0;
++	return true;
++}
++#endif
+diff --git a/drivers/hid/surface-hid/denali_hhkb_descriptor.h b/drivers/hid/surface-hid/denali_hhkb_descriptor.h
+new file mode 100644
+index 0000000..c4fc6da
+--- /dev/null
++++ b/drivers/hid/surface-hid/denali_hhkb_descriptor.h
+@@ -0,0 +1,31 @@
++/* SPDX-License-Identifier: GPL-2.0+ */
++/* Exact public HID report descriptor of the tested 045e:09ae keyboard. */
++static const u8 denali_hhkb_descriptor[] = {
++	0x05, 0x01, 0x09, 0x06, 0xa1, 0x01, 0x85, 0x01, 0x15, 0x00,
++	0x25, 0x01, 0x75, 0x01, 0x95, 0x08, 0x05, 0x07, 0x19, 0xe0,
++	0x29, 0xe7, 0x81, 0x02, 0x75, 0x08, 0x95, 0x0a, 0x19, 0x00,
++	0x29, 0x91, 0x26, 0xff, 0x00, 0x81, 0x00, 0x05, 0x0c, 0x0a,
++	0xc0, 0x02, 0xa1, 0x02, 0x1a, 0xc1, 0x02, 0x2a, 0xc6, 0x02,
++	0x95, 0x06, 0xb1, 0x03, 0xc0, 0x05, 0x08, 0x19, 0x01, 0x29,
++	0x03, 0x75, 0x01, 0x95, 0x03, 0x25, 0x01, 0x91, 0x02, 0x95,
++	0x05, 0x91, 0x01, 0xc0, 0x05, 0x01, 0x09, 0x80, 0xa1, 0x01,
++	0x85, 0x5b, 0x15, 0x00, 0x25, 0x01, 0x75, 0x01, 0x95, 0x03,
++	0x09, 0x97, 0x09, 0x98, 0x09, 0x99, 0x81, 0x02, 0x95, 0x05,
++	0x81, 0x01, 0xc0, 0x05, 0x0c, 0x09, 0x01, 0xa1, 0x01, 0x85,
++	0x03, 0x95, 0x01, 0x75, 0x10, 0x15, 0x00, 0x26, 0xff, 0x03,
++	0x19, 0x00, 0x2a, 0xff, 0x03, 0x81, 0x00, 0xc0, 0x05, 0x01,
++	0x09, 0x13, 0xa1, 0x01, 0x85, 0x5e, 0x75, 0x01, 0x95, 0x01,
++	0x15, 0x00, 0x25, 0x01, 0x05, 0x01, 0x09, 0xe1, 0x81, 0x02,
++	0x95, 0x07, 0x81, 0x01, 0xc0, 0x06, 0x00, 0xff, 0x09, 0xe0,
++	0xa1, 0x01, 0x85, 0xd4, 0x15, 0x00, 0x26, 0x00, 0xfe, 0x09,
++	0xe1, 0x75, 0x08, 0x95, 0x01, 0xb1, 0x03, 0x19, 0xe2, 0x29,
++	0xe5, 0x95, 0x04, 0xb1, 0x02, 0x19, 0xe6, 0x29, 0xe9, 0x25,
++	0x01, 0x75, 0x01, 0x95, 0x04, 0xb1, 0x03, 0xb1, 0x03, 0xc0,
++	0x05, 0x0c, 0x09, 0x07, 0xa1, 0x01, 0x85, 0xd5, 0x95, 0x01,
++	0x0a, 0x15, 0x05, 0x15, 0x00, 0x25, 0x01, 0x95, 0x01, 0x75,
++	0x01, 0x81, 0x06, 0x95, 0x01, 0x75, 0x07, 0x81, 0x03, 0x0a,
++	0x17, 0x05, 0x67, 0xe1, 0x00, 0x00, 0x01, 0x55, 0x04, 0x26,
++	0x0c, 0x00, 0x95, 0x04, 0x75, 0x08, 0xb1, 0x03, 0x85, 0xd6,
++	0x09, 0x7b, 0x95, 0x01, 0xb1, 0x03, 0x85, 0xd5, 0x09, 0x7b,
++	0x91, 0x02, 0xc0,
++};
+diff --git a/drivers/hid/surface-hid/surface_hid.c b/drivers/hid/surface-hid/surface_hid.c
+index e554032..4adbe49 100644
+--- a/drivers/hid/surface-hid/surface_hid.c
++++ b/drivers/hid/surface-hid/surface_hid.c
+@@ -161,7 +161,7 @@ static u32 ssam_hid_event_fn(struct ssam_event_notifier *nf, const struct ssam_e
+ 	if (event->command_id != 0x00)
+ 		return 0;
+ 
+-	hid_input_report(shid->hid, HID_INPUT_REPORT, (u8 *)&event->data[0], event->length, 0);
++	surface_hid_input_report(shid, event->data, event->length);
+ 	return SSAM_NOTIF_HANDLED;
+ }
+ 
+diff --git a/drivers/hid/surface-hid/surface_hid_core.c b/drivers/hid/surface-hid/surface_hid_core.c
+index 6690c24..bb9f6cb 100644
+--- a/drivers/hid/surface-hid/surface_hid_core.c
++++ b/drivers/hid/surface-hid/surface_hid_core.c
+@@ -11,12 +11,60 @@
+ #include <linux/hid.h>
+ #include <linux/kernel.h>
+ #include <linux/module.h>
++#include <linux/of.h>
+ #include <linux/types.h>
+ #include <linux/usb/ch9.h>
+ 
+ #include <linux/surface_aggregator/controller.h>
+ 
+ #include "surface_hid_core.h"
++#include "denali_hhkb_descriptor.h"
++
++static bool denali_hhkb;
++module_param(denali_hhkb, bool, 0444);
++MODULE_PARM_DESC(denali_hhkb, "Enable HHKB layer on the verified Denali OLED keyboard");
++
++/* Separate from the physical consumer-control report, so simultaneous
++ * top-row media keys cannot be released by Fn+F (or vice versa).
++ */
++static const u8 denali_hhkb_eject_descriptor[] = {
++	0x05, 0x0c, 0x09, 0x01, 0xa1, 0x01, 0x85, DENALI_EJECT_REPORT,
++	0x15, 0x00, 0x25, 0x01, 0x09, 0xb8, 0x75, 0x01, 0x95, 0x01,
++	0x81, 0x02, 0x75, 0x07, 0x81, 0x03, 0xc0,
++};
++
++static bool denali_hhkb_candidate(struct surface_hid_device *shid, size_t len)
++{
++	return denali_hhkb && shid->hid->vendor == 0x045e && shid->hid->product == 0x09ae &&
++	       shid->uid.domain == 0x01 && shid->uid.category == 0x15 &&
++	       shid->uid.target == 0x02 && shid->uid.instance == 0x01 &&
++	       shid->uid.function == 0x00 && len == sizeof(denali_hhkb_descriptor) &&
++	       of_machine_is_compatible("microsoft,denali-oled");
++}
++
++void surface_hid_input_report(struct surface_hid_device *shid, const u8 *data, size_t len)
++{
++	struct denali_hhkb *state = &shid->hhkb;
++	u8 out[DENALI_KBD_SIZE + 7] = { 0 };
++	u8 aux[2 + 7] = { DENALI_EJECT_REPORT };
++	bool eject;
++
++	if (state->enabled && len && data[0] == DENALI_EJECT_REPORT)
++		return; /* This ID is only generated by the translated Fn layer. */
++	if (!state->enabled || !len || data[0] != DENALI_KBD_REPORT) {
++		hid_input_report(shid->hid, HID_INPUT_REPORT, (u8 *)data, len, 0);
++		return;
++	}
++	if (len != DENALI_KBD_SIZE || !denali_hhkb_translate(state, data, out, &eject))
++		return;
++	hid_input_report(shid->hid, HID_INPUT_REPORT, out, DENALI_KBD_SIZE, 0);
++	if (eject != state->eject_sent) {
++		aux[1] = eject;
++		if (!hid_input_report(shid->hid, HID_INPUT_REPORT, aux, 2, 0))
++			state->eject_sent = eject;
++	}
++}
++EXPORT_SYMBOL_GPL(surface_hid_input_report);
+ 
+ 
+ /* -- Utility functions. ---------------------------------------------------- */
+@@ -136,17 +184,24 @@ static int surface_hid_parse(struct hid_device *hid)
+ {
+ 	struct surface_hid_device *shid = hid->driver_data;
+ 	size_t len = get_unaligned_le16(&shid->hid_desc.report_desc_len);
++	bool candidate = denali_hhkb_candidate(shid, len);
++	size_t extra = candidate ? sizeof(denali_hhkb_eject_descriptor) : 0;
+ 	u8 *buf;
+ 	int status;
+ 
+ 	if (surface_hid_is_hot_removed(shid))
+ 		return -ENODEV;
+ 
+-	buf = kzalloc(len, GFP_KERNEL);
++	buf = kzalloc(len + extra, GFP_KERNEL);
+ 	if (!buf)
+ 		return -ENOMEM;
+ 
+ 	status = shid->ops.get_descriptor(shid, SURFACE_HID_DESC_REPORT, buf, len);
++	if (!status && candidate && !memcmp(buf, denali_hhkb_descriptor, len)) {
++		memcpy(buf + len, denali_hhkb_eject_descriptor, extra);
++		len += extra;
++		shid->hhkb.enabled = true;
++	}
+ 	if (!status)
+ 		status = hid_parse_report(hid, buf, len);
+ 
+diff --git a/drivers/hid/surface-hid/surface_hid_core.h b/drivers/hid/surface-hid/surface_hid_core.h
+index 4b1a7b5..90eb66b 100644
+--- a/drivers/hid/surface-hid/surface_hid_core.h
++++ b/drivers/hid/surface-hid/surface_hid_core.h
+@@ -17,6 +17,8 @@
+ #include <linux/surface_aggregator/controller.h>
+ #include <linux/surface_aggregator/device.h>
+ 
++#include "denali_hhkb.h"
++
+ enum surface_hid_descriptor_entry {
+ 	SURFACE_HID_DESC_HID    = 0,
+ 	SURFACE_HID_DESC_REPORT = 1,
+@@ -65,12 +67,14 @@ struct surface_hid_device {
+ 
+ 	struct ssam_event_notifier notif;
+ 	struct hid_device *hid;
++	struct denali_hhkb hhkb;
+ 
+ 	struct surface_hid_device_ops ops;
+ };
+ 
+ int surface_hid_device_add(struct surface_hid_device *shid);
+ void surface_hid_device_destroy(struct surface_hid_device *shid);
++void surface_hid_input_report(struct surface_hid_device *shid, const u8 *data, size_t len);
+ 
+ extern const struct dev_pm_ops surface_hid_pm_ops;
+ 

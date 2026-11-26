@@ -12,13 +12,16 @@ let
       packages.fullio-checked-capture-kernel
     else
       packages.fullio-reference-kernel;
-  auditKernel = baseline.override {
-    kernelPatches = baseline.kernelPatches ++ [
-      {
-        name = "denali-fullio-live-clock-readback";
-        patch = ../../pkgs/patches/denali-fullio-live-clock-readback.patch;
-      }
-    ];
+  auditKernel = import ./with-hhkb.nix {
+    enabled = config.surface.devices.denali.keyboard.hhkb.enable or false;
+    kernel = baseline.override {
+      kernelPatches = baseline.kernelPatches ++ [
+        {
+          name = "denali-fullio-live-clock-readback";
+          patch = ../../pkgs/patches/denali-fullio-live-clock-readback.patch;
+        }
+      ];
+    };
   };
 in
 {
