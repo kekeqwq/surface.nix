@@ -67,3 +67,23 @@ SquashFS default, leaving ISO discovery and overlay unchanged. The native
 configuration gate checks the effective mount flags, `SURFACE_LIVE` label,
 and visible stage-1 status; an initial sub-option override that still left
 `threads=multi` was rejected by the gate before packaging.
+
+### Denali USB boot qualification
+
+The Wi-Fi/HHKB candidate (`c7dbb7a`, 1,679,294,464 bytes, private ISO SHA-256
+`05bbdeb12d62583c3114564b897c456ccc806034d9df1bf598d0c403b8825b73`)
+passed a complete post-write USB readback. The owner booted it and used
+the local text console; the running system showed the USB-backed ISO9660,
+SquashFS and overlay mounts, HHKB enabled, Wi-Fi connected under
+NetworkManager, and working Live-only root SSH. Both Git repositories
+were reachable and all three embedded firmware hashes matched. The
+internal NVMe was not mounted or modified. The prior run had USB disconnect
+before SquashFS I/O errors; with USB left attached, the repeat boot had
+no matching kernel faults. Keep the stick connected throughout use and
+remove it only after shutdown (or select the installed system at reboot).
+
+The booted medium's full hash differed from the preboot image; the same
+new hash was observed locally on Surface and in a separate readback to
+Mac. Do not archive that disk dump as the original ISO. This qualifies
+Live boot and network/install-tool availability; LUKS enrollment and
+first boot from a blank-disk installation have not been performed.
