@@ -16,6 +16,8 @@ ROOT = Path(__file__).resolve().parents[1]
 GOLDEN = 'e7bb06a03e7bd9b869825a51775355a6743477d1579d78eb09fad5881cfb20f0'
 RECOVERY = 'a1a61241ed970ef512f40c5a11a193006b99720e7540f609c66cfa008f09d4b0'
 FW = 'qcom/x1e80100/X1E80100-Microsoft-Surface-Pro-11-FullIO-v19c0-tplg.bin'
+ZAP = 'qcom/x1e80100/microsoft/qcdxkmsuc8380.mbn'
+PRIVATE = Path('/var/lib/surface-firmware')
 
 
 def only(pattern, text, label):
@@ -61,6 +63,51 @@ def verify_image(image, expected, section):
     return cmdline
 
 
+def newc_payload(data, offset, wanted):
+    """Read one known appended newc archive by its record boundaries."""
+    found = None
+    while offset + 110 <= len(data):
+        hdr = data[offset:offset + 110]
+        if hdr[:6] != b'070701':
+            raise ValueError('invalid appended firmware archive header')
+        size, namesize = int(hdr[54:62], 16), int(hdr[94:102], 16)
+        name = data[offset + 110:offset + 110 + namesize]
+        start = (offset + 110 + namesize + 3) & ~3
+        end = start + size
+        if not name.endswith(b'\0') or end > len(data):
+            raise ValueError('truncated appended firmware record')
+        if name == b'TRAILER!!!\0':
+            if size or found is None:
+                raise ValueError('firmware archive did not contain the expected zap')
+            return found
+        if name == wanted + b'\0':
+            if found is not None:
+                raise ValueError('duplicated private zap in appended firmware archive')
+            found = data[start:end]
+        offset = (end + 3) & ~3
+    raise ValueError('no trailer in private firmware archive')
+
+
+def verify_private_initrd(image, expected, section, private=PRIVATE):
+    data = section(image, b'.initrd')
+    stock = (expected / 'surface-boot/initrd').read_bytes()
+    if not data.startswith(stock):
+        raise ValueError('UKI initrd does not start with the expected system initrd')
+    embedded = newc_payload(data, (len(stock) + 3) & ~3, f'surface-firmware/{ZAP}'.encode())
+    if embedded != (private / ZAP).read_bytes():
+        raise ValueError('UKI zap differs from the privately provisioned source')
+
+
+def verify_recovery(esp):
+    recovery_conf = (esp / 'loader/entries/surface-recovery-gen20.conf').read_text()
+    recovery_name = only(r'^efi\s+(\S+)\s*$', recovery_conf, 'Gen20 recovery image')
+    if recovery_name != '/EFI/surface/recovery-gen20.efi':
+        raise ValueError('Gen20 entry does not point to the protected recovery image')
+    recovery = esp / recovery_name.lstrip('/')
+    if hashlib.sha256(recovery.read_bytes()).hexdigest() != RECOVERY:
+        raise ValueError('Gen20 recovery image hash mismatch')
+
+
 def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument('expected', type=Path)
@@ -75,11 +122,11 @@ def main():
     default = selected_default(entries)
     esp = Path(subprocess.check_output(['bootctl', '--print-esp-path'], text=True).strip())
     subprocess.run(['mountpoint', '-q', esp], check=True)
-    recovery = esp / 'EFI/surface/recovery-gen20.efi'
-    if not (esp / 'loader/entries/surface-recovery-gen20.conf').is_file() or hashlib.sha256(recovery.read_bytes()).hexdigest() != RECOVERY:
-        raise ValueError('Gen20 recovery verification failed')
+    verify_recovery(esp)
     section = run_path(str(ROOT / 'scripts/install-ukis.py'))['pe_section']
-    cmdline = verify_image(checked_image(esp, default), c, section)
+    image = checked_image(esp, default)
+    cmdline = verify_image(image, c, section)
+    verify_private_initrd(image, c, section)
     if Path('/proc/cmdline').read_text().split() != cmdline.split():
         raise ValueError('running command line differs from generation UKI')
     dt = Path('/sys/firmware/devicetree/base')

@@ -40,4 +40,29 @@ with TemporaryDirectory() as tmp:
     sections[b'.dtb'] = b'device tree'
     sections[b'.cmdline'] += f' init={root}/init'.encode()
     rejects(f['verify_image'], image, root, section)
-print('Daily boot: rejects mismatched default/selected, duplicate entries, wrong DTB and wrong cmdline')
+
+    def record(name, data=b''):
+        name = name + b'\0'
+        header = b'070701' + b'00000000' * 13
+        header = header[:54] + f'{len(data):08x}'.encode() + header[62:94] + f'{len(name):08x}'.encode() + header[102:]
+        padded = lambda x: x + b'\0' * (-len(x) % 4)
+        return padded(header + name) + padded(data)
+
+    stock = b'initrd!'  # Non-aligned prefix.
+    (parts / 'initrd').write_bytes(stock)
+    private = root / 'firmware'
+    zap = private / f['ZAP']
+    zap.parent.mkdir(parents=True)
+    zap.write_bytes(b'known payload')
+    payload = record(f"surface-firmware/{f['ZAP']}".encode(), zap.read_bytes())
+    trailer = record(b'TRAILER!!!')
+    sections[b'.initrd'] = stock + b'\0' + payload + trailer
+    f['verify_private_initrd'](image, root, section, private)
+    zap.write_bytes(b'wrong payload')
+    rejects(f['verify_private_initrd'], image, root, section, private)
+    zap.write_bytes(b'known payload')
+    sections[b'.initrd'] = stock + b'\0' + payload + payload + trailer
+    rejects(f['verify_private_initrd'], image, root, section, private)
+    sections[b'.initrd'] = stock + b'\0' + payload[:-1]
+    rejects(f['verify_private_initrd'], image, root, section, private)
+print('Daily boot: rejects mismatched default/selected, duplicate entries, wrong sections and wrong or malformed private initrd')
