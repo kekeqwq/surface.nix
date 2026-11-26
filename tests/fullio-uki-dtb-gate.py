@@ -36,16 +36,33 @@ def main() -> None:
         )
         stub.chmod(stub.stat().st_mode | stat.S_IEXEC)
 
-        def verify(fn, table):
+        def verify(fn, table, **kwargs):
             path = tmp / 'table.json'
             path.write_text(json.dumps(table))
             try:
-                fn(path, stub)
+                fn(path, stub, **kwargs)
             except (ValueError, subprocess.CalledProcessError) as exc:
                 return f'rejected:{exc}'
             return 'ok'
 
         assert verify(prep.verify_reference_dtb, NODES) == 'ok'
+        checked = dict(NODES, **{'/sound': SOUND_REF + [prep.CHECKED_CAPTURE_MARKER]})
+        assert 'checked-capture' in verify(prep.verify_reference_dtb, checked)
+        assert 'checked-capture' in verify(prep.verify_reference_dtb, NODES, checked_capture=True)
+        assert verify(prep.verify_reference_dtb, checked, checked_capture=True) == 'ok'
+        pre_sp = dict(NODES, **{'/sound': SOUND_REF + [prep.CHECKED_CAPTURE_MARKER, prep.PRE_SP_MARKER]})
+        assert 'pre-SP' in verify(prep.verify_reference_dtb, pre_sp, checked_capture=True)
+        assert 'pre-SP' in verify(prep.verify_reference_dtb, checked, checked_capture=True, pre_sp=True)
+        assert 'pre-SP' in verify(prep.verify_reference_dtb, NODES, pre_sp=True)
+        assert verify(prep.verify_reference_dtb, pre_sp, checked_capture=True, pre_sp=True) == 'ok'
+        parity = dict(checked, **{prep.WSA_NODE: [prep.FEEDBACK_PARITY_MARKER,
+                      'qcom,denali-fullio-feedback', 'qcom,denali-fullio-link-gate',
+                      'qcom,denali-fullio-wait-frame-stop']})
+        assert 'feedback parity' in verify(prep.verify_reference_dtb, parity, checked_capture=True)
+        assert 'feedback parity' in verify(prep.verify_reference_dtb, checked, checked_capture=True, feedback_parity=True)
+        assert verify(prep.verify_reference_dtb, parity, checked_capture=True, feedback_parity=True) == 'ok'
+        unsafe = dict(parity, **{prep.WSA_NODE: parity[prep.WSA_NODE] + ['qcom,denali-fullio-feedback-capture-test']})
+        assert 'feedback parity' in verify(prep.verify_reference_dtb, unsafe, checked_capture=True, feedback_parity=True)
         muted_table = dict(NODES, **{'/sound': SOUND_MUTED})
         assert verify(prep.verify_reference_dtb, muted_table).startswith('rejected:')
         assert verify(prep.verify_reference_dtb,

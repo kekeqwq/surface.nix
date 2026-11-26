@@ -107,17 +107,19 @@ def find_named_control_numid(name: str, card: str, amixer: str) -> int:
     raise LookupError(f'control not found: {name}')
 
 
-def write_tlv(helper: Path, card: str, numid: int, blob: bytes, dry_run: bool) -> None:
+def write_tlv(helper: Path, card: str, numid: int, blob: bytes, dry_run: bool,
+              *, stage: str) -> None:
     if dry_run:
         print(f'dry-run: numid={numid} payload={len(blob)} bytes sha256='
               f'{hashlib.sha256(blob).hexdigest()}')
         return
+    print(f'Endpoint {stage}: submit', flush=True)
     done = subprocess.run([str(helper), card, str(numid), blob.hex()],
                           capture_output=True, text=True)
     output = (done.stdout + done.stderr).strip()
     if done.returncode:
         raise RuntimeError(output or f'tlv_write rc={done.returncode}')
-    print(output)
+    print(f'Endpoint {stage}: ACK ({output})', flush=True)
 
 
 def main() -> int:
@@ -128,7 +130,8 @@ def main() -> int:
     cli.add_argument('--delta-table', type=Path, required=True)
     cli.add_argument('--endpoint-db', type=float, default=-12.0,
                      help='fixed Windows endpoint position (default: the reviewed -12.0 dB)')
-    cli.add_argument('--mute', choices=('off', 'on'), default='off')
+    cli.add_argument('--mute', choices=('off', 'on', 'keep'), default='off',
+                     help='keep leaves the existing endpoint mute state untouched')
     cli.add_argument('--volume-only', action='store_true',
                      help='skip the GainStep calibration delta')
     cli.add_argument('--dry-run', action='store_true')
@@ -141,23 +144,21 @@ def main() -> int:
     deltas = load_deltas(args.delta_table)
     print(f'endpoint_db={args.endpoint_db:g} q28={q28} (0x{q28:08x}) gainstep={step}')
 
-    transaction_numid = find_named_control_numid(
-        'SP11 Windows Volume Transaction', args.card, args.amixer)
-    mute_numid = find_named_control_numid(
+    control = 'SP11 Windows Volume Only' if args.volume_only else 'SP11 Windows Volume Transaction'
+    volume_numid = find_named_control_numid(control, args.card, args.amixer)
+    mute_numid = None if args.mute == 'keep' else find_named_control_numid(
         'SP11 Windows Endpoint Mute', args.card, args.amixer)
 
-    if args.volume_only:
-        volume_numid = find_named_control_numid(
-            'SP11 Windows Volume Only', args.card, args.amixer)
-        write_tlv(args.tlv_write, args.card, volume_numid,
-                  struct.pack('<II', q28, q28), args.dry_run)
-    else:
-        write_tlv(args.tlv_write, args.card, transaction_numid,
-                  struct.pack('<II', q28, q28) + deltas[step - 1], args.dry_run)
-
-    # Volume first, then the mute selector: a failure stays attenuated.
-    write_tlv(args.tlv_write, args.card, mute_numid,
-              struct.pack('<I', 1 if args.mute == 'on' else 0), args.dry_run)
+    volume = struct.pack('<II', q28, q28)
+    if not args.volume_only:
+        volume += deltas[step - 1]
+    write_tlv(args.tlv_write, args.card, volume_numid, volume, args.dry_run,
+              stage='gain' if args.volume_only else 'gain/GainStep')
+    if mute_numid is not None:
+        # Never update mute if the preceding volume transaction failed.
+        write_tlv(args.tlv_write, args.card, mute_numid,
+                  struct.pack('<I', 1 if args.mute == 'on' else 0), args.dry_run,
+                  stage='mute' if args.mute == 'on' else 'unmute')
     return 0
 
 

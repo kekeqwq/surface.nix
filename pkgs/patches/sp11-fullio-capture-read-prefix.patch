@@ -1,0 +1,49 @@
+--- a/sound/soc/qcom/qdsp6/q6apm.c
++++ b/sound/soc/qcom/qdsp6/q6apm.c
+@@ -1568,27 +1568,34 @@
+ 		if (!graph->ar_graph)
+ 			break;
+ 		client_event = APM_CLIENT_EVENT_DATA_READ_DONE;
+-		mutex_lock(&graph->lock);
++		/* Validate only the common prefix, not the undocumented tail. */
++		if (!data->payload || data->payload_size < (int)offsetofend(typeof(*rd_done), data_size))
++			return -EINVAL;
+ 		rd_done = data->payload;
++		mutex_lock(&graph->lock);
+ 		if (!graph->tx_data.buf) {
+ 			mutex_unlock(&graph->lock);
+ 			break;
+ 		}
++		if (hdr->token >= graph->tx_data.num_periods) {
++			mutex_unlock(&graph->lock);
++			return -EINVAL;
++		}
+ 		phys = graph->tx_data.buf[hdr->token].phys;
+-		mutex_unlock(&graph->lock);
+-		/* token numbering starts at 0 */
+-		atomic_set(&graph->tx_data.hw_ptr, hdr->token + 1);
+-
+-		if (upper_32_bits(phys) == rd_done->buf_addr_msw &&
+-		    lower_32_bits(phys) == rd_done->buf_addr_lsw) {
+-			graph->result.opcode = hdr->opcode;
+-			graph->result.status = rd_done->status;
+-			if (graph->cb)
+-				graph->cb(client_event, hdr->token, data->payload, graph->priv);
+-		} else {
++		if (upper_32_bits(phys) != rd_done->buf_addr_msw ||
++		    lower_32_bits(phys) != rd_done->buf_addr_lsw) {
++			mutex_unlock(&graph->lock);
+ 			dev_err(dev, "RD BUFF Unexpected addr %08x-%08x\n", rd_done->buf_addr_lsw,
+ 				rd_done->buf_addr_msw);
++			return -EINVAL;
+ 		}
++		/* token numbering starts at 0 */
++		atomic_set(&graph->tx_data.hw_ptr, hdr->token + 1);
++		mutex_unlock(&graph->lock);
++		graph->result.opcode = hdr->opcode;
++		graph->result.status = rd_done->status;
++		if (graph->cb)
++			graph->cb(client_event, hdr->token, data->payload, graph->priv);
+ 		break;
+ 	case DATA_CMD_WR_SH_MEM_EP_EOS_RENDERED:
+ 		client_event = APM_CLIENT_EVENT_CMD_EOS_DONE;

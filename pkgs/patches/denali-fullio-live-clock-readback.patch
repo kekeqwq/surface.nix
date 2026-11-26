@@ -1,0 +1,68 @@
+diff --git a/sound/soc/codecs/lpass-wsa-macro.c b/sound/soc/codecs/lpass-wsa-macro.c
+index 2c2f63f..e2de223 100644
+--- a/sound/soc/codecs/lpass-wsa-macro.c
++++ b/sound/soc/codecs/lpass-wsa-macro.c
+@@ -3120,6 +3120,50 @@ static const struct snd_soc_component_driver wsa_macro_component_drv = {
+ 	.num_dapm_routes = ARRAY_SIZE(wsa_audio_map),
+ };
+ 
++/* Opt-in telemetry: no control write, no PM wake and no cache-only read. */
++static bool fullio_level_audit;
++module_param(fullio_level_audit, bool, 0400);
++MODULE_PARM_DESC(fullio_level_audit, "Expose read-only Denali FullIO clock state");
++
++static ssize_t fullio_clock_snapshot_show(struct device *dev,
++					 struct device_attribute *attr, char *buf)
++{
++	struct wsa_macro *wsa = dev_get_drvdata(dev);
++	unsigned int tx[ARRAY_SIZE(fullio_tx_regs)];
++	unsigned int rx[2];
++	int ret, i;
++
++	guard(mutex)(&wsa->fullio_clock_lock);
++	if (!wsa->fullio_clock_pm || wsa->fullio_clock_fault)
++		return -EAGAIN;
++	ret = pm_runtime_get_if_active(dev);
++	if (ret <= 0)
++		return ret ?: -EAGAIN;
++	for (i = 0; i < ARRAY_SIZE(fullio_tx_regs); i++) {
++		ret = regmap_read_bypassed(wsa->regmap, fullio_tx_regs[i], &tx[i]);
++		if (ret)
++			goto put;
++	}
++	ret = regmap_read_bypassed(wsa->regmap, CDC_WSA_RX0_RX_PATH_CTL, &rx[0]);
++	if (!ret)
++		ret = regmap_read_bypassed(wsa->regmap, CDC_WSA_RX1_RX_PATH_CTL, &rx[1]);
++put:
++	pm_runtime_put_noidle(dev);
++	if (ret)
++		return ret;
++	return sysfs_emit(buf, "tx=%02x,%02x,%02x,%02x rx=%02x,%02x\n",
++			tx[0], tx[1], tx[2], tx[3], rx[0], rx[1]);
++}
++static DEVICE_ATTR_ADMIN_RO(fullio_clock_snapshot);
++
++static struct attribute *wsa_macro_fullio_level_attrs[] = {
++	&dev_attr_fullio_clock_snapshot.attr,
++	NULL,
++};
++static const struct attribute_group wsa_macro_fullio_level_group = {
++	.attrs = wsa_macro_fullio_level_attrs,
++};
++
+ static int wsa_macro_probe(struct platform_device *pdev)
+ {
+ 	struct device *dev = &pdev->dev;
+@@ -3259,6 +3303,12 @@ static int wsa_macro_probe(struct platform_device *pdev)
+ 	if (ret)
+ 		goto err_rpm_put;
+ 
++	if (fullio_level_audit && of_machine_is_compatible("microsoft,denali")) {
++		ret = devm_device_add_group(dev, &wsa_macro_fullio_level_group);
++		if (ret)
++			dev_warn(dev, "FullIO read-only clock audit unavailable: %d\n", ret);
++	}
++
+ 	ret = pm_runtime_put_autosuspend(dev);
+ 	if (ret < 0)
+ 		dev_warn(dev, "runtime PM put failed after probe: %d\n", ret);

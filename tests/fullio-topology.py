@@ -268,6 +268,13 @@ def verify_render_edges(topology):
             {edge for edge in edges if rx_logger in (edge[0], edge[2])} != rx_edges or
             (0x4027, 1, 0x4002, 2) not in edges):
         raise ValueError("Golden RX0 tap is not between SP and the speaker DMA sink")
+    upstream = {
+        (0x412B, 1, 0x47E9, 2), (0x47E9, 1, 0x4A63, 2),
+        (0x48A1, 1, 0x467A, 2), (0x467A, 1, 0x4001, 12),
+        (0x4001, 1, 0x402C, 2), (0x402C, 1, 0x4027, 2),
+    }
+    if not upstream <= edges:
+        raise ValueError('Golden pre-volume/pre-SAL tap path mismatch')
     verify_render_mute_path(edges)
 
 
@@ -377,6 +384,8 @@ def self_test(topology):
     reject_mutation("sp11.data_logging.4003", struct.pack("<2I", 209, 0x4157),
                     struct.pack("<2I", 209, 0x4027),
                     "Golden RX0 tap is not between SP and the speaker DMA sink")
+    reject_mutation('sp11.data_logging.467a', struct.pack('<2I', 207, 12),
+                    struct.pack('<2I', 207, 2), 'Golden pre-volume/pre-SAL tap path mismatch')
     link_error = "Golden control-link peer, port, intent or heap mismatch"
     name = "sp11.speaker_protection.4027"
     for row in GOLDEN_LINKS[:2]:

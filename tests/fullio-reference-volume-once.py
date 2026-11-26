@@ -54,16 +54,19 @@ def main() -> None:
         amixer.chmod(amixer.stat().st_mode | stat.S_IEXEC)
         log = tmp / 'writes.log'
         tlv = tmp / 'tlv_write'
-        tlv.write_text('#!/bin/sh\nprintf "%s %s\\n" "$2" "$3" >> "%s"\n' % ('%s', '%s', log))
+        tlv.write_text('#!/bin/sh\nprintf "%s %s\\n" "$2" "$3" >> "%s"\n' % ('%s', '%s', log)
+                       + 'if [ "$2" = "$FAIL_NUMID" ]; then exit 1; fi\n')
         tlv.chmod(tlv.stat().st_mode | stat.S_IEXEC)
 
-        def run(*extra):
+        def run(*extra, fail_numid='', check=True):
             return subprocess.run(
                 [sys.executable, str(script), '--card', 'hw:0', '--amixer', str(amixer),
                  '--tlv-write', str(tlv), '--delta-table', str(table), *extra],
-                capture_output=True, text=True, check=True)
+                capture_output=True, text=True, check=check,
+                env={**os.environ, 'FAIL_NUMID': fail_numid})
 
-        for db, mute in ((-12.0, 'off'), (0.0, 'on'), (-75.0, 'off'), (-3.25, 'off')):
+        for db, mute in ((-12.0, 'off'), (0.0, 'on'), (0.0, 'off'), (3.0, 'off'),
+                         (-75.0, 'off'), (-3.25, 'off')):
             log.write_text('')
             run('--endpoint-db', str(db), '--mute', mute)
             lines = log.read_text().splitlines()
@@ -83,6 +86,15 @@ def main() -> None:
             assert bytes.fromhex(payload) == struct.pack('<I', 1 if mute == 'on' else 0)
             assert 'gainstep=%d' % step in run('--endpoint-db', str(db), '--dry-run').stdout
 
+        for fail_numid, writes, stage in [('11', ['11'], 'gain/GainStep'),
+                                          ('13', ['11', '13'], 'unmute')]:
+            log.write_text('')
+            result = run('--endpoint-db', '0', fail_numid=fail_numid, check=False)
+            assert result.returncode != 0
+            assert [x.split()[0] for x in log.read_text().splitlines()] == writes
+            assert f'Endpoint {stage}: submit' in result.stdout.splitlines()[-1]
+            assert f'Endpoint {stage}: ACK' not in result.stdout
+
         log.write_text('')
         run('--volume-only', '--endpoint-db', '-12', '--mute', 'on')
         lines = log.read_text().splitlines()
@@ -90,6 +102,18 @@ def main() -> None:
         assert bytes.fromhex(lines[0].split(' ', 1)[1]) == struct.pack('<II', expected_q28(-12.0),
                                                                       expected_q28(-12.0))
         assert lines[1].split(' ', 1)[0] == '13'
+
+        # Diagnostic reassertion must not touch the mute selector at all,
+        # even before the write: with 'keep' its control may be unavailable.
+        listing.write_text('\n'.join(listing.read_text().splitlines()[:2]) + '\n')
+        for volume_only, numid in ((True, '12'), (False, '11')):
+            log.write_text('')
+            extra = ['--volume-only'] if volume_only else []
+            run('--endpoint-db', '-3', '--mute', 'keep', *extra)
+            gain = struct.pack('<II', expected_q28(-3), expected_q28(-3))
+            if not volume_only:
+                gain += payloads[26]
+            assert log.read_text().splitlines() == [f'{numid} {gain.hex()}']
 
         payloads = make_table(table, corrupt_step=7)
         failed = subprocess.run(

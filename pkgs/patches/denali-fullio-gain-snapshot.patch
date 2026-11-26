@@ -1,0 +1,173 @@
+diff --git a/sound/soc/qcom/qdsp6/q6apm-dai.c b/sound/soc/qcom/qdsp6/q6apm-dai.c
+index 321903f..6140f61 100644
+--- a/sound/soc/qcom/qdsp6/q6apm-dai.c
++++ b/sound/soc/qcom/qdsp6/q6apm-dai.c
+@@ -1160,6 +1160,11 @@ static int q6apm_fullio_reference_recycle(struct q6apm_dai_data *pdata,
+ 	}
+ 
+ 	snd_pcm_set_runtime_buffer(prtd->substream, NULL);
++	{
++		guard(mutex)(&graph->apm->graph_lock);
++		if (graph->apm->fullio_active_render == graph)
++			graph->apm->fullio_active_render = NULL;
++	}
+ 	prtd->graph = NULL;
+ 	ret = q6apm_graph_close(graph);
+ 	if (ret)
+@@ -1233,6 +1238,8 @@ static int q6apm_fullio_reference_prepare(struct q6apm_dai_data *pdata,
+ 	}
+ 	snd_pcm_set_runtime_buffer(substream, buffer);
+ 	prtd->fullio_reference_prepared = true;
++	guard(mutex)(&prtd->graph->apm->graph_lock);
++	prtd->graph->apm->fullio_active_render = prtd->graph;
+ 	return 0;
+ 
+ failed:
+@@ -1703,6 +1710,11 @@ static int q6apm_dai_close(struct snd_soc_component *component,
+ 				WRITE_ONCE(pdata->fullio_render_locked, true);
+ 		}
+ 		q6apm_fullio_release_cal(prtd);
++		{
++			guard(mutex)(&prtd->graph->apm->graph_lock);
++			if (prtd->graph->apm->fullio_active_render == prtd->graph)
++				prtd->graph->apm->fullio_active_render = NULL;
++		}
+ 		close_ret = q6apm_graph_close(prtd->graph);
+ 	}
+ 	kfree(prtd);
+diff --git a/sound/soc/qcom/qdsp6/q6apm.c b/sound/soc/qcom/qdsp6/q6apm.c
+index 86184bf..e919454 100644
+--- a/sound/soc/qcom/qdsp6/q6apm.c
++++ b/sound/soc/qcom/qdsp6/q6apm.c
+@@ -849,8 +849,12 @@ int q6apm_fullio_get_cfg(struct q6apm_graph *graph, u32 instance, u32 param,
+ 	       (param == PARAM_ID_HW_EP_MF_CFG || param == PARAM_ID_CODEC_DMA_INTF_CFG)) ||
+ 	      (param == Q6APM_FULLIO_LOG_CFG && bytes == 12 &&
+ 	       (instance == 0x4003 || instance == 0x4025 || instance == 0x402a)) ||
+-	      (instance == 0x4a63 && param == 0x08001039 && bytes == 104) ||
+-	      (instance == 0x4a63 && param == 0x08001035 && bytes == 4)))
++	      (instance == 0x4001 && param == 0x0800101e && bytes == 4) ||
++	      (instance == 0x4026 && bytes == 12 &&
++	       (param == PARAM_ID_HW_EP_MF_CFG || param == PARAM_ID_CODEC_DMA_INTF_CFG)) ||
++      (instance == 0x4a63 && param == 0x08001039 && bytes == 104) ||
++	      ((instance == 0x4663 || instance == 0x4669 || instance == 0x4a63) &&
++       param == 0x08001035 && bytes == 4)))
+ 		return -EINVAL;
+ 	if (!q6apm_fullio_transport_enabled(graph->apm))
+ 		return -EAGAIN;
+@@ -2478,6 +2480,75 @@ static int q6apm_fullio_volume_transaction_put(struct snd_kcontrol *kcontrol,
+ 	return ret;
+ }
+ 
++/* Opt-in, read-only audit of the protected graph's own live endpoint gain.
++ * No write, no retry and no wake: a read is taken only while the render
++ * graph this driver already prepared is published. It is the discriminator
++ * between DSP-side attenuation and anything downstream of every readable
++ * hardware register.
++ */
++static bool fullio_gain_audit;
++module_param(fullio_gain_audit, bool, 0400);
++MODULE_PARM_DESC(fullio_gain_audit, "Expose read-only Denali FullIO DSP master gain");
++
++static ssize_t fullio_master_gain_show(struct device *dev,
++					     struct device_attribute *attr, char *buf)
++{
++	struct q6apm *apm = dev_get_drvdata(dev);
++	struct q6apm_graph *graph;
++	static const struct { u32 iid, param, bytes; const char *name; } sp[] = {
++		{ 0x4027, 0x080011e8, 68, "sp" },
++		{ 0x4024, 0x080011f6, 44, "spvi" },
++		{ 0x4001, 0x0800101e, 4, "sal" },
++		{ 0x4663, 0x08001035, 4, "vol1" },
++		{ 0x4669, 0x08001035, 4, "vol2" },
++		{ 0x4026, 0x08001017, 12, "vimedia" },
++		{ 0x4026, 0x08001063, 12, "viintf" },
++	};
++	u8 blob[68];
++	__le16 words[2];
++	unsigned int crc;
++	int ret, n, len, i, j;
++
++	guard(mutex)(&apm->graph_lock);
++	graph = apm->fullio_active_render;
++	if (!graph)
++		return -EAGAIN;
++	ret = q6apm_fullio_get_cfg(graph, 0x4a63, 0x08001035, words, sizeof(words));
++	if (ret)
++		return ret < 0 ? ret : -EPROTO;
++	n = sysfs_emit(buf, "vol=%#x,%#x", le16_to_cpu(words[0]), le16_to_cpu(words[1]));
++	if (n < 0)
++		return n;
++	/* SP and SPVI live immediately upstream of the DAC sink, downstream of
++	 * VOL_CTRL. Their accepted GET_CFG payloads are already allow-listed,
++	 * so compare the same bounded configuration without any write.
++	 */
++	for (i = 0; i < ARRAY_SIZE(sp); i++) {
++		ret = q6apm_fullio_get_cfg(graph, sp[i].iid, sp[i].param, blob, sp[i].bytes);
++		if (ret) {
++			len = snprintf(buf + n, PAGE_SIZE - n, " %s=err%d", sp[i].name, ret);
++			if (len < 0)
++				return len;
++			n += len;
++			continue;
++		}
++		crc = 0;
++		for (j = 0; j < (int)sp[i].bytes; j++)
++			crc = crc * 33 + ((u8 *)blob)[j];
++		len = snprintf(buf + n, PAGE_SIZE - n, " %s=%#x", sp[i].name, crc);
++		if (len < 0)
++			return len;
++		n += len;
++	}
++	len = snprintf(buf + n, PAGE_SIZE - n, "\n");
++	return len < 0 ? len : n + len;
++}
++static DEVICE_ATTR_ADMIN_RO(fullio_master_gain);
++
++static const struct attribute_group q6apm_fullio_gain_group = {
++	.attrs = (struct attribute *[]){ &dev_attr_fullio_master_gain.attr, NULL },
++};
++
+ static const struct snd_kcontrol_new q6apm_fullio_endpoint_controls[] = {
+ 	SND_SOC_BYTES_TLV("SP11 Windows Volume Transaction", FULLIO_ENDPOINT_TLV_HEADER_BYTES +
+ 			  FULLIO_ENDPOINT_GAIN_BYTES + FULLIO_GAINSTEP_LARGE_BYTES,
+@@ -2504,9 +2575,16 @@ static int q6apm_audio_probe(struct snd_soc_component *component)
+ 
+ 	ret = snd_soc_add_component_controls(component, q6apm_fullio_endpoint_controls,
+ 					     ARRAY_SIZE(q6apm_fullio_endpoint_controls));
+-	if (ret)
++	if (ret) {
+ 		snd_soc_tplg_component_remove(component);
+-	return ret;
++		return ret;
++	}
++	if (fullio_gain_audit && of_machine_is_compatible("microsoft,denali")) {
++		ret = devm_device_add_group(component->dev, &q6apm_fullio_gain_group);
++		if (ret)
++			dev_warn(component->dev, "FullIO read-only gain audit unavailable: %d\n", ret);
++	}
++	return 0;
+ }
+ 
+ static void q6apm_audio_remove(struct snd_soc_component *component)
+diff --git a/sound/soc/qcom/qdsp6/q6apm.h b/sound/soc/qcom/qdsp6/q6apm.h
+index 36b5063..deba91c 100644
+--- a/sound/soc/qcom/qdsp6/q6apm.h
++++ b/sound/soc/qcom/qdsp6/q6apm.h
+@@ -52,6 +52,8 @@
+ #define APM_LAST_BUFFER_FLAG			BIT(30)
+ #define NO_TIMESTAMP				0xFF00
+ 
++struct q6apm_graph;
++
+ struct q6apm {
+ 	struct device *dev;
+ 	gpr_port_t *port;
+@@ -65,6 +67,8 @@ struct q6apm {
+ 	uint32_t state;
+ 
+ 	struct list_head widget_list;
++	/* graph_lock: live protected render graph, or NULL. Read-only audit. */
++	struct q6apm_graph *fullio_active_render;
+ 	/* Serializes DSP graph open, publication and final close. */
+ 	struct mutex graph_lock;
+ 	unsigned long fullio_transport;

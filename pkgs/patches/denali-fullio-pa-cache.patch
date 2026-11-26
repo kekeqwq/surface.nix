@@ -1,0 +1,44 @@
+diff --git a/sound/soc/codecs/wsa884x.c b/sound/soc/codecs/wsa884x.c
+index 43a374e..36ed98d 100644
+--- a/sound/soc/codecs/wsa884x.c
++++ b/sound/soc/codecs/wsa884x.c
+@@ -1397,6 +1397,13 @@ static bool wsa884x_writeable_register(struct device *dev, unsigned int reg)
+ 
+ static bool wsa884x_volatile_register(struct device *dev, unsigned int reg)
+ {
++	const struct wsa884x_priv *amp = dev_get_drvdata(dev);
++
++	/* The paired FullIO START/STOP transaction owns PA enable. Neither
++	 * runtime resume nor reattach may replay it from the register cache.
++	 */
++	if (reg == WSA884X_PA_FSM_EN && amp && amp->fullio_reference_codec)
++		return true;
+ 	switch (reg) {
+ 	case WSA884X_ANA_WO_CTL_0:
+ 	case WSA884X_ANA_WO_CTL_1:
+@@ -1614,7 +1621,7 @@ static const struct reg_sequence wsa884x_fullio_cold_init[] = {
+ 
+ static int wsa884x_fullio_cold_start(struct wsa884x_priv *amp)
+ {
+-	unsigned int value;
++	unsigned int value = 0;
+ 	int ret;
+ 
+ 	/* The reference lifecycle re-runs the cold table after every SoundWire
+@@ -1719,6 +1726,16 @@ static int wsa884x_update_status(struct sdw_slave *slave,
+ 		return 0;
+ 
+ 	regcache_cache_only(wsa884x->regmap, false);
++	if (wsa884x->fullio_reference_codec) {
++		unsigned int enable;
++
++		if (wsa884x->fullio_cold_failed)
++			return -ENOTRECOVERABLE;
++		ret = regmap_read_bypassed(wsa884x->regmap, WSA884X_PA_FSM_EN, &enable);
++		if (ret || (enable & WSA884X_PA_FSM_EN_GLOBAL_PA_EN_MASK))
++			return dev_err_probe(&slave->dev, ret ?: -EBUSY,
++					     "FullIO reattach cache sync requires verified PA-off\n");
++	}
+ 	ret = regcache_sync(wsa884x->regmap);
+ 	if (ret < 0) {
+ 		if (wsa884x->fullio_reference_codec)

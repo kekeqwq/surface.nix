@@ -1,0 +1,282 @@
+--- a/sound/soc/qcom/qdsp6/q6apm.h
++++ b/sound/soc/qcom/qdsp6/q6apm.h
+@@ -43,6 +43,8 @@
+ #define APM_CLIENT_EVENT_CMD_RUN_DONE		0x1008
+ #define APM_CLIENT_EVENT_DATA_WRITE_DONE	0x1009
+ #define APM_CLIENT_EVENT_DATA_READ_DONE		0x100a
++#define APM_CLIENT_EVENT_CAPTURE_RECLAIM		0x100c
++#define APM_CLIENT_EVENT_CAPTURE_FAULT		0x100d
+ #define APM_CLIENT_EVENT_WATERMARK_EVENT	0x100b
+ #define APM_WRITE_TOKEN_MASK                   GENMASK(15, 0)
+ #define APM_WRITE_TOKEN_LEN_MASK               GENMASK(31, 16)
+@@ -125,6 +127,15 @@
+ 	gpr_port_t *port;
+ 	struct audioreach_graph_data rx_data;
+ 	struct audioreach_graph_data tx_data;
++	/* Queued Denali MicArray only; protected by lock after graph open. */
++	bool capture_checked;
++	bool capture_draining;
++	bool capture_fault;
++	bool capture_full;
++	u32 capture_send_seq;
++	u32 capture_done_seq;
++	u32 capture_done_slot;
++	u32 capture_empty;
+ 	struct gpr_ibasic_rsp_result_t result;
+ 	wait_queue_head_t cmd_wait;
+ 	u32 fullio_soft_event;
+@@ -216,6 +227,7 @@
+ 
+ /* read/write related */
+ int q6apm_read(struct q6apm_graph *graph);
++int q6apm_capture_retire(struct q6apm_graph *graph);
+ int q6apm_write_async(struct q6apm_graph *graph, uint32_t len, uint32_t msw_ts,
+ 		      uint32_t lsw_ts, uint32_t wflags);
+ 
+--- a/sound/soc/qcom/qdsp6/q6apm.c
++++ b/sound/soc/qcom/qdsp6/q6apm.c
+@@ -1170,6 +1170,15 @@
+ 
+ 	mutex_lock(&graph->lock);
+ 
++	if (data == &graph->tx_data && graph->capture_checked) {
++		if (graph->capture_fault || graph->capture_send_seq != graph->capture_done_seq) {
++			mutex_unlock(&graph->lock);
++			return -EIO;
++		}
++		graph->capture_done_slot = 0;
++		graph->capture_empty = 0;
++		graph->capture_full = false;
++	}
+ 	data->dsp_buf = 0;
+ 	atomic_set(&data->hw_ptr, 0);
+ 
+@@ -1201,6 +1210,8 @@
+ 		}
+ 	}
+ 	data->num_periods = periods;
++	if (data == &graph->tx_data && graph->capture_checked)
++		graph->capture_draining = false;
+ 
+ 	mutex_unlock(&graph->lock);
+ 
+@@ -1426,6 +1437,18 @@
+ 	 * between PREPARE priming and the READ_DONE requeue callback.
+ 	 */
+ 	pkt->hdr.token = port->dsp_buf;
++	if (graph->capture_checked) {
++		if (graph->capture_draining)
++			return -ESHUTDOWN;
++		if (graph->capture_fault)
++			return -EIO;
++		if (graph->capture_send_seq == U32_MAX ||
++		    graph->capture_send_seq - graph->capture_done_seq >= port->num_periods) {
++			graph->capture_fault = true;
++			return -EOVERFLOW;
++		}
++		pkt->hdr.token = graph->capture_send_seq;
++	}
+ 	ab = &port->buf[port->dsp_buf];
+ 
+ 	read_buffer->buf_addr_lsw = lower_32_bits(ab->phys);
+@@ -1435,12 +1458,47 @@
+ 
+ 	pkt->hdr.dest_domain = audioreach_gpr_dest_domain(graph->apm->gdev);
+ 	ret = gpr_send_port_pkt(graph->port, pkt);
+-	if (ret >= 0 && ++port->dsp_buf == port->num_periods)
+-		port->dsp_buf = 0;
++	if (ret >= 0) {
++		if (++port->dsp_buf == port->num_periods)
++			port->dsp_buf = 0;
++		if (graph->capture_checked)
++			graph->capture_send_seq++;
++	} else if (graph->capture_checked) {
++		graph->capture_fault = true;
++	}
+ 
+ 	return ret;
+ }
+ EXPORT_SYMBOL_GPL(q6apm_read);
++
++int q6apm_capture_retire(struct q6apm_graph *graph)
++{
++	struct audioreach_graph *ar = graph->ar_graph;
++	int ret = -EIO;
++
++	mutex_lock(&graph->lock);
++	if (graph->capture_draining) {
++		mutex_unlock(&graph->lock);
++		return -EIO;
++	}
++	graph->capture_draining = true;
++	mutex_unlock(&graph->lock);
++
++	/* A shared/no-op STOP cannot prove this ring was drained. Never wait
++	 * for the token-scoped response with the callback mutex held.
++	 */
++	q6apm_fullio_mute_invalidate(graph);
++	if (READ_ONCE(ar->start_count) == 1) {
++		WRITE_ONCE(ar->start_count, 0);
++		ret = audioreach_graph_mgmt_transaction(ar, APM_CMD_GRAPH_STOP, true);
++	}
++
++	guard(mutex)(&graph->lock);
++	if (ret || graph->capture_send_seq != graph->capture_done_seq)
++		graph->capture_fault = true;
++	return ret ?: (graph->capture_fault ? -EIO : 0);
++}
++EXPORT_SYMBOL_GPL(q6apm_capture_retire);
+ 
+ int q6apm_get_hw_pointer(struct q6apm_graph *graph, int dir)
+ {
+@@ -1491,6 +1549,51 @@
+ 	return level == FULLIO_PULL_PERIOD_BYTES || level == 2 * FULLIO_PULL_PERIOD_BYTES;
+ }
+ 
++static u32 q6apm_capture_done(struct q6apm_graph *graph, u32 token,
++			     const struct data_cmd_rsp_rd_sh_mem_ep_data_buffer_done_v2 *done)
++{
++	struct audioreach_graph_data *port = &graph->tx_data;
++	struct audio_buffer *buf;
++	u32 slot;
++
++	guard(mutex)(&graph->lock);
++	slot = graph->capture_done_slot;
++	if (graph->capture_fault && !graph->capture_draining)
++		return 0;
++	if (!done || !port->buf || slot >= port->num_periods ||
++	    graph->capture_done_seq == graph->capture_send_seq || token != graph->capture_done_seq)
++		goto fault;
++
++	buf = &port->buf[slot];
++	if (done->mem_map_handle != graph->info->mem_map_handle ||
++	    done->buf_addr_lsw != lower_32_bits(buf->phys) ||
++	    done->buf_addr_msw != upper_32_bits(buf->phys))
++		goto fault;
++
++	graph->capture_done_seq++;
++	graph->capture_done_slot = (slot + 1) % port->num_periods;
++	if (graph->capture_draining)
++		return 0;
++
++	if (done->status)
++		goto fault;
++	if (!done->data_size) {
++		if (graph->capture_full || graph->capture_empty++ >= port->num_periods)
++			goto fault;
++		return APM_CLIENT_EVENT_CAPTURE_RECLAIM;
++	}
++	if (done->data_size != buf->size || (!graph->capture_full && slot))
++		goto fault;
++
++	graph->capture_full = true;
++	atomic_set(&port->hw_ptr, slot + 1);
++	return APM_CLIENT_EVENT_DATA_READ_DONE;
++
++fault:
++	graph->capture_fault = true;
++	return graph->capture_draining ? 0 : APM_CLIENT_EVENT_CAPTURE_FAULT;
++}
++
+ static int graph_callback(const struct gpr_resp_pkt *data, void *priv, int op)
+ {
+ 	struct data_cmd_rsp_rd_sh_mem_ep_data_buffer_done_v2 *rd_done;
+@@ -1568,6 +1671,15 @@
+ 		if (!graph->ar_graph)
+ 			break;
+ 		client_event = APM_CLIENT_EVENT_DATA_READ_DONE;
++		if (READ_ONCE(graph->capture_checked)) {
++			rd_done = NULL;
++			if (data->payload_size >= (int)offsetofend(typeof(*rd_done), data_size))
++				rd_done = data->payload;
++			client_event = q6apm_capture_done(graph, hdr->token, rd_done);
++			if (client_event && graph->cb)
++				graph->cb(client_event, hdr->token, data->payload, graph->priv);
++			break;
++		}
+ 		/* Validate only the common prefix, not the undocumented tail. */
+ 		if (!data->payload || data->payload_size < (int)offsetofend(typeof(*rd_done), data_size))
+ 			return -EINVAL;
+--- a/sound/soc/qcom/qdsp6/q6apm-dai.c
++++ b/sound/soc/qcom/qdsp6/q6apm-dai.c
+@@ -320,9 +320,17 @@
+ 		break;
+ 	case APM_CLIENT_EVENT_DATA_READ_DONE:
+ 		snd_pcm_period_elapsed(substream);
+-		if (prtd->state == Q6APM_STREAM_RUNNING)
+-			q6apm_read(prtd->graph);
++		fallthrough;
++	case APM_CLIENT_EVENT_CAPTURE_RECLAIM:
++		if (READ_ONCE(prtd->state) == Q6APM_STREAM_RUNNING) {
++			int ret = q6apm_read(prtd->graph);
+ 
++			if (prtd->graph->capture_checked && ret < 0 && ret != -ESHUTDOWN)
++				snd_pcm_stop_xrun(substream);
++		}
++		break;
++	case APM_CLIENT_EVENT_CAPTURE_FAULT:
++		snd_pcm_stop_xrun(substream);
+ 		break;
+ 	default:
+ 		break;
+@@ -1327,8 +1335,14 @@
+ 		return ret ?: -EOPNOTSUPP;
+ 	}
+ 	if (prtd->state) {
+-		/* clear the previous setup if any  */
+-		q6apm_graph_stop(prtd->graph);
++		/* A stopped ALSA PCM does not prove the DSP returned its reads. */
++		if (prtd->graph->capture_checked) {
++			ret = q6apm_capture_retire(prtd->graph);
++			if (ret)
++				return ret;
++		} else {
++			q6apm_graph_stop(prtd->graph);
++		}
+ 		q6apm_free_fragments(prtd->graph, substream->stream);
+ 	}
+ 
+@@ -1395,9 +1409,14 @@
+ 	if (!q6apm_is_graph_in_push_pull_mode(prtd->graph)) {
+ 		if (substream->stream == SNDRV_PCM_STREAM_CAPTURE) {
+ 			int i;
+-			/* Queue the buffers for Capture ONLY after graph is started */
+-			for (i = 0; i < runtime->periods; i++)
+-				q6apm_read(prtd->graph);
++			/* A valid read may return before the last priming submission. */
++			if (prtd->graph->capture_checked)
++				WRITE_ONCE(prtd->state, Q6APM_STREAM_RUNNING);
++			for (i = 0; i < runtime->periods; i++) {
++				ret = q6apm_read(prtd->graph);
++				if (prtd->graph->capture_checked && ret < 0)
++					return ret;
++			}
+ 		}
+ 	}
+ 
+@@ -1574,6 +1593,13 @@
+ 		ret = PTR_ERR(prtd->graph);
+ 		goto err;
+ 	}
++
++	if (!probe_rate && graph_id == 2 && substream->stream == SNDRV_PCM_STREAM_CAPTURE &&
++	    of_machine_is_compatible("microsoft,denali") &&
++	    of_property_read_bool(component->card->dev->of_node,
++				  "microsoft,denali-fullio-checked-capture") &&
++	    !q6apm_is_graph_in_push_pull_mode(prtd->graph))
++		WRITE_ONCE(prtd->graph->capture_checked, true);
+ 
+ 	if (substream->stream == SNDRV_PCM_STREAM_PLAYBACK)
+ 		runtime->hw = q6apm_dai_hardware_playback;
+@@ -1685,7 +1711,10 @@
+ 	cancel_work_sync(&prtd->watermark_work);
+ 	if (prtd->graph && !prtd->fullio_reference_pcm && prtd->state) {
+ 		/* Native FullIO uses only the token-scoped STOP below. */
+-		q6apm_graph_stop(prtd->graph);
++		if (prtd->graph->capture_checked)
++			ret = q6apm_capture_retire(prtd->graph);
++		else
++			q6apm_graph_stop(prtd->graph);
+ 		q6apm_free_fragments(prtd->graph, substream->stream);
+ 	}
+ 

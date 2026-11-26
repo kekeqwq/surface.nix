@@ -2,10 +2,10 @@
 # Hold the protected Denali render graph alive for the whole session.
 #
 # A silent stream keeps the PipeWire sink, the ALSA PCM and the FullIO
-# graph open across user playback gaps, so the PA enable transient (the
-# audible start crack after long idle) happens once when this holder
-# starts and never again on play or video switch. The stream contributes
-# exactly zero samples and cannot affect mix level or channel mapping.
+# graph open across ordinary playback gaps, avoiding unnecessary PA
+# starts when the same PCM epoch survives. This is not a fix for a startup
+# transient or a guarantee against graph retirement. The stream itself
+# contributes exactly zero samples.
 #
 # The feeder and the player are supervised as two explicit processes
 # (a FIFO, not a pipeline: `$!` would otherwise capture the feeder) and

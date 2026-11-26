@@ -2028,7 +2028,7 @@ index afa4bb0..27f6043 100644
  static int q6apm_dai_trigger(struct snd_soc_component *component,
  			     struct snd_pcm_substream *substream, int cmd)
  {
-@@ -455,15 +1472,38 @@ static int q6apm_dai_trigger(struct snd_soc_component *component,
+@@ -455,15 +1472,43 @@ static int q6apm_dai_trigger(struct snd_soc_component *component,
  	case SNDRV_PCM_TRIGGER_START:
  	case SNDRV_PCM_TRIGGER_RESUME:
  	case SNDRV_PCM_TRIGGER_PAUSE_RELEASE:
@@ -2037,9 +2037,8 @@ index afa4bb0..27f6043 100644
 +				return prtd->fullio_reference_error;
 +			if (!prtd->fullio_reference_prepared || prtd->fullio_reference_reopen)
 +				return -EBADFD;
-+			/* PipeWire may release or recover this stream without hw_free.
-+			 * The paired PAs are already on; another start_pair would fail
-+			 * and force a graph replacement during playback.
++			/* A duplicate START of the same uninterrupted PCM epoch
++			 * must not repeat the protected paired PA enable.
 +			 */
 +			if (!prtd->fullio_reference_started) {
 +				ret = q6apm_fullio_reference_start(prtd, component->card,
@@ -2057,14 +2056,21 @@ index afa4bb0..27f6043 100644
  		break;
  	case SNDRV_PCM_TRIGGER_STOP:
 -		/* TODO support be handled via SoftPause Module */
-+		q6apm_pcm_watermark_enable(prtd, false);
  		prtd->state = Q6APM_STREAM_STOPPED;
  		prtd->queue_ptr = 0;
  		prtd->last_pos_index = 0;
- 		break;
+-		break;
++		fallthrough;
  	case SNDRV_PCM_TRIGGER_SUSPEND:
  	case SNDRV_PCM_TRIGGER_PAUSE_PUSH:
 +		q6apm_pcm_watermark_enable(prtd, false);
++		/* The WSA backend mutes at STOP, not only at hw_free.
++		 * PREPARE after XRUN/DROP may reuse the same ALSA file.
++		 * Publish retirement, then let PREPARE verify both PAs off
++		 * and replace the old DSP graph; never drain work here.
++		 */
++		if (prtd->fullio_reference_pcm && prtd->fullio_reference_started)
++			prtd->fullio_reference_reopen = true;
  		break;
  	default:
  		ret = -EINVAL;

@@ -234,7 +234,19 @@ index ad28a0f..f4b6c6e 100644
  	if (msg->page) {
  		if (ctrl->page1_cache[msg->dev_num] != msg->addr_page1) {
  			ret = qcom_swrm_cmd_fifo_wr_cmd(ctrl, msg->addr_page1,
-@@ -1214,6 +1346,98 @@ static int qcom_swrm_port_params(struct sdw_bus *bus,
+@@ -1210,10 +1342,110 @@ static int qcom_swrm_port_params(struct sdw_bus *bus,
+ 	u32 offset = ctrl->reg_layout[SWRM_OFFSET_DP_BLOCK_CTRL_1];
+ 
++	/* No DT word-length override leaves this optional struct zeroed.
++	 * The core still calls us after programming the transport parameters.
++	 */
++	if (!p_params->num && !p_params->bps)
++		return 0;
++	if (!p_params->num || p_params->num > ctrl->nports || !p_params->bps)
++		return -EINVAL;
++
+ 	return qcom_swrm_port_reg_write(ctrl, p_params->num,
+ 					SWRM_DPn_BLOCK_CTRL_1(offset, p_params->num),
  					p_params->bps - 1);
  }
  

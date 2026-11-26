@@ -1,0 +1,51 @@
+--- a/sound/soc/qcom/qdsp6/q6apm.c
++++ b/sound/soc/qcom/qdsp6/q6apm.c
+@@ -1407,17 +1407,25 @@
+ 	struct data_cmd_rd_sh_mem_ep_data_buffer_v2 *read_buffer;
+ 	struct audioreach_graph_data *port;
+ 	struct audio_buffer *ab;
++	int ret;
+ 
+ 	struct gpr_pkt *pkt __free(kfree) = audioreach_alloc_pkt(sizeof(*read_buffer),
+ 					DATA_CMD_RD_SH_MEM_EP_DATA_BUFFER_V2,
+-					graph->tx_data.dsp_buf, graph->port->id, graph->shm_iid);
++					0, graph->port->id, graph->shm_iid);
+ 	if (IS_ERR(pkt))
+ 		return PTR_ERR(pkt);
+ 
+ 	read_buffer = (void *)pkt + GPR_HDR_SIZE;
+ 
+-	mutex_lock(&graph->lock);
++	guard(mutex)(&graph->lock);
+ 	port = &graph->tx_data;
++	if (!port->buf || port->dsp_buf >= port->num_periods)
++		return -EINVAL;
++
++	/* Keep slot selection, command submission and the cursor ordered
++	 * between PREPARE priming and the READ_DONE requeue callback.
++	 */
++	pkt->hdr.token = port->dsp_buf;
+ 	ab = &port->buf[port->dsp_buf];
+ 
+ 	read_buffer->buf_addr_lsw = lower_32_bits(ab->phys);
+@@ -1425,16 +1433,12 @@
+ 	read_buffer->mem_map_handle = graph->info->mem_map_handle;
+ 	read_buffer->buf_size = ab->size;
+ 
+-	port->dsp_buf++;
+-
+-	if (port->dsp_buf >= port->num_periods)
+-		port->dsp_buf = 0;
+-
+-	mutex_unlock(&graph->lock);
+-
+ 	pkt->hdr.dest_domain = audioreach_gpr_dest_domain(graph->apm->gdev);
++	ret = gpr_send_port_pkt(graph->port, pkt);
++	if (ret >= 0 && ++port->dsp_buf == port->num_periods)
++		port->dsp_buf = 0;
+ 
+-	return gpr_send_port_pkt(graph->port, pkt);
++	return ret;
+ }
+ EXPORT_SYMBOL_GPL(q6apm_read);
+ 
