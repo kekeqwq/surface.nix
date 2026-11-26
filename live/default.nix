@@ -20,9 +20,13 @@ let
       [ "CONFIG_ISO9660_FS=m" "CONFIG_SQUASHFS=m\nCONFIG_SQUASHFS_ZSTD=y" ]
       baseConfig
   );
-  liveKernel = pkgs.surfacePackages.surfaceNext.override {
-    configfile = liveConfig;
-    localVersion = "-surface-live";
+  withHhkb = import ../modules/denali/with-hhkb.nix;
+  liveKernel = withHhkb {
+    enabled = config.surface.devices.denali.keyboard.hhkb.enable;
+    kernel = pkgs.surfacePackages.surfaceNext.override {
+      configfile = liveConfig;
+      localVersion = "-surface-live";
+    };
   };
   isoInspector = pkgs.runCommand "surface-live-inspector" { } ''
     mkdir -p "$out"
@@ -102,6 +106,7 @@ in
 
   nixpkgs.hostPlatform = "aarch64-linux";
   surface.devices.denali.enable = true;
+  surface.devices.denali.keyboard.hhkb.enable = true;
   hardware.enableAllHardware = lib.mkForce false;
   networking.hostName = "surface-live";
   # A new, stateless Live environment; not the installed host's compatibility baseline.
@@ -134,9 +139,24 @@ in
     overlay = true;
     loop = true;
   };
+  # The generic installer asks for threads=multi. Our Live kernel builds
+  # the single SquashFS decompressor and rejects that option with EINVAL.
+  # Keep the loop mount and let the kernel choose its compiled default.
+  fileSystems = lib.mkOverride 40 (config.lib.isoFileSystems // {
+    "/nix/.ro-store" = {
+      fsType = "squashfs";
+      device = "/sysroot/iso/nix-store.squashfs";
+      options = [ "loop" ];
+      neededForBoot = true;
+    };
+  });
+
+  boot.consoleLogLevel = lib.mkForce 7;
   boot.kernelParams = [
-    "fbcon=font:TER16x32"
+    "fbcon=font:TER16x32,nodefer"
     "console=tty0"
+    "rd.systemd.show_status=yes"
+    "systemd.show_status=yes"
   ];
   console.font = "ter-v32n";
   console.packages = [ pkgs.terminus_font ];

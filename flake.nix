@@ -81,7 +81,11 @@
               ssh = live.config.services.openssh.enable;
               root = live.config.services.openssh.settings.PermitRootLogin;
               empty = live.config.services.openssh.settings.PermitEmptyPasswords;
-              font = live.config.boot.kernelParams;
+              cmdline = live.config.boot.kernelParams;
+              hhkb = live.config.surface.devices.denali.keyboard.hhkb.enable;
+              kernelPatches = map (patch: patch.name) live.config.boot.kernelPackages.kernel.kernelPatches;
+              media = live.config.fileSystems."/iso".device;
+              squashfsOptions = live.config.fileSystems."/nix/.ro-store".options;
               tools = map (pkg: pkg.pname or pkg.name) live.config.environment.systemPackages;
             };
           }
@@ -91,7 +95,13 @@
             grep -q '"ssh":true' "$out"
             grep -q '"root":"yes"' "$out"
             grep -q '"empty":true' "$out"
-            grep -q TER16x32 "$out"
+            grep -Fq 'fbcon=font:TER16x32,nodefer' "$out"
+            grep -Fq 'rd.systemd.show_status=yes' "$out"
+            grep -Fq '"hhkb":true' "$out"
+            grep -Fq '"denali-hhkb"' "$out"
+            grep -Fq '"surface_hid_core.denali_hhkb=1"' "$out"
+            grep -Fq '"media":"/dev/disk/by-label/SURFACE_LIVE"' "$out"
+            grep -Fq '"squashfsOptions":["x-initrd.mount","loop"]' "$out"
             for tool in git util-linux gptfdisk dosfstools btrfs-progs cryptsetup libfido2 python3 iw usbutils; do
               grep -q "\"$tool\"" "$out"
             done

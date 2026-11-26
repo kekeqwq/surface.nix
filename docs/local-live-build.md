@@ -38,3 +38,32 @@ The base and remaster had the same EFI partition digest, Denali ARM64 zboot
 UKI, and Live squashfs; the embedded three-file firmware payload matched the
 hardware-tested MSI. No USB was written. Do not treat verified ISO contents
 as a USB boot or an acceptance test of a freshly installed instance.
+
+On 2026-11-26 the refreshed private image was written to USB and the
+entire image range read back byte-for-byte (SHA-256
+`0e53bdba6bb1ee7a5e612bd07584c8aa3966538ff2478cdd069897f0577b40d6`).
+The owner later reached the boot menu on the Denali OLED, but selecting
+Live left a black screen and did not expose a usable TTY. **This image
+is not a verified bootable baseline.** The menu, ISO/ESP inspection and
+USB readback do not distinguish early kernel failure, Live root mount
+failure and display/console handoff failure. On the next image, retain a
+visible boot log and verify the real device reaches a legible local TTY
+with working input and the Live root mounted before attempting any disk
+installation. Keep the failure investigation separate from the installed
+system and do not repartition the internal disk to test it. Keep subsequent
+private candidates outside Git, the Nix store, and iCloud while testing.
+Archive a copy in the owner's iCloud only after the owner confirms real
+USB boot and use of the Live TTY. The failed candidate is not a baseline.
+
+### Live root mount fix
+
+The old Live configuration evaluated `/nix/.ro-store` with `loop,threads=multi`.
+The actual Next24 Live kernel build config has `SQUASHFS_COMPILE_DECOMP_SINGLE=y`
+and no `SQUASHFS_CHOICE_DECOMP_BY_MOUNT`; its `squashfs_parse_param_threads_str()`
+rejects `multi` with `EINVAL`. This is a concrete blocker for reaching stage 2,
+independent of whether there is a second display problem. Keep the same
+kernel and override the Live read-only store mount to use its compiled
+SquashFS default, leaving ISO discovery and overlay unchanged. The native
+configuration gate checks the effective mount flags, `SURFACE_LIVE` label,
+and visible stage-1 status; an initial sub-option override that still left
+`threads=multi` was rejected by the gate before packaging.

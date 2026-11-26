@@ -2,7 +2,7 @@
 
 `surface.devices.denali.keyboard.hhkb.enable = true;` selects an experimental
 Surface HID transport patch. The hardware option defaults off; `flakes#surface`
-may explicitly enable it. The Live image keeps it off. On the 2026-11-26
+and the Denali Live image explicitly enable it. On the 2026-11-26
 native evaluation, leaving it off yielded the exact deployed daily closure. See the [PFU Studio US Fn table][pfu] for
 macOS Profile 2, adapted to keep the physical Surface top row and number row
 (including grave, minus, equals and Backspace) in place.

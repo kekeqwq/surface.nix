@@ -149,7 +149,10 @@ def report(iso, profile):
             cmdline = sections['.cmdline'].rstrip(b'\0').decode().split()
             require(any(arg.startswith('init=/nix/store/') and arg.endswith('/init') for arg in cmdline),
                     'missing NixOS init path')
-            require('fbcon=font:TER16x32' in cmdline, 'missing large console font')
+            fbcon_options = [option for arg in cmdline if arg.startswith('fbcon=')
+                             for option in arg.removeprefix('fbcon=').split(',')]
+            require([option for option in fbcon_options if option.startswith('font:')] == ['font:TER16x32'],
+                    'missing or conflicting large console font')
             report.update(profile=profile, iso_sha256=sha256(iso), live_root=root,
                           esp_sha256=sha256(esp), loader={'bytes': loader.stat().st_size, 'sha256': sha256(loader), 'config': config},
                           uki=measured)
