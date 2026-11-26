@@ -5,6 +5,7 @@
 #include <string.h>
 
 typedef uint8_t u8;
+typedef uint16_t u16;
 #include "denali_hhkb.h"
 
 static void expect(struct denali_hhkb *s, const u8 *in, const u8 *expected, bool eject)
@@ -19,6 +20,63 @@ static void expect(struct denali_hhkb *s, const u8 *in, const u8 *expected, bool
 }
 
 #define REPORT(...) ((const u8[DENALI_KBD_SIZE]){ 1, __VA_ARGS__ })
+
+static void test_surface_row(void)
+{
+	static const u16 base[] = { 0, 0xe2, 0xea, 0xe9, 0, 0x70, 0x6f,
+				    0x46, 0x4a, 0x4d, 0x4b, 0x4e };
+	bool eject, mic, light;
+	u16 media;
+	u8 out[DENALI_KBD_OUT_SIZE];
+
+	for (unsigned i = 0; i < 12; i++) {
+		struct denali_hhkb s = { 0 };
+		u8 f = 0x3a + i;
+
+		/* Old Fn / Fn Lock sent a physical F usage; normalize it to base. */
+		assert(denali_hhkb_snapshot(&s, REPORT(0, f)));
+		denali_hhkb_outputs(&s, out, &eject, &mic, &light, &media);
+		assert(out[2] == (i >= 7 ? base[i] : 0));
+		assert(media == (i < 7 ? base[i] : 0));
+		assert(mic == (i == 0) && light == (i == 4));
+		assert(denali_hhkb_snapshot(&s, REPORT(0, 0x4f)));
+		denali_hhkb_outputs(&s, out, &eject, &mic, &light, &media);
+		/* New Fn with the base report, across all on-wire report classes. */
+		if (i == 0 || i == 4)
+			denali_hhkb_top_button(&s, i, true);
+		else if (i < 7)
+			denali_hhkb_consumer(&s, base[i]);
+		else
+			assert(denali_hhkb_snapshot(&s, REPORT(0, 0x4f, base[i])));
+		denali_hhkb_outputs(&s, out, &eject, &mic, &light, &media);
+		assert(out[2] == f && out[3] == 0 && !mic && !light && !media);
+		/* Fn first up preserves the F-key until its own release. */
+		assert(denali_hhkb_snapshot(&s, REPORT(0, i >= 7 ? base[i] : 0)));
+		denali_hhkb_outputs(&s, out, &eject, &mic, &light, &media);
+		assert(out[2] == f);
+		assert(denali_hhkb_snapshot(&s, REPORT(0)));
+		denali_hhkb_consumer(&s, 0);
+		denali_hhkb_top_button(&s, 0, false);
+		denali_hhkb_top_button(&s, 4, false);
+		denali_hhkb_outputs(&s, out, &eject, &mic, &light, &media);
+		assert(!out[2] && !mic && !light && !media);
+		/* With new Fn down, firmware's old-Fn variant is still the
+		 * same physical position. Release that position before Fn.
+		 */
+		assert(denali_hhkb_snapshot(&s, REPORT(0, 0x4f, f)));
+		denali_hhkb_outputs(&s, out, &eject, &mic, &light, &media);
+		assert(out[2] == f);
+		assert(denali_hhkb_snapshot(&s, REPORT(0, 0x4f)));
+		denali_hhkb_outputs(&s, out, &eject, &mic, &light, &media);
+		assert(!out[2] && !mic && !light && !media);
+	}
+	struct denali_hhkb s = { 0 };
+	assert(denali_hhkb_snapshot(&s, REPORT(0, 0x4f, 0x1e, 0x42)));
+	denali_hhkb_top_button(&s, 0, true);
+	denali_hhkb_consumer(&s, 0x00cd); /* Unrelated Play/Pause passes. */
+	denali_hhkb_outputs(&s, out, &eject, &mic, &light, &media);
+	assert(out[2] == 0x3a && out[3] == 0x42 && out[4] == 0 && media == 0xcd);
+}
 
 int main(void)
 {
@@ -59,5 +117,6 @@ int main(void)
 	assert(!denali_hhkb_translate(&s, REPORT(0, 0xff), out, &eject));
 	expect(&s, REPORT(0, 0x34, 0x34), REPORT(0, 0x4f), false);
 	expect(&s, REPORT(0), REPORT(0), false);
+	test_surface_row();
 	return 0;
 }

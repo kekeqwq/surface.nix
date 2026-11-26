@@ -14,10 +14,11 @@ The verified device is Surface Aggregator UID `01:15:02:01:00`, HID
 reports ID 1: one modifier byte and ten simultaneous keyboard usages. A
 short read-only capture confirmed physical Right (`0x4f`) alongside
 semicolon (`0x33`) and apostrophe (`0x34`), with independent releases. The
-patch preserves the original keyboard input path and only translates that
-report. Eject uses a separate added Consumer HID report; all physical
-consumer/system reports pass as before. The touchpad, generic USB/BT
-keyboards, and xremap configuration are unchanged.
+patch preserves the original keyboard input path, translating the keyboard
+array and the verified auxiliary reports for the physical top row. The
+synthetic array has room for all translated usages without displacing other
+held keys. Eject uses a separate added Consumer HID report. The touchpad,
+generic USB/BT keyboards, and xremap configuration are unchanged.
 
 - Physical Right is Fn, and standalone Fn has no evdev output. Physical
   Left/Up/Down and left Ctrl do not emit. Caps becomes real left Ctrl;
@@ -27,14 +28,16 @@ keyboards, and xremap configuration are unchanged.
   Screen/Scroll Lock/Pause, Insert, Forward Delete, volume, Eject, and Power.
   The output of a key held across a layer change remains fixed until its
   physical release. Rollover or an invalid slot does not invent releases.
-- The original left Fn had no reliable independent make/break in the captured
-  reports. This implementation does **not** claim to disable firmware-side
-  behavior. The unrelated system control report must not be deleted on the
-  assumption that it means Fn. Right Alt and the Copilot/Menu behavior remain
-  stock until the latter's own reports can be distinguished without stealing
-  a genuine chord. The top row's base behavior remains stock; Fn+Esc is
-  the intentional Studio Power shortcut. Linux handles that key according to
-  its own power policy. No Studio hardware pairing/profile controls exist.
+- Right-Fn + physical top row emits F1–F12. The matched magnetic keyboard's
+  firmware-generated F1–F12 usages represent those same physical positions;
+  normalize them to the captured base actions unless Right-Fn selected the
+  alternate at make time. This makes the mapping independent of the firmware
+  Fn Lock mode. Clear only bit 0 of report `5b` (the observed old Fn event),
+  preserving adjacent system bits. This does **not** stop the firmware from
+  driving its Fn LED or handling any firmware-local behavior.
+- Right Alt and Copilot/Menu remain stock. Fn+Esc is the intentional Studio
+  Power shortcut. Linux handles that key according to its own power policy.
+  No Studio hardware pairing/profile controls exist.
 
 ## Verification
 
@@ -61,5 +64,24 @@ orders, arrow repeat, the number and top rows, and xremap's Emacs left-Shift
 tap/hold behavior. Repeat with the Surface keyboard reattached and after
 resume, and verify that the USB keyboard and audio path are unchanged.
 These are run-time acceptance requirements, not results of the model.
+
+2026-11-26 installed-boot feedback: the candidate booted with
+`surface_hid_core.denali_hhkb=1`, and the loaded module reported `Y`.
+The owner confirmed physical Caps works as Ctrl without lighting the Caps
+LED, and Right works as Fn. Right-Fn plus a physical top-row function/media
+key does not yet produce its F-key alternate; the original Fn still does and
+its light still responds. This was separate from Studio Fn+number F1–F12.
+
+Follow-up read-only captures from both `09ae` and `09b0` found all relevant
+reports on `09ae`. Physical F1/F9 with the old Fn produced keyboard usages
+`3a`/`42`, bracketed by `5b01` and `5b00`; with the new Fn they produced
+the same base reports as without Fn. With no Fn, the F1–F12 positions in
+order produced `5e01`, `03e200`, `03ea00`, `03e900`, `d501`, `037000`,
+`036f00`, and keyboard usages `46`, `4a`, `4d`, `4b`, `4e`. The revised
+model checks all twelve positions, make-time mapping in both release
+orders, deduplication with Fn+number, and unrelated Consumer pass-through.
+The revised model passed ASan/UBSan and native AArch64; all three Surface
+HID/KBD modules compiled and linked against the running build headers.
+Physical TTY and desktop regression remain to be verified after deployment.
 
 [pfu]: https://happyhackingkb.com/manual/studio/ug-us/en/ug/topic/use_fnkeys_fn1.html
