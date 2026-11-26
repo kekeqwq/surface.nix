@@ -99,6 +99,11 @@ let
   '';
 in
 {
+  options.surface.fullio.referenceRender.enable = lib.mkOption {
+    type = lib.types.bool;
+    default = true;
+    description = "Use the imported FullIO reference configuration. Disable only in an explicit boot comparison.";
+  };
   options.surface.fullio.checkedCapture = lib.mkEnableOption ''
     Experimental Denali MicArray read completion and STOP ownership checks
   '';
@@ -114,7 +119,7 @@ in
   options.surface.fullio.swrResumeAudit = lib.mkEnableOption ''
     Denali FullIO SoundWire resume snapshots with fail-closed link admission
   '';
-  config = {
+  config = lib.mkIf config.surface.fullio.referenceRender.enable {
     assertions = [
       {
         assertion = !feedbackParity || (

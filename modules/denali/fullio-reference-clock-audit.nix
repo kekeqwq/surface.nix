@@ -24,7 +24,7 @@ let
     };
   };
 in
-{
+lib.mkIf (config.surface.fullio.referenceRender.enable or true) {
   assertions = [
     {
       assertion =
