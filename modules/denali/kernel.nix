@@ -9,6 +9,8 @@ let
   withHhkb = import ./with-hhkb.nix;
 in
 {
+  imports = [ ./touchscreen.nix ];
+
   config = lib.mkIf config.surface.devices.denali.enable {
     # The opted-in Denali device needs its kernel instead of a desktop default.
     boot.kernelPackages =
@@ -56,6 +58,5 @@ in
       name = "qcom/x1e80100-microsoft-denali-oled.dtb";
       filter = "x1e80100-microsoft-denali-oled.dtb";
     };
-    services.iptsd.enable = lib.mkDefault true;
   };
 }
