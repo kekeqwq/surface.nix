@@ -1212,9 +1212,9 @@ index f58ce92..43a374e 100644
 +	return verify ?: (pa < 0 ? pa : clock);
 +}
 +
-+/* Startup settle before PA_FSM_EN. The measured startup crack is a
-+ * charge step at PA enable; the output stage now pre-biases first.
-+ * Runtime-tunable so hardware A/B measurements need no rebuild.
++/* Experimental dwell before PA_FSM_EN, preserving reference write order.
++ * This is not an established fix: the long-idle transient survived 20 ms
++ * and 1 s dwells, and its electrical/acoustic source is not identified.
 + */
 +static unsigned int wsa884x_pa_settle_us = 20000;
 +module_param_named(pa_settle_us, wsa884x_pa_settle_us, uint, 0644);
@@ -1237,9 +1237,9 @@ index f58ce92..43a374e 100644
 +	int ret;
 +
 +	for (unsigned int i = 0; i < ARRAY_SIZE(sequence); ++i) {
-+		/* Let the boost and half-drive output stage settle before the PA
-+		 * connects the speaker. The measured startup crack is a charge
-+		 * step at PA_FSM_EN with the previous back-to-back ordering.
++		/* Dwell at the reference half-drive setting before PA enable.
++		 * Keep this separate from the PA-ready checks; waiting here
++		 * is not proof that the PA or protection feedback is ready.
 +		 */
 +		if (sequence[i].reg == WSA884X_PA_FSM_EN) {
 +			unsigned int settle = min(wsa884x_pa_settle_us, 1000000U);

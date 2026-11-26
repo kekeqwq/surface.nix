@@ -57,6 +57,17 @@ def verify_reference_dtb(dtb, fdtget, *, checked_capture=False, pre_sp=False, fe
             raise ValueError(f"DTB node {node} is missing the reference-codec marker")
 
 
+def keyboard_cmdline(line, kernel_params, enabled):
+    prefix = "surface_hid_core.denali_hhkb="
+    expected = prefix + "1"
+    selection = [p for p in kernel_params.split() if p.startswith(prefix)]
+    if selection != ([expected] if enabled else []):
+        raise ValueError("candidate keyboard parameter does not match the explicit experiment selection")
+    if any(p.startswith(prefix) for p in line.split()):
+        raise ValueError("stage the keyboard experiment from a normal boot")
+    return line + " " + expected if enabled else line
+
+
 def main():
     cli = argparse.ArgumentParser(description=__doc__)
     cli.add_argument("system", type=Path, help="built candidate toplevel")
@@ -66,6 +77,7 @@ def main():
     cli.add_argument("--checked-capture", action="store_true", help="require the checked MicArray experiment")
     cli.add_argument("--pre-sp-logger-audit", action="store_true", help="require the pre-SP topology diagnostic")
     cli.add_argument("--feedback-parity-audit", action="store_true", help="require the feedback parity diagnostic")
+    cli.add_argument("--denali-hhkb", action="store_true", help="require the opt-in Denali keyboard configuration")
     cli.add_argument("--zstd", default="zstd", help="firmware decompressor (default: zstd on PATH)")
     args = cli.parse_args()
     os.umask(0o077)
@@ -112,6 +124,10 @@ def main():
     if match != [str(active / "init")] or "firmware_class.path=/surface-firmware" not in line.split():
         cli.error("the running Denali command line does not match its booted closure")
     line = re.sub(r"(?<!\S)init=\S+", f"init={candidate}/init", line, count=1)
+    try:
+        line = keyboard_cmdline(line, (candidate / "kernel-params").read_text(), args.denali_hhkb)
+    except (OSError, ValueError) as exc:
+        cli.error(str(exc))
     here = Path(__file__).resolve().parent
     spec = importlib.util.spec_from_file_location("install_ukis", here / "install-ukis.py")
     installer = importlib.util.module_from_spec(spec)

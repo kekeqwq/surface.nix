@@ -1,5 +1,11 @@
 # Denali speaker loudness/protection audit
 
+**DIAG interpretation correction.** Historical local observations using
+byte 52 as the 0x1586 tap ID cannot establish a tap's presence or absence.
+The reference and an unfiltered live census identify byte 60 instead;
+see `fullio-audio-acceptance.md`. Where the old collector discarded
+records before archiving, an offline decoder cannot recover them.
+
 ## Priority
 
 Deferred until the other hardware bring-up tasks are complete, by user request.
