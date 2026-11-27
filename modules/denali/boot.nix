@@ -41,8 +41,28 @@ let
   '';
 in
 {
+  options.surface.devices.denali.boot.earlyDisplay = lib.mkEnableOption ''
+    native OLED modesetting in the initrd (for example, for an encrypted root)
+  '';
+
   config = lib.mkIf cfg.enable {
-    boot.initrd.kernelModules = [ "simpledrm" ];
+    boot.initrd.kernelModules = [ "simpledrm" ] ++ lib.optionals cfg.boot.earlyDisplay [
+      "dispcc-x1e80100"
+      "gpucc-x1e80100"
+      # MDSS waits for both USB-C DP components even when using only eDP.
+      "qcom_glink_smem"
+      "qrtr"
+      "pmic_glink"
+      "pmic_glink_altmode"
+      "ps883x"
+    ];
+    # PMIC GLINK initializes PDR/QMI over AF_QIPCRTR. This is a socket
+    # dependency, not a kmod symbol dependency; kernelModules is sorted.
+    boot.initrd.systemd.contents = lib.mkIf cfg.boot.earlyDisplay {
+      "/etc/modprobe.d/denali-display.conf".text = ''
+        softdep pmic_glink pre: qrtr
+      '';
+    };
     boot.kernelParams = [
       "arm64.nopauth"
       "systemd.mask=tpm2.target"
