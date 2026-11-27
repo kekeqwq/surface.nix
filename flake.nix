@@ -2,9 +2,12 @@
   description = "Opt-in NixOS hardware support for Surface Pro 11 Denali OLED";
 
   inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable-small";
+  # Keep the validated kernel compiler, module tools and DTB filter independent
+  # of the host userspace. Replace only with a verified native boot baseline.
+  inputs.daily-kernel-nixpkgs.url = "github:NixOS/nixpkgs/52a93865f031ba894c0d19121dda6b75c0f2b2b8";
 
   outputs =
-    { nixpkgs, ... }:
+    { nixpkgs, daily-kernel-nixpkgs, ... }:
     let
       system = "aarch64-linux";
       overlay = import ./overlay.nix;
@@ -16,13 +19,12 @@
       live = nixpkgs.lib.nixosSystem {
         modules = [ ./live/default.nix ];
       };
-      packages = rec {
-        default = kernel;
-        surface-live-iso = live.config.system.build.surfaceLiveIso;
+      fullioPackages = pkgs: rec {
+        kernel = pkgs.surfacePackages.surfaceNext;
         fullio-reference-topology = pkgs.callPackage ./pkgs/fullio-topology.nix { };
         fullio-reference-volume = pkgs.callPackage ./pkgs/fullio-reference-volume.nix { };
-        fullio-reference-kernel = kernel.override {
-          localVersion = "-surface-fullio";
+        fullio-checked-capture-kernel = kernel.override {
+          localVersion = "-surface-fullio-checked-capture";
           kernelPatches =
             kernel.kernelPatches
             ++
@@ -39,25 +41,7 @@
                   ./pkgs/patches/denali-fullio-pa-cache.patch
                   ./pkgs/patches/fullio/audioreach-fullio.patch
                   ./pkgs/patches/fullio/asoc-denali-routing.patch
-                  # Context depends on the FullIO q6apm/q6apm-dai/q6apm.h
-                  # additions above: keep this after the common FullIO patches.
-                  ./pkgs/patches/denali-fullio-gain-snapshot.patch
-                ];
-        };
-        fullio-checked-capture-kernel = fullio-reference-kernel.override {
-          localVersion = "-surface-fullio-checked-capture";
-          kernelPatches =
-            # Keep the tested checked-capture v2 kernel byte-identical:
-            # the separate gain snapshot diagnostic is not part of v2.
-            builtins.filter (p: (p.name or "") != "denali-fullio-gain-snapshot.patch")
-              fullio-reference-kernel.kernelPatches
-            ++
-              map
-                (patch: {
-                  name = builtins.baseNameOf patch;
-                  inherit patch;
-                })
-                [
+                  # Checked capture depends on the FullIO changes above.
                   ./pkgs/patches/sp11-fullio-capture-read-order.patch
                   ./pkgs/patches/sp11-fullio-capture-read-prefix.patch
                   ./pkgs/patches/sp11-fullio-checked-capture.patch
@@ -65,10 +49,43 @@
                 ];
         };
       };
+      packages = (removeAttrs (fullioPackages pkgs) [ "kernel" ]) // {
+        default = kernel;
+        surface-live-iso = live.config.system.build.surfaceLiveIso;
+      };
+      dailyPackages = fullioPackages (
+        import daily-kernel-nixpkgs {
+          inherit system;
+          overlays = [ overlay ];
+        }
+      );
+      dailyBoot =
+        (daily-kernel-nixpkgs.lib.nixosSystem {
+          modules = [
+            ./modules/denali.nix
+            (import ./modules/denali/fullio-reference-render.nix dailyPackages)
+            (import ./modules/denali/fullio-reference-clock-audit.nix dailyPackages)
+            {
+              nixpkgs.hostPlatform = system;
+              system.stateVersion = "26.05";
+              surface.devices.denali = {
+                enable = true;
+                keyboard.hhkb.enable = true;
+              };
+            }
+          ];
+        }).config;
     in
     {
+      # Hardware only: no historical users, authentication, mounts or desktop.
+      denaliDailyBoot = {
+        kernelPackages = dailyBoot.boot.kernelPackages;
+        dtbs = dailyBoot.hardware.deviceTree.package;
+      };
       overlays.default = overlay;
       nixosModules.default = ./modules/denali.nix;
+      # The installed host imports these layers in order so the existing
+      # firmware manifest and initrd remain unchanged.
       nixosModules.fullio-reference-render = import ./modules/denali/fullio-reference-render.nix packages;
       nixosModules.fullio-reference-clock-audit = import ./modules/denali/fullio-reference-clock-audit.nix packages;
       nixosConfigurations.surface-live = live;

@@ -7,11 +7,7 @@ packages:
   ...
 }:
 let
-  baseline =
-    if config.surface.fullio.checkedCapture or false then
-      packages.fullio-checked-capture-kernel
-    else
-      packages.fullio-reference-kernel;
+  baseline = packages.fullio-checked-capture-kernel;
   auditKernel = import ./with-hhkb.nix {
     enabled = config.surface.devices.denali.keyboard.hhkb.enable or false;
     kernel = baseline.override {
@@ -24,7 +20,7 @@ let
     };
   };
 in
-lib.mkIf (config.surface.fullio.referenceRender.enable or true) {
+{
   assertions = [
     {
       assertion =

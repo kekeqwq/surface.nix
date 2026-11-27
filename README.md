@@ -75,20 +75,16 @@ unrelated Bluetooth adapters.
 `nixosModules.fullio-reference-render` is the only FullIO profile. It extends
 `nixosModules.default` on ARM64 Denali with the pinned v19c topology and
 Golden v33 protected stereo route, and keeps MicArray available to the
-desktop. The endpoint is set to −3 dB; use the desktop slider for normal
-changes. The profile does not start an acoustic capture service.
+desktop. The DSP endpoint is set to **0 dB** per graph; the desktop volume
+slider remains available. The profile does not start a capture service.
 
-Validate changes first with a private one-shot boot and keep an independent
-recovery entry. The consuming Surface host selects this module explicitly;
-it does not alter the default kernel for other consumers. On the test host,
-`scripts/build-fullio-fixture.sh` builds only, `scripts/prepare-fullio-uki.py`
-stages the reference UKI outside the ESP, and
-`scripts/arm-fullio-reference-once.sh` performs the recovery preflight before
-arming it. Do not put the private UKI in Git or the Nix store. See the
-[listening checkpoint](docs/audio-protection-audit.md#listening-checkpoint--2026-11-25)
-for evidence and remaining limits. The six kernel patches live in
-[`pkgs/patches/fullio`](pkgs/patches/fullio); earlier experiment entry points
-are available in Git history, not as current flake outputs.
+`denaliDailyBoot` exports the verified internal-boot kernel and OLED DTB
+from this repository using a separately locked kernel toolchain. The
+installed host consumes those artifacts directly; no historical host/system
+flake is needed. Use the normal `nixos-rebuild switch --flake .#surface`
+workflow and retain a recovery generation. The Live ISO remains a separate
+installer, not a second installed baseline. Prior test instruments and
+manual UKI staging are available only in Git history.
 
 ## Validation and development
 
@@ -100,4 +96,4 @@ The persistent local Kbuild workbench is for development, not deployment:
 nix develop .#surface-next -c bash scripts/surface-next-workbench.sh build
 ```
 
-This retains writable source and Kbuild `O=` outputs for development. Production builds use the pinned Nix derivation without a compiler cache. See the [config audit and full-build timer](docs/denali-kernel-config.md).
+This retains writable source and Kbuild `O=` outputs for development. Production builds use the pinned Nix derivation without a compiler cache. See the [kernel configuration audit](docs/denali-kernel-config.md). Historical investigation notes are evidence, not current build or deployment instructions; their retired tools live in the Git history.

@@ -21,7 +21,7 @@ stdenvNoCC.mkDerivation {
     runHook preBuild
     alsatplg -c "$src" -o fullio-v19c.bin
     echo 'e7bb06a03e7bd9b869825a51775355a6743477d1579d78eb09fad5881cfb20f0  fullio-v19c.bin' | sha256sum -c -
-    python3 ${../tests/fullio-topology.py} fullio-v19c.bin --self-test
+    python3 ${./fullio-topology.py} fullio-v19c.bin --self-test
     runHook postBuild
   '';
   installPhase = ''
