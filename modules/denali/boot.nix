@@ -41,9 +41,20 @@ let
   '';
 in
 {
-  options.surface.devices.denali.boot.earlyDisplay = lib.mkEnableOption ''
-    native OLED modesetting in the initrd (for example, for an encrypted root)
-  '';
+  options.surface.devices.denali.boot = {
+    earlyDisplay = lib.mkEnableOption ''
+      native OLED modesetting in the initrd (for example, for an encrypted root)
+    '';
+    earlyBrightnessPercent = lib.mkOption {
+      type = lib.types.nullOr (lib.types.ints.between 1 100);
+      default = null;
+      description = ''
+        Initial brightness of the Denali OLED's 12-bit eDP backlight in the
+        initrd. Null preserves its power-on brightness. Does not change the
+        desktop brightness saved and restored by systemd-backlight.
+      '';
+    };
+  };
 
   config = lib.mkIf cfg.enable {
     boot.initrd.kernelModules = [ "simpledrm" ] ++ lib.optionals cfg.boot.earlyDisplay [
@@ -63,6 +74,9 @@ in
         softdep pmic_glink pre: qrtr
       '';
     };
+    boot.initrd.services.udev.rules = lib.mkIf (cfg.boot.earlyDisplay && cfg.boot.earlyBrightnessPercent != null) ''
+      ACTION=="add", SUBSYSTEM=="backlight", KERNEL=="dp_aux_backlight", KERNELS=="aea0000.displayport-controller", ATTR{max_brightness}=="4095", ATTR{brightness}="${toString (builtins.div (4095 * cfg.boot.earlyBrightnessPercent + 50) 100)}"
+    '';
     boot.kernelParams = [
       "arm64.nopauth"
       "systemd.mask=tpm2.target"
