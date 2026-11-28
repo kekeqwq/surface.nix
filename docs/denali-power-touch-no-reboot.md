@@ -147,6 +147,8 @@ The terminal DMA audit found that `a6xx_bus_clear_pending_transactions()` discar
 
 `denali-adreno-gmu-drain-before-closing-recovery.patch` lets the recovery worker run during the existing terminal submit-drain window, with the scheduler already parked. It closes and joins the worker before force suspend and rechecks `active_submits` under `active_lock`: during a6xx recovery the count can be temporarily zero even with work outstanding. This closes a false-idle window and preserves a chance for recoverable submissions to retire; neither the software counter nor this patch proves the hardware bus is idle. Native AArch64 built all thirteen objects (`/nix/store/n6447yyz4qv4lvhxbmg57845bsn21za3-denali-adreno-gmu-compile-object-7.4.0-rc4-next-20261124`).
 
+`denali-adreno-gmu-check-recovery-runtime-resume.patch` ensures the recovery worker and hardware fault capture do not proceed with register capture after a runtime-PM resume error. The worker also skips reset and replay on that error; `pm_runtime_resume_and_get()` does not leave a failed usage reference to put. This is important when recovery is allowed to run during the terminal drain. It does not make unsuccessful recovery retire jobs and does not cover earlier fault-handler diagnostics or prove hardware shutdown. The thirteen-object native build passed and both error messages were found in `msm_gpu.o` (`/nix/store/6anwpv66g7fs5g4c2z72praxxfh8gl88-denali-adreno-gmu-compile-object-7.4.0-rc4-next-20261124`).
+
 ### Acceptance for both supported suspend paths
 
 | Gate | Evidence required | Current status |

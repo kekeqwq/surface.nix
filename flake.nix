@@ -147,6 +147,10 @@
             name = "denali-adreno-gmu-drain-before-closing-recovery";
             patch = ./pkgs/patches/denali-adreno-gmu-drain-before-closing-recovery.patch;
           }
+          {
+            name = "denali-adreno-gmu-check-recovery-runtime-resume";
+            patch = ./pkgs/patches/denali-adreno-gmu-check-recovery-runtime-resume.patch;
+          }
         ];
       };
       fsgenOrderExperiment = import ./modules/denali/fsgen-order-experiment.nix {

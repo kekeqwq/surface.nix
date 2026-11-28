@@ -1,0 +1,66 @@
+drm/msm: Do not touch GPU hardware after a failed recovery resume
+
+Recovery and IOMMU fault capture must obtain a successful runtime-PM
+reference before capturing hardware state. Recovery must not send a
+reset or replay submissions if powering the device up failed. Use
+pm_runtime_resume_and_get() to keep the failure paths balanced.
+
+This does not retire failed jobs or certify stopped DMA.
+
+--- a/drivers/gpu/drm/msm/msm_gpu.c
++++ b/drivers/gpu/drm/msm/msm_gpu.c
+@@ -471,7 +471,7 @@
+ 	char *comm = NULL, *cmd = NULL;
+ 	unsigned int noreclaim_flag;
+ 	struct task_struct *task;
+-	int i;
++	int i, ret;
+ 
+ 	mutex_lock(&gpu->lock);
+ 
+@@ -525,8 +525,16 @@
+ 		msm_rd_dump_submit(priv->hangrd, submit, NULL);
+ 	}
+ 
+-	/* Record the crash state */
+-	pm_runtime_get_sync(&gpu->pdev->dev);
++	/* Don't inspect or replay GPU work if its power-up failed. */
++	ret = pm_runtime_resume_and_get(&gpu->pdev->dev);
++	if (ret < 0) {
++		dev_err_ratelimited(&gpu->pdev->dev,
++				    "GPU recovery skipped: runtime resume failed: %d\n", ret);
++		memalloc_noreclaim_restore(noreclaim_flag);
++		kfree(cmd);
++		kfree(comm);
++		goto out_unlock;
++	}
+ 	msm_gpu_crashstate_capture(gpu, submit, NULL, comm, cmd);
+ 
+ 	memalloc_noreclaim_restore(noreclaim_flag);
+@@ -596,6 +604,7 @@
+ 	struct msm_ringbuffer *cur_ring = gpu->funcs->active_ring(gpu);
+ 	char *comm = NULL, *cmd = NULL;
+ 	unsigned int noreclaim_flag;
++	int ret;
+ 
+ 	mutex_lock(&gpu->lock);
+ 
+@@ -615,10 +624,15 @@
+ 		submit->fault_dumped = true;
+ 	}
+ 
+-	/* Record the crash state */
+-	pm_runtime_get_sync(&gpu->pdev->dev);
+-	msm_gpu_crashstate_capture(gpu, submit, fault_info, comm, cmd);
+-	pm_runtime_put_sync(&gpu->pdev->dev);
++	/* An unsuccessful resume is not permission to read GPU registers. */
++	ret = pm_runtime_resume_and_get(&gpu->pdev->dev);
++	if (ret < 0) {
++		dev_err_ratelimited(&gpu->pdev->dev,
++				    "GPU fault capture skipped: runtime resume failed: %d\n", ret);
++	} else {
++		msm_gpu_crashstate_capture(gpu, submit, fault_info, comm, cmd);
++		pm_runtime_put_sync(&gpu->pdev->dev);
++	}
+ 
+ 	memalloc_noreclaim_restore(noreclaim_flag);
