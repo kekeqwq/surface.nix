@@ -1,0 +1,31 @@
+drm/msm/a6xx: Distinguish an unobserved RSCC stop from an ACK
+
+If there is no firmware start recorded, no RSCC sleep request or poll
+runs. Return -ENODATA in that branch, not successful acknowledgement.
+Report the distinction internally without changing PM callbacks, power
+operations, or teardown. No ACK, including a reported success, alone
+establishes terminal DMA isolation.
+
+--- a/drivers/gpu/drm/msm/adreno/a6xx_gmu.c
++++ b/drivers/gpu/drm/msm/adreno/a6xx_gmu.c
+@@ -661,8 +661,9 @@
+ 	int ret;
+ 	u32 val;
+ 
++	/* No firmware start recorded: no RSCC acknowledgement was sampled. */
+ 	if (!test_and_clear_bit(GMU_STATUS_FW_START, &gmu->status))
+-		return 0;
++		return -ENODATA;
+ 
+ 	if (adreno_is_a840(adreno_gpu) || adreno_is_a850_family(adreno_gpu))
+ 		bitmask = BIT(30);
+@@ -1532,7 +1533,9 @@
+ 	else
+ 		stop_ret = a6xx_gmu_shutdown(gmu);
+ 
+-	if (stop_ret)
++	if (stop_ret == -ENODATA)
++		dev_dbg(gmu->dev, "GMU stop: no RSCC sleep acknowledgement sampled\n");
++	else if (stop_ret)
+ 		dev_err_ratelimited(gmu->dev,
+ 				    "GMU stop not fully acknowledged: %d\n", stop_ret);

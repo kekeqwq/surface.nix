@@ -220,8 +220,17 @@ int main(void)
     gpu = init();
     gpu.gmu.status = 0;
     rscc = -ETIMEDOUT;
-    assert(a6xx_gmu_force_off(&gpu.gmu) == 0);
+    assert(a6xx_gmu_force_off(&gpu.gmu) == -ENODATA);
     assert(!rscc_polls); /* No firmware-start bit; no RSCC ACK observed. */
+    gpu = init();
+    gpu.gmu.status = 0;
+    assert(a6xx_gmu_shutdown(&gpu.gmu) == -ENODATA);
+    assert(cx_polls == 1 && !rscc_polls);
+    gpu = init();
+    gpu.gmu.status = 0;
+    bus[0] = -ETIMEDOUT;
+    assert(a6xx_gmu_force_off(&gpu.gmu) == -ETIMEDOUT);
+    assert(!rscc_polls);
     puts("GMU shutdown and fallback acknowledgement handling: PASS");
     return 0;
 }

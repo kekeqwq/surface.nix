@@ -163,6 +163,10 @@
             name = "denali-adreno-gmu-report-stop-status";
             patch = ./pkgs/patches/denali-adreno-gmu-report-stop-status.patch;
           }
+          {
+            name = "denali-adreno-gmu-distinguish-unobserved-rscc-stop";
+            patch = ./pkgs/patches/denali-adreno-gmu-distinguish-unobserved-rscc-stop.patch;
+          }
         ];
       };
       fsgenOrderExperiment = import ./modules/denali/fsgen-order-experiment.nix {
