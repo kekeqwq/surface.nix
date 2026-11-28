@@ -195,6 +195,19 @@
             };
       };
       checks.${system} = {
+        denali-adreno-gmu-build-payload =
+          let
+            dtb = "qcom/x1e80100-microsoft-denali-oled.dtb";
+            msmPath = "lib/modules/${gmuBindingBuildOnlyKernel.modDirVersion}/kernel/drivers/gpu/drm/msm";
+          in
+          pkgs.runCommand "denali-adreno-gmu-build-payload" { nativeBuildInputs = [ pkgs.kmod ]; } ''
+            cmp ${fsgenOrderKernel}/dtbs/${dtb} ${gmuBindingBuildOnlyKernel}/dtbs/${dtb}
+            set -- ${gmuBindingBuildOnlyKernel.modules}/${msmPath}/msm.ko*
+            test "$#" = 1 && test -s "$1"
+            modinfo -F alias "$1" > aliases
+            grep -Fx 'of:N*T*Cqcom,adreno-gmu' aliases
+            touch "$out"
+          '';
         denali-native-touch-config =
           let
             stock = evaluateDaily false false false false;
