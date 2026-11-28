@@ -61,6 +61,11 @@ add_probe() {
     printf '1\n' >"$instance/events/$name/$probe/enable"
 }
 add_probe p wake_irq 'pm_system_irq_wakeup irq=$arg1:u32'
+if grep -qE '[[:space:]]rpmh_rsc_pd_callback$' /proc/kallsyms; then
+    add_probe p rpmh_pd_enter 'rpmh_rsc_pd_callback action=$arg2:u64'
+    add_probe r rpmh_pd_return 'rpmh_rsc_pd_callback result=$retval:x32'
+    add_probe r rpmh_flush_return 'rpmh_flush result=$retval:s32'
+fi
 if [[ $mode == deep ]]; then
     add_probe r psci_return 'psci_system_suspend_enter psci_ret=$retval:s32'
 fi
