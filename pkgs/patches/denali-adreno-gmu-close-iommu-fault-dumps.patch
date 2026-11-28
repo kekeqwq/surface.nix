@@ -1,0 +1,133 @@
+drm/msm: Drain GPU IOMMU fault dumps before final suspend\n\nPrevent new GPU fault dumps from taking runtime PM references during\nfinal DRM teardown and wait for dumps already admitted. The SMMU\nhandler still owns acknowledgement and stall termination. This is\nseparate from recovery work queued by the GPU and GMU IRQ handlers.\n\n--- a/drivers/gpu/drm/msm/msm_iommu.c
++++ b/drivers/gpu/drm/msm/msm_iommu.c
+@@ -5,6 +5,7 @@
+  */
+ 
+ #include <linux/adreno-smmu-priv.h>
++#include <linux/completion.h>
+ #include <linux/io-pgtable.h>
+ #include <linux/kmemleak.h>
+ 
+@@ -23,6 +24,12 @@
+ struct msm_iommu {
+ 	struct msm_mmu base;
+ 	struct iommu_domain *domain;
++
++	/* Protect the terminal GPU fault gate, not the handler body. */
++	spinlock_t fault_lock;
++	struct completion faults_drained;
++	unsigned int active_faults;
++	bool faults_closed;
+ 
+ 	struct mutex init_lock;  /* protects pagetables counter and prr_page */
+ 	int pagetables;
+@@ -642,20 +649,56 @@
+ 		unsigned long iova, int flags, void *arg)
+ {
+ 	struct msm_iommu *iommu = arg;
+-	struct adreno_smmu_priv *adreno_smmu = dev_get_drvdata(iommu->base.dev);
++	struct adreno_smmu_priv *adreno_smmu;
+ 	struct adreno_smmu_fault_info info, *ptr = NULL;
+-
++	unsigned long irqflags;
++	int ret = 0;
++
++	spin_lock_irqsave(&iommu->fault_lock, irqflags);
++	if (iommu->faults_closed) {
++		spin_unlock_irqrestore(&iommu->fault_lock, irqflags);
++		/* The SMMU still acknowledges and terminates a stalled fault. */
++		return 0;
++	}
++	iommu->active_faults++;
++	spin_unlock_irqrestore(&iommu->fault_lock, irqflags);
++
++	adreno_smmu = dev_get_drvdata(iommu->base.dev);
+ 	if (adreno_smmu->get_fault_info) {
+ 		adreno_smmu->get_fault_info(adreno_smmu->cookie, &info);
+ 		ptr = &info;
+ 	}
+ 
+ 	if (iommu->base.handler)
+-		return iommu->base.handler(iommu->base.arg, iova, flags, ptr);
+-
+-	pr_warn_ratelimited("*** fault: iova=%16lx, flags=%d\n", iova, flags);
+-
+-	return 0;
++		ret = iommu->base.handler(iommu->base.arg, iova, flags, ptr);
++	else
++		pr_warn_ratelimited("*** fault: iova=%16lx, flags=%d\n", iova, flags);
++
++	spin_lock_irqsave(&iommu->fault_lock, irqflags);
++	if (!--iommu->active_faults && iommu->faults_closed)
++		complete_all(&iommu->faults_drained);
++	spin_unlock_irqrestore(&iommu->fault_lock, irqflags);
++
++	return ret;
++}
++
++void msm_iommu_gpu_close_faults(struct msm_mmu *mmu)
++{
++	struct msm_iommu *iommu;
++	unsigned long flags;
++
++	if (mmu->type != MSM_MMU_IOMMU)
++		return;
++
++	iommu = to_msm_iommu(mmu);
++	spin_lock_irqsave(&iommu->fault_lock, flags);
++	iommu->faults_closed = true;
++	if (!iommu->active_faults)
++		complete_all(&iommu->faults_drained);
++	spin_unlock_irqrestore(&iommu->fault_lock, flags);
++
++	/* Must not hold gpu->lock, which an in-flight dump may take. */
++	wait_for_completion(&iommu->faults_drained);
+ }
+ 
+ static int msm_disp_fault_handler(struct iommu_domain *domain, struct device *dev,
+@@ -757,6 +800,8 @@
+ 	msm_mmu_init(&iommu->base, dev, &funcs, MSM_MMU_IOMMU);
+ 
+ 	mutex_init(&iommu->init_lock);
++	spin_lock_init(&iommu->fault_lock);
++	init_completion(&iommu->faults_drained);
+ 
+ 	/*
+ 	 * ARM32 attaches a DMA mapping domain to every IOMMU-backed device,
+--- a/drivers/gpu/drm/msm/msm_mmu.h
++++ b/drivers/gpu/drm/msm/msm_mmu.h
+@@ -77,6 +77,7 @@
+ struct msm_mmu *msm_iommu_new(struct device *dev, unsigned long quirks);
+ struct msm_mmu *msm_iommu_gpu_new(struct device *dev, struct msm_gpu *gpu, unsigned long quirks);
+ struct msm_mmu *msm_iommu_disp_new(struct device *dev, unsigned long quirks);
++void msm_iommu_gpu_close_faults(struct msm_mmu *mmu);
+ 
+ static inline void msm_mmu_set_fault_handler(struct msm_mmu *mmu, void *arg,
+ 		int (*handler)(void *arg, unsigned long iova, int flags, void *data))
+--- a/drivers/gpu/drm/msm/msm_drv.c
++++ b/drivers/gpu/drm/msm/msm_drv.c
+@@ -22,6 +22,7 @@
+ #include "msm_gem.h"
+ #include "msm_gpu.h"
+ #include "msm_kms.h"
++#include "msm_mmu.h"
+ 
+ /*
+  * MSM driver version:
+@@ -175,10 +176,14 @@
+ 
+ 	if (priv->gpu_pdev) {
+ 		struct device *gpu_dev = &priv->gpu_pdev->dev;
+-
++		struct msm_gpu *gpu = dev_to_gpu(gpu_dev);
++
++		/* Stop fault dumps before suspending or releasing GMU resources. */
++		if (!IS_ERR_OR_NULL(gpu->vm))
++			msm_iommu_gpu_close_faults(to_msm_vm(gpu->vm)->mmu);
+ 		if (pm_runtime_enabled(gpu_dev))
+ 			WARN_ON_ONCE(adreno_system_suspend(gpu_dev));
+-		msm_devfreq_cleanup(dev_to_gpu(gpu_dev));
++		msm_devfreq_cleanup(gpu);
+ 	}
+ 
+ 	component_unbind_all(dev, ddev);

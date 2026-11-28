@@ -107,6 +107,10 @@
             name = "denali-adreno-gmu-stop-hangcheck-before-ring-free";
             patch = ./pkgs/patches/denali-adreno-gmu-stop-hangcheck-before-ring-free.patch;
           }
+          {
+            name = "denali-adreno-gmu-close-iommu-fault-dumps";
+            patch = ./pkgs/patches/denali-adreno-gmu-close-iommu-fault-dumps.patch;
+          }
         ];
       };
       fsgenOrderExperiment = import ./modules/denali/fsgen-order-experiment.nix {
@@ -220,14 +224,17 @@
           pname = "denali-adreno-gmu-compile-object";
           buildFlags = [
             "drivers/gpu/drm/msm/adreno/a6xx_gmu.o"
+            "drivers/gpu/drm/msm/msm_drv.o"
             "drivers/gpu/drm/msm/msm_gpu.o"
+            "drivers/gpu/drm/msm/msm_iommu.o"
           ];
           installPhase = ''
             mkdir -p "$out" "$dev" "$modules"
-            cp "$buildRoot/drivers/gpu/drm/msm/"{adreno/a6xx_gmu,msm_gpu}.o "$out/"
+            cp "$buildRoot/drivers/gpu/drm/msm/"{adreno/a6xx_gmu,msm_drv,msm_gpu,msm_iommu}.o "$out/"
           '';
           postInstall = "";
-          dontStrip = true;
+          # The output is relocatable objects, not a runtime or development kit.
+          dontFixup = true;
         });
         denali-adreno-gmu-build-payload =
           let
