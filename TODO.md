@@ -14,7 +14,8 @@
 
 - [ ] **低功耗待机最后验收。** QCE 试验已解除两条互连的同步阻塞；两次接电 `s2idle` 能持续睡眠并由电源键唤醒，但 `CXSD` / `AOSD` / DDR 驻留仍为零。至少两小时纯电池对照尚未测，最后做；当前不宣称已实现低功耗待机。
 
-- [ ] **电池读数与充电分开验收。** 同一电池曾同时报 `BAT1=80%`、`qcom-battmgr-bat=100%`。让 Surface 的 Waybar 和锁屏统一选 `BAT1`，不改共享默认行为、不先禁用 Qualcomm 驱动或写入充电阈值。拔插验证电源状态、充放电方向和 `energy_now`，再判断是否需做驱动级仲裁。参考 [dwhinham 的 SAM 电池选源](https://github.com/dwhinham/linux-surface-pro-11#post-install-fixups)。
+- [x] **电池日用初验。** Surface 的 Waybar 和锁屏统一选 `BAT1`；实测拔电后正常放电，插回后恢复充电，`energy_now` 按方向变化，未见明显异常。没有禁用 Qualcomm 驱动或写入充电阈值。参考 [dwhinham 的 SAM 电池选源](https://github.com/dwhinham/linux-surface-pro-11#post-install-fixups)。
+- [ ] **电池长期观察（暂缓）。** 同一电池的 SAM / Qualcomm 百分比仍有差异；未验证长期读数、固件充电上限或更长期充放电行为。不按初验结果更改充电策略或做驱动级仲裁。
 - [ ] **先建立本机基线。** 在有人值守、保留可启动回退代的前提下，分别做 `deep` 和 `s2idle` 的短时手动挂起，记录实际模式、唤醒源、内核与设备恢复时间。短测通过后，对已通过的模式做 ≥2 小时中等电量、电池供电的对照；拔掉电源、外屏和 USB 外设，保持网络条件一致，记录 `BAT1/energy_now`、稳定后的读数及 Qualcomm `CXSD`/`AOSD`/`DDR` 驻留率。清醒空闲功耗另测。
 - [ ] **逐项对照，不移植整套内核。** 参考 [geocausa 的 suspend archive @ `0376e25`](https://github.com/geocausa/sp11-suspend-resume-public/tree/0376e25)、[Omarchy 同款 OLED 低功耗补丁](https://github.com/omacom/omarchy-pkgs/blob/master/pkgbuilds/linux-omarchy-aarch64/README.md#surface-pro-11)、[turbineBMW 旧 PSCI guard 与 logind watchdog](https://github.com/turbineBMW/surface-pro-11-linux/blob/main/docs/SUSPEND.md) 和 [OE 的 deep 记录](https://github.com/ooaklee/linux-surface-pro-11-oe/issues/39)。先查 GMU 绑定与 QCE/互连 `sync_state()`，比较禁用无用 DT 节点与仅 PM 绑定 QCE（不启用加密算法）；若仍见频繁 ADSP 唤醒，再对照 PLD GLINK，不能只靠 SMP2P bit 12。只在复现对应症状时考虑 GENI UART、PSCI、Wi-Fi 或显示补丁。
 - [ ] **FullIO 是硬性验收门槛。** 若低功耗数据指向 WSA 空闲时钟票，单独评估释放与恢复；不强关共享电源轨，不合入重置/重绑规避。每轮检查 OLED、NVMe、Wi-Fi、BT、HHKB/触控板/触屏，以及首轮受保护扬声器与 MicArray 同时工作，维持 0 dB 和现有 fail-closed 保护。连续挂起、长时耗电、外设唤醒边界和回退均通过后，才考虑在 `flakes` 改合盖策略。
