@@ -1,0 +1,40 @@
+drm/msm/a6xx: Shut down the preemption watchdog before destroy
+
+The preemption watchdog is distinct from the shared GPU hangcheck.
+Its callback still dereferences GPU state even when recovery enqueue
+is closed. Shut it down synchronously before releasing GPU storage.
+Track initialization because single-ring mode and early init failures
+can reach destroy without timer_setup(). Regular suspend is unchanged.
+
+--- a/drivers/gpu/drm/msm/adreno/a6xx_gpu.h
++++ b/drivers/gpu/drm/msm/adreno/a6xx_gpu.h
+@@ -97,6 +97,7 @@
+ 	atomic_t preempt_state;
+ 	spinlock_t eval_lock;
+ 	struct timer_list preempt_timer;
++	bool preempt_timer_initialized;
+ 
+ 	unsigned int preempt_level;
+ 	bool uses_gmem;
+--- a/drivers/gpu/drm/msm/adreno/a6xx_preempt.c
++++ b/drivers/gpu/drm/msm/adreno/a6xx_preempt.c
+@@ -390,6 +390,7 @@
+ 	preempt_prepare_postamble(a6xx_gpu);
+ 
+ 	timer_setup(&a6xx_gpu->preempt_timer, a6xx_preempt_timer, 0);
++	a6xx_gpu->preempt_timer_initialized = true;
+ 
+ 	return;
+ fail:
+--- a/drivers/gpu/drm/msm/adreno/a6xx_gpu.c
++++ b/drivers/gpu/drm/msm/adreno/a6xx_gpu.c
+@@ -2318,6 +2318,9 @@
+ 	struct a6xx_gpu *a6xx_gpu = to_a6xx_gpu(adreno_gpu);
+ 
+ 	msm_gpu_release_irq(gpu);
++	if (a6xx_gpu->preempt_timer_initialized)
++		timer_shutdown_sync(&a6xx_gpu->preempt_timer);
++
+ 	if (a6xx_gpu->sqe_bo) {
+ 		msm_gem_unpin_iova(a6xx_gpu->sqe_bo, gpu->vm);
+ 		drm_gem_object_put(a6xx_gpu->sqe_bo);

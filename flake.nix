@@ -131,6 +131,10 @@
             name = "denali-adreno-gmu-drain-devfreq-qos";
             patch = ./pkgs/patches/denali-adreno-gmu-drain-devfreq-qos.patch;
           }
+          {
+            name = "denali-adreno-gmu-stop-preempt-watchdog";
+            patch = ./pkgs/patches/denali-adreno-gmu-stop-preempt-watchdog.patch;
+          }
         ];
       };
       fsgenOrderExperiment = import ./modules/denali/fsgen-order-experiment.nix {
