@@ -1,0 +1,55 @@
+drm/msm/a6xx: Report ignored bus-halt acknowledgement timeouts
+
+The existing shutdown and recovery paths continue if their bus-halt
+polls time out. Report the failed stage without changing the register
+sequence, timeout, or runtime-PM semantics. This is diagnostic only;
+it does not turn an unconfirmed bus halt into a DMA fence.
+
+--- a/drivers/gpu/drm/msm/adreno/a6xx_gpu.c
++++ b/drivers/gpu/drm/msm/adreno/a6xx_gpu.c
+@@ -2088,12 +2088,14 @@
+ 
+ 	if (adreno_is_a619_holi(adreno_gpu)) {
+ 		gpu_write(gpu, REG_A6XX_RBBM_GPR0_CNTL, GPR0_GBIF_HALT_REQUEST);
+-		spin_until((gpu_read(gpu, REG_A6XX_RBBM_VBIF_GX_RESET_STATUS) &
+-				(VBIF_RESET_ACK_MASK)) == VBIF_RESET_ACK_MASK);
++		if (spin_until((gpu_read(gpu, REG_A6XX_RBBM_VBIF_GX_RESET_STATUS) &
++				VBIF_RESET_ACK_MASK) == VBIF_RESET_ACK_MASK))
++			dev_err_ratelimited(&gpu->pdev->dev, "Timed out waiting for GX reset ACK\n");
+ 	} else if (!a6xx_has_gbif(adreno_gpu)) {
+ 		gpu_write(gpu, REG_A6XX_VBIF_XIN_HALT_CTRL0, VBIF_XIN_HALT_CTRL0_MASK);
+-		spin_until((gpu_read(gpu, REG_A6XX_VBIF_XIN_HALT_CTRL1) &
+-				(VBIF_XIN_HALT_CTRL0_MASK)) == VBIF_XIN_HALT_CTRL0_MASK);
++		if (spin_until((gpu_read(gpu, REG_A6XX_VBIF_XIN_HALT_CTRL1) &
++				VBIF_XIN_HALT_CTRL0_MASK) == VBIF_XIN_HALT_CTRL0_MASK))
++			dev_err_ratelimited(&gpu->pdev->dev, "Timed out waiting for VBIF halt ACK\n");
+ 		gpu_write(gpu, REG_A6XX_VBIF_XIN_HALT_CTRL0, 0);
+ 
+ 		return;
+@@ -2102,18 +2104,21 @@
+ 	if (gx_off) {
+ 		/* Halt the gx side of GBIF */
+ 		gpu_write(gpu, REG_A6XX_RBBM_GBIF_HALT, 1);
+-		spin_until(gpu_read(gpu, REG_A6XX_RBBM_GBIF_HALT_ACK) & 1);
++		if (spin_until(gpu_read(gpu, REG_A6XX_RBBM_GBIF_HALT_ACK) & 1))
++			dev_err_ratelimited(&gpu->pdev->dev, "Timed out waiting for GX GBIF halt ACK\n");
+ 	}
+ 
+ 	/* Halt new client requests on GBIF */
+ 	gpu_write(gpu, REG_A6XX_GBIF_HALT, GBIF_CLIENT_HALT_MASK);
+-	spin_until((gpu_read(gpu, REG_A6XX_GBIF_HALT_ACK) &
+-			(GBIF_CLIENT_HALT_MASK)) == GBIF_CLIENT_HALT_MASK);
++	if (spin_until((gpu_read(gpu, REG_A6XX_GBIF_HALT_ACK) &
++			GBIF_CLIENT_HALT_MASK) == GBIF_CLIENT_HALT_MASK))
++		dev_err_ratelimited(&gpu->pdev->dev, "Timed out waiting for GBIF client halt ACK\n");
+ 
+ 	/* Halt all AXI requests on GBIF */
+ 	gpu_write(gpu, REG_A6XX_GBIF_HALT, GBIF_ARB_HALT_MASK);
+-	spin_until((gpu_read(gpu,  REG_A6XX_GBIF_HALT_ACK) &
+-			(GBIF_ARB_HALT_MASK)) == GBIF_ARB_HALT_MASK);
++	if (spin_until((gpu_read(gpu, REG_A6XX_GBIF_HALT_ACK) &
++			GBIF_ARB_HALT_MASK) == GBIF_ARB_HALT_MASK))
++		dev_err_ratelimited(&gpu->pdev->dev, "Timed out waiting for GBIF arbiter halt ACK\n");
+ 
+ 	/* The GBIF halt needs to be explicitly cleared */
+ 	gpu_write(gpu, REG_A6XX_GBIF_HALT, 0x0);

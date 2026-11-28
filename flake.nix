@@ -123,6 +123,10 @@
             name = "denali-adreno-gmu-release-gpu-irq";
             patch = ./pkgs/patches/denali-adreno-gmu-release-gpu-irq.patch;
           }
+          {
+            name = "denali-adreno-gmu-report-bus-halt-timeout";
+            patch = ./pkgs/patches/denali-adreno-gmu-report-bus-halt-timeout.patch;
+          }
         ];
       };
       fsgenOrderExperiment = import ./modules/denali/fsgen-order-experiment.nix {
