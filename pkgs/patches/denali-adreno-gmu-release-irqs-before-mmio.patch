@@ -1,0 +1,41 @@
+drm/msm/a6xx: Release GMU IRQ handlers before unmapping registers
+
+The GMU and HFI interrupt handlers both access the GMU MMIO mapping.
+Keep the mapping and GMU buffers alive until free_irq() has drained the
+handlers. Do so after the final runtime suspend, which may still need
+those IRQ descriptors to disable the interrupt lines.
+
+This only orders IRQ handler teardown. Work already queued by a handler
+must be quiesced separately, and GPU/GMU shutdown must already succeed
+before this resource cleanup is safe.
+
+--- a/drivers/gpu/drm/msm/adreno/a6xx_gmu.c
++++ b/drivers/gpu/drm/msm/adreno/a6xx_gmu.c
+@@ -2188,7 +2188,12 @@ static void a6xx_gmu_destroy(struct a6xx_gpu *a6xx_gpu)
+ 	mutex_unlock(&gmu->lock);
+
+ 	pm_runtime_force_suspend(gmu->dev);
++	if (!adreno_has_gmu_wrapper(adreno_gpu) &&
++	    !adreno_has_rgmu(adreno_gpu)) {
++		free_irq(gmu->gmu_irq, gmu);
++		free_irq(gmu->hfi_irq, gmu);
++	}
+
+ 	/*
+ 	 * Since cxpd is a virt device, the devlink with gmu-dev will be removed
+ 	 * automatically when we do detach
+@@ -2209,13 +2214,9 @@ static void a6xx_gmu_destroy(struct a6xx_gpu *a6xx_gpu)
+ 	iounmap(gmu->mmio);
+ 	gmu->mmio = NULL;
+ 	gmu->rscc = NULL;
+
+ 	if (!adreno_has_gmu_wrapper(adreno_gpu) &&
+-	    !adreno_has_rgmu(adreno_gpu)) {
++	    !adreno_has_rgmu(adreno_gpu))
+ 		a6xx_gmu_memory_free(gmu);
+-
+-		free_irq(gmu->gmu_irq, gmu);
+-		free_irq(gmu->hfi_irq, gmu);
+-	}
+ }
+

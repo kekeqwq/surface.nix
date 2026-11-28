@@ -95,6 +95,10 @@
             name = "denali-adreno-gmu-balance-failed-bind-rpm";
             patch = ./pkgs/patches/denali-adreno-gmu-balance-failed-bind-rpm.patch;
           }
+          {
+            name = "denali-adreno-gmu-release-irqs-before-mmio";
+            patch = ./pkgs/patches/denali-adreno-gmu-release-irqs-before-mmio.patch;
+          }
         ];
       };
       fsgenOrderExperiment = import ./modules/denali/fsgen-order-experiment.nix {
