@@ -41,6 +41,21 @@ class ReadoutTest(unittest.TestCase):
         self.assertEqual(result['residency'], 'no_counter_advance')
         self.assertEqual(result['ADP1_online'], ['1', '1'])
 
+    def test_adsp_activity_does_not_pass_soc_residency(self):
+        adsp = '''--- /sys/kernel/debug/qcom_stats/adsp ---
+Count: {}
+Last Entered At: 0
+Last Exited At: 0
+Accumulated Duration: {}
+'''
+        before = snapshots(sample(0) + adsp.format(12, 120))[0]
+        after = snapshots(sample(1) + adsp.format(15, 160))[0]
+        result = compare(before, after)
+        self.assertEqual(result['subsystems']['adsp']['count_delta'], 3)
+        self.assertEqual(result['subsystems']['adsp']['duration_ticks_delta'], 40)
+        self.assertEqual(result['subsystems']['adsp_island']['status'], 'missing')
+        self.assertEqual(result['residency'], 'no_counter_advance')
+
     def test_counter_advance(self):
         entry = self.after['counters']['qcom_stats', 'cxsd']
         entry.update({'Count': 1, 'Accumulated Duration': 100})

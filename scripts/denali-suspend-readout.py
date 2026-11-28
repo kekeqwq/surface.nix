@@ -10,6 +10,7 @@ POWER = '/sys/class/power_supply/'
 STATS = '/sys/power/suspend_stats/'
 OFFSET = 'boottime_minus_monotonic_ns'
 MODES = ('cxsd', 'aosd', 'ddr')
+SUBSYSTEMS = ('adsp', 'adsp_island')
 FIELD = re.compile(r'^(Count|Last Entered At|Last Exited At|Accumulated Duration):\s*(\d+)\s*$')
 HEADER = re.compile(r'^--- /sys/kernel/debug/(qcom_stats|rpmh_stats)/(\w+) ---$')
 
@@ -95,6 +96,9 @@ def compare(before, after):
         'boot_id': boot, 'snapshot_utc': [b['utc'], a['utc']],
         'os_suspended_ns': suspended, 'wake_irq': a.get('/sys/power/pm_wakeup_irq'),
         'residency': result, 'modes': modes,
+        # Subsystem entries span the full sampling interval, including awake
+        # edges. Do not promote them to SoC residency or infer a wake rate.
+        'subsystems': {name: probe_mode(before, after, name) for name in SUBSYSTEMS},
         # Do not estimate watts from snapshots: charging/settling and awake time may differ.
         'BAT1_energy_uWh': [s.get(POWER+'BAT1/energy_now') for s in (b, a)],
         'BAT1_status': [s.get(POWER+'BAT1/status') for s in (b, a)],
