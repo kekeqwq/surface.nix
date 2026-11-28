@@ -1,0 +1,69 @@
+devfreq: Drain frequency QoS notifiers during device removal
+
+A reference to the devfreq device may defer its release past GPU
+teardown. Remove the blocking PM QoS notifiers in devfreq_remove_device
+while driver resources are live, before governor stop and cooling QoS
+removal. The add failure path already uses the same remove function;
+keep accepting absent notifiers there. Drop the MSM boost request only
+after devfreq removal has synchronized its QoS callbacks.
+
+This covers the core frequency QoS callbacks, not all devfreq clients
+or the terminal GPU/DMA stop. Build-only Denali candidate.
+
+--- a/drivers/devfreq/devfreq.c
++++ b/drivers/devfreq/devfreq.c
+@@ -749,17 +749,6 @@
+ 	list_del(&devfreq->node);
+ 	mutex_unlock(&devfreq_list_lock);
+ 
+-	err = dev_pm_qos_remove_notifier(devfreq->dev.parent, &devfreq->nb_max,
+-					 DEV_PM_QOS_MAX_FREQUENCY);
+-	if (err && err != -ENOENT)
+-		dev_warn(dev->parent,
+-			"Failed to remove max_freq notifier: %d\n", err);
+-	err = dev_pm_qos_remove_notifier(devfreq->dev.parent, &devfreq->nb_min,
+-					 DEV_PM_QOS_MIN_FREQUENCY);
+-	if (err && err != -ENOENT)
+-		dev_warn(dev->parent,
+-			"Failed to remove min_freq notifier: %d\n", err);
+-
+ 	if (dev_pm_qos_request_active(&devfreq->user_max_freq_req)) {
+ 		err = dev_pm_qos_remove_request(&devfreq->user_max_freq_req);
+ 		if (err < 0)
+@@ -986,8 +975,25 @@
+  */
+ int devfreq_remove_device(struct devfreq *devfreq)
+ {
++	struct device *dev;
++	int err;
++
+ 	if (!devfreq)
+ 		return -EINVAL;
++
++	dev = &devfreq->dev;
++
++	/* Drain QoS callbacks before stopping the governor or removing QoS votes. */
++	err = dev_pm_qos_remove_notifier(devfreq->dev.parent, &devfreq->nb_max,
++					 DEV_PM_QOS_MAX_FREQUENCY);
++	if (err && err != -ENOENT)
++		dev_warn(dev->parent,
++			"Failed to remove max_freq notifier: %d\n", err);
++	err = dev_pm_qos_remove_notifier(devfreq->dev.parent, &devfreq->nb_min,
++					 DEV_PM_QOS_MIN_FREQUENCY);
++	if (err && err != -ENOENT)
++		dev_warn(dev->parent,
++			"Failed to remove min_freq notifier: %d\n", err);
+ 
+ 	devfreq_cooling_unregister(devfreq->cdev);
+ 
+--- a/drivers/gpu/drm/msm/msm_gpu_devfreq.c
++++ b/drivers/gpu/drm/msm/msm_gpu_devfreq.c
+@@ -225,8 +225,8 @@
+ 	cancel_boost_work(df);
+ 
+ 	devfreq_cooling_unregister(gpu->cooling);
++	devm_devfreq_remove_device(&gpu->pdev->dev, df->devfreq);
+ 	dev_pm_qos_remove_request(&df->boost_freq);
+-	devm_devfreq_remove_device(&gpu->pdev->dev, df->devfreq);
+ 	df->devfreq = NULL;
+ }

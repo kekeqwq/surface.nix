@@ -127,6 +127,10 @@
             name = "denali-adreno-gmu-report-bus-halt-timeout";
             patch = ./pkgs/patches/denali-adreno-gmu-report-bus-halt-timeout.patch;
           }
+          {
+            name = "denali-adreno-gmu-drain-devfreq-qos";
+            patch = ./pkgs/patches/denali-adreno-gmu-drain-devfreq-qos.patch;
+          }
         ];
       };
       fsgenOrderExperiment = import ./modules/denali/fsgen-order-experiment.nix {
@@ -248,12 +252,14 @@
             "adreno/a8xx_preempt"
             "msm_drv"
             "msm_gpu"
+            "msm_gpu_devfreq"
             "msm_iommu"
-          ];
+          ] ++ [ "drivers/devfreq/devfreq.o" ];
           installPhase = ''
             mkdir -p "$out" "$dev" "$modules"
             cd "$buildRoot/drivers/gpu/drm/msm"
-            cp adreno/a{5,6,8}xx_{gpu,preempt}.o adreno/a6xx_gmu.o msm_{drv,gpu,iommu}.o "$out/"
+            cp adreno/a{5,6,8}xx_{gpu,preempt}.o adreno/a6xx_gmu.o msm_{drv,gpu,gpu_devfreq,iommu}.o "$out/"
+            cp "$buildRoot/drivers/devfreq/devfreq.o" "$out/"
           '';
           postInstall = "";
           # The output is relocatable objects, not a runtime or development kit.
