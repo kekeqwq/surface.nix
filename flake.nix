@@ -99,6 +99,10 @@
             name = "denali-adreno-gmu-release-irqs-before-mmio";
             patch = ./pkgs/patches/denali-adreno-gmu-release-irqs-before-mmio.patch;
           }
+          {
+            name = "denali-adreno-gmu-unwind-partial-irq-bind";
+            patch = ./pkgs/patches/denali-adreno-gmu-unwind-partial-irq-bind.patch;
+          }
         ];
       };
       fsgenOrderExperiment = import ./modules/denali/fsgen-order-experiment.nix {
