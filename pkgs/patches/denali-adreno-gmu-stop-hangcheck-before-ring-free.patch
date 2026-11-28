@@ -1,0 +1,24 @@
+drm/msm: Shut down the GPU hangcheck timer before freeing rings
+
+The timer callback dereferences the active ring and can rearm itself.
+Synchronously stop it before destroying any rings. A valid worker means
+msm_gpu_init() reached timer_setup(): there are no failures between the
+two initialization steps.
+
+This closes the timer producer at final cleanup. It does not fence IRQ
+or IOMMU producers, drain recovery before the GMU component unbind, or
+stop in-flight DMA after a suspend timeout.
+
+--- a/drivers/gpu/drm/msm/msm_gpu.c
++++ b/drivers/gpu/drm/msm/msm_gpu.c
+@@ -1043,6 +1043,10 @@ void msm_gpu_cleanup(struct msm_gpu *gpu)
+ 
+ 	DBG("%s", gpu->name);
+ 
++	/* hangcheck_handler() reads the rings and may rearm the timer. */
++	if (gpu->worker)
++		timer_shutdown_sync(&gpu->hangcheck_timer);
++
+ 	for (i = 0; i < ARRAY_SIZE(gpu->rb); i++) {
+ 		msm_ringbuffer_destroy(gpu->rb[i]);
+ 		gpu->rb[i] = NULL;

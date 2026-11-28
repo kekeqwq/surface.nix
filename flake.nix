@@ -103,6 +103,10 @@
             name = "denali-adreno-gmu-unwind-partial-irq-bind";
             patch = ./pkgs/patches/denali-adreno-gmu-unwind-partial-irq-bind.patch;
           }
+          {
+            name = "denali-adreno-gmu-stop-hangcheck-before-ring-free";
+            patch = ./pkgs/patches/denali-adreno-gmu-stop-hangcheck-before-ring-free.patch;
+          }
         ];
       };
       fsgenOrderExperiment = import ./modules/denali/fsgen-order-experiment.nix {
@@ -211,13 +215,16 @@
             };
       };
       checks.${system} = {
-        # Compile the touched translation unit without building a bootable kernel.
+        # Compile the touched translation units without building a bootable kernel.
         denali-adreno-gmu-compile-object = gmuBindingBuildOnlyKernel.overrideAttrs (_: {
           pname = "denali-adreno-gmu-compile-object";
-          buildFlags = [ "drivers/gpu/drm/msm/adreno/a6xx_gmu.o" ];
+          buildFlags = [
+            "drivers/gpu/drm/msm/adreno/a6xx_gmu.o"
+            "drivers/gpu/drm/msm/msm_gpu.o"
+          ];
           installPhase = ''
             mkdir -p "$out" "$dev" "$modules"
-            cp "$buildRoot/drivers/gpu/drm/msm/adreno/a6xx_gmu.o" "$out/"
+            cp "$buildRoot/drivers/gpu/drm/msm/"{adreno/a6xx_gmu,msm_gpu}.o "$out/"
           '';
           postInstall = "";
           dontStrip = true;
