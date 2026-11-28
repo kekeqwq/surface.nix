@@ -9,12 +9,12 @@ instance=$root/instances/$name
 registered=()
 created=0
 
-usage() { echo "usage: sudo $0 {deep|s2idle} NEW_OUTPUT_DIRECTORY [--request]" >&2; exit 2; }
+usage() { echo "usage: sudo $0 {deep|s2idle} NEW_OUTPUT_DIRECTORY [--request|--request-after-auth]" >&2; exit 2; }
 [[ $# -ge 2 && $# -le 3 && ( $1 == deep || $1 == s2idle ) ]] || usage
 mode=$1
 output=$2
 request=${3:-}
-[[ -z $request || $request == --request ]] || usage
+[[ -z $request || $request == --request || $request == --request-after-auth ]] || usage
 [[ $EUID == 0 && -t 0 && -t 1 ]] || { echo 'Run as root in an attended terminal.' >&2; exit 2; }
 [[ -d $root/instances && -r $snapshot ]] || { echo 'tracefs and the power snapshot script are required.' >&2; exit 2; }
 sleep_modes=$(</sys/power/mem_sleep)
@@ -74,7 +74,13 @@ bash "$snapshot" >"$output/before.txt"
     printf 'trace_group=%s\n' "$name"
 } >"$output/session.txt"
 printf '1\n' >"$instance/tracing_on"
-if [[ $request == --request ]]; then
+if [[ $request == --request-after-auth ]]; then
+    before_success=$(</sys/power/suspend_stats/success)
+    before_fail=$(</sys/power/suspend_stats/fail)
+    [[ " $(</sys/power/mem_sleep) " == *" [$mode] "* ]] || { echo 'Selected mode changed; no suspend requested.' >&2; exit 2; }
+    printf 'Trace armed for %s. Requesting one cycle now.\n' "$mode"
+    systemctl --no-block suspend
+elif [[ $request == --request ]]; then
     printf 'Trace armed for %s. Type SUSPEND then Enter to request one cycle.\n' "$mode"
     printf 'After about 30 seconds, wake with the power button and press Enter here to save.\n'
     if ! read -r -t 120 answer || [[ $answer != SUSPEND ]]; then
@@ -87,7 +93,17 @@ else
     printf 'Trace armed for %s. Suspend once from another terminal, wake with the power button, then press Enter here.\n' "$mode"
 fi
 confirmed=1
-if ! read -r -t 240; then
+if [[ $request == --request-after-auth ]]; then
+    confirmed=0
+    deadline=$((SECONDS + 120))
+    until (( SECONDS >= deadline )); do
+        if [[ $(</sys/power/suspend_stats/success) != "$before_success" || $(</sys/power/suspend_stats/fail) != "$before_fail" ]]; then
+            state=$(systemctl show -p ActiveState --value systemd-suspend.service)
+            [[ $state == inactive || $state == failed ]] && break
+        fi
+        sleep 1
+    done
+elif ! read -r -t 240; then
     printf 'No operator confirmation; saving available evidence without a confirmed wake.\n' >&2
     confirmed=0
 fi
@@ -98,4 +114,4 @@ printf 'operator_wake_confirmation=%s\n' "$confirmed" >>"$output/session.txt"
 bash "$snapshot" >"$output/after.txt"
 python3 "${snapshot%/*}/denali-suspend-readout.py" "$output/before.txt" "$output/after.txt" >"$output/readout.json"
 printf 'Saved trace and readout: %s\n' "$output"
-(( confirmed ))
+[[ $request == --request-after-auth ]] || (( confirmed ))
