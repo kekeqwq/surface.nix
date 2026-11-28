@@ -84,6 +84,15 @@
         ];
       };
       fsgenOrderPackages = dailyPkgs.linuxPackagesFor fsgenOrderKernel;
+      # Unqualified upstream review snapshot. Intentionally no NixOS module or host selector.
+      gmuBindingBuildOnlyKernel = fsgenOrderKernel.override {
+        kernelPatches = fsgenOrderKernel.kernelPatches ++ [
+          {
+            name = "denali-adreno-gmu-driver-v2-build-only";
+            patch = ./pkgs/patches/denali-adreno-gmu-driver-v2-build-only.patch;
+          }
+        ];
+      };
       fsgenOrderExperiment = import ./modules/denali/fsgen-order-experiment.nix {
         kernelPackages = fsgenOrderPackages;
       };
@@ -174,6 +183,7 @@
         denali-native-touch-qce-disabled-dtb-candidate = nativeQceDtbs;
         denali-unused-ufs-ice-disabled-dtb-candidate = nativeQceIceDtbs;
         denali-lpass-fsgen-order-kernel-candidate = fsgenOrderKernel;
+        denali-adreno-gmu-binding-build-only = gmuBindingBuildOnlyKernel;
         denali-adsp-pld-candidate =
           dailyBoot.boot.kernelPackages.callPackage ./pkgs/denali-module-candidate.nix
             {
