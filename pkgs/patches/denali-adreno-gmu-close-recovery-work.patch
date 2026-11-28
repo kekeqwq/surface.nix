@@ -1,0 +1,208 @@
+drm/msm: Gate recovery work during final DRM teardown
+
+Serialize every recovery enqueue with terminal closure; then cancel
+pending work and wait for a running callback before touching runtime
+PM or dismantling GMU resources. Ordinary sleep never closes the gate.
+
+This is not a terminal DMA stop: a stuck job can still make the later
+suspend attempt time out. Keep the candidate build-only.
+
+--- a/drivers/gpu/drm/msm/adreno/a5xx_gpu.c
++++ b/drivers/gpu/drm/msm/adreno/a5xx_gpu.c
+@@ -1254,7 +1254,7 @@
+ 	/* Turn off the hangcheck timer to keep it from bothering us */
+ 	timer_delete(&gpu->hangcheck_timer);
+ 
+-	kthread_queue_work(gpu->worker, &gpu->recover_work);
++	msm_gpu_queue_recovery(gpu);
+ }
+ 
+ #define RBBM_ERROR_MASK \
+--- a/drivers/gpu/drm/msm/adreno/a5xx_preempt.c
++++ b/drivers/gpu/drm/msm/adreno/a5xx_preempt.c
+@@ -88,7 +88,7 @@
+ 		return;
+ 
+ 	DRM_DEV_ERROR(dev->dev, "%s: preemption timed out\n", gpu->name);
+-	kthread_queue_work(gpu->worker, &gpu->recover_work);
++	msm_gpu_queue_recovery(gpu);
+ }
+ 
+ /* Try to trigger a preemption switch */
+@@ -196,7 +196,7 @@
+ 		set_preempt_state(a5xx_gpu, PREEMPT_FAULTED);
+ 		DRM_DEV_ERROR(dev->dev, "%s: Preemption failed to complete\n",
+ 			gpu->name);
+-		kthread_queue_work(gpu->worker, &gpu->recover_work);
++		msm_gpu_queue_recovery(gpu);
+ 		return;
+ 	}
+ 
+--- a/drivers/gpu/drm/msm/adreno/a6xx_gmu.c
++++ b/drivers/gpu/drm/msm/adreno/a6xx_gmu.c
+@@ -32,7 +32,7 @@
+ 	timer_delete(&gpu->hangcheck_timer);
+ 
+ 	/* Queue the GPU handler because we need to treat this as a recovery */
+-	kthread_queue_work(gpu->worker, &gpu->recover_work);
++	msm_gpu_queue_recovery(gpu);
+ }
+ 
+ static irqreturn_t a6xx_gmu_irq(int irq, void *data)
+--- a/drivers/gpu/drm/msm/adreno/a6xx_gpu.c
++++ b/drivers/gpu/drm/msm/adreno/a6xx_gpu.c
+@@ -1848,7 +1848,7 @@
+ 	/* Turn off interrupts to avoid triggering recovery again */
+ 	gpu_write(gpu, REG_A6XX_RBBM_INT_0_MASK, 0);
+ 
+-	kthread_queue_work(gpu->worker, &gpu->recover_work);
++	msm_gpu_queue_recovery(gpu);
+ }
+ 
+ static void a7xx_sw_fuse_violation_irq(struct msm_gpu *gpu)
+@@ -1868,7 +1868,7 @@
+ 		      A7XX_CX_MISC_SW_FUSE_VALUE_LPAC)) {
+ 		timer_delete(&gpu->hangcheck_timer);
+ 
+-		kthread_queue_work(gpu->worker, &gpu->recover_work);
++		msm_gpu_queue_recovery(gpu);
+ 	}
+ }
+ 
+--- a/drivers/gpu/drm/msm/adreno/a6xx_preempt.c
++++ b/drivers/gpu/drm/msm/adreno/a6xx_preempt.c
+@@ -21,7 +21,7 @@
+ 		return;
+ 
+ 	dev_err(dev->dev, "%s: preemption timed out\n", gpu->name);
+-	kthread_queue_work(gpu->worker, &gpu->recover_work);
++	msm_gpu_queue_recovery(gpu);
+ }
+ 
+ static void preempt_prepare_postamble(struct a6xx_gpu *a6xx_gpu)
+@@ -103,7 +103,7 @@
+ 		set_preempt_state(a6xx_gpu, PREEMPT_FAULTED);
+ 		dev_err(dev->dev, "%s: Preemption failed to complete\n",
+ 			gpu->name);
+-		kthread_queue_work(gpu->worker, &gpu->recover_work);
++		msm_gpu_queue_recovery(gpu);
+ 		return;
+ 	}
+ 
+--- a/drivers/gpu/drm/msm/adreno/a8xx_gpu.c
++++ b/drivers/gpu/drm/msm/adreno/a8xx_gpu.c
+@@ -1095,7 +1095,7 @@
+ 	gpu_write(gpu, REG_A8XX_CP_INTERRUPT_STATUS_MASK_GLOBAL, 0);
+ 	gpu_write(gpu, REG_A8XX_RBBM_INT_0_MASK, 0);
+ 
+-	kthread_queue_work(gpu->worker, &gpu->recover_work);
++	msm_gpu_queue_recovery(gpu);
+ }
+ 
+ static u32 gpu_periph_read(struct msm_gpu *gpu, u32 dbg_offset)
+@@ -1191,7 +1191,7 @@
+ 	/* Turn off the hangcheck timer to keep it from bothering us */
+ 	timer_delete(&gpu->hangcheck_timer);
+ 
+-	kthread_queue_work(gpu->worker, &gpu->recover_work);
++	msm_gpu_queue_recovery(gpu);
+ }
+ 
+ static void a8xx_sw_fuse_violation_irq(struct msm_gpu *gpu)
+@@ -1211,7 +1211,7 @@
+ 		      A7XX_CX_MISC_SW_FUSE_VALUE_LPAC)) {
+ 		timer_delete(&gpu->hangcheck_timer);
+ 
+-		kthread_queue_work(gpu->worker, &gpu->recover_work);
++		msm_gpu_queue_recovery(gpu);
+ 	}
+ }
+ 
+--- a/drivers/gpu/drm/msm/adreno/a8xx_preempt.c
++++ b/drivers/gpu/drm/msm/adreno/a8xx_preempt.c
+@@ -84,7 +84,7 @@
+ 		set_preempt_state(a6xx_gpu, PREEMPT_FAULTED);
+ 		dev_err(dev->dev, "%s: Preemption failed to complete\n",
+ 			gpu->name);
+-		kthread_queue_work(gpu->worker, &gpu->recover_work);
++		msm_gpu_queue_recovery(gpu);
+ 		return;
+ 	}
+ 
+--- a/drivers/gpu/drm/msm/msm_drv.c
++++ b/drivers/gpu/drm/msm/msm_drv.c
+@@ -181,6 +181,7 @@
+ 		/* Stop fault dumps before suspending or releasing GMU resources. */
+ 		if (!IS_ERR_OR_NULL(gpu->vm))
+ 			msm_iommu_gpu_close_faults(to_msm_vm(gpu->vm)->mmu);
++		msm_gpu_close_recovery(gpu);
+ 		if (pm_runtime_enabled(gpu_dev))
+ 			WARN_ON_ONCE(adreno_system_suspend(gpu_dev));
+ 		msm_devfreq_cleanup(gpu);
+--- a/drivers/gpu/drm/msm/msm_gpu.c
++++ b/drivers/gpu/drm/msm/msm_gpu.c
+@@ -459,6 +459,28 @@
+ 		*cmd = kstrdup_quotable_cmdline(task, GFP_KERNEL);
+ 
+ 	put_task_struct(task);
++}
++
++void msm_gpu_queue_recovery(struct msm_gpu *gpu)
++{
++	unsigned long flags;
++
++	spin_lock_irqsave(&gpu->recovery_lock, flags);
++	if (!gpu->recovery_closed)
++		kthread_queue_work(gpu->worker, &gpu->recover_work);
++	spin_unlock_irqrestore(&gpu->recovery_lock, flags);
++}
++
++void msm_gpu_close_recovery(struct msm_gpu *gpu)
++{
++	unsigned long flags;
++
++	spin_lock_irqsave(&gpu->recovery_lock, flags);
++	gpu->recovery_closed = true;
++	spin_unlock_irqrestore(&gpu->recovery_lock, flags);
++
++	/* The worker can take gpu->lock; the caller must not hold it. */
++	kthread_cancel_work_sync(&gpu->recover_work);
+ }
+ 
+ static void recover_worker(struct kthread_work *work)
+@@ -674,7 +696,7 @@
+ 		DRM_DEV_ERROR(dev->dev, "%s:     submitted fence: %u\n",
+ 				gpu->name, ring->fctx->last_fence);
+ 
+-		kthread_queue_work(gpu->worker, &gpu->recover_work);
++		msm_gpu_queue_recovery(gpu);
+ 	}
+ 
+ 	/* if still more pending work, reset the hangcheck timer: */
+@@ -912,6 +934,7 @@
+ 	init_waitqueue_head(&gpu->retire_event);
+ 	kthread_init_work(&gpu->retire_work, retire_worker);
+ 	kthread_init_work(&gpu->recover_work, recover_worker);
++	spin_lock_init(&gpu->recovery_lock);
+ 
+ 	priv->hangcheck_period = DRM_MSM_HANGCHECK_DEFAULT_PERIOD;
+ 
+--- a/drivers/gpu/drm/msm/msm_gpu.h
++++ b/drivers/gpu/drm/msm/msm_gpu.h
+@@ -240,6 +240,8 @@
+ 
+ 	/* work for handling GPU recovery: */
+ 	struct kthread_work recover_work;
++	spinlock_t recovery_lock;
++	bool recovery_closed;
+ 
+ 	/** retire_event: notified when submits are retired: */
+ 	wait_queue_head_t retire_event;
+@@ -738,6 +740,8 @@
+ 
+ int msm_gpu_hw_init(struct msm_gpu *gpu);
+ 
++void msm_gpu_queue_recovery(struct msm_gpu *gpu);
++void msm_gpu_close_recovery(struct msm_gpu *gpu);
+ void msm_gpu_retire(struct msm_gpu *gpu);
+ void msm_gpu_submit(struct msm_gpu *gpu, struct msm_gem_submit *submit);

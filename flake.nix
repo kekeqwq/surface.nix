@@ -111,6 +111,10 @@
             name = "denali-adreno-gmu-close-iommu-fault-dumps";
             patch = ./pkgs/patches/denali-adreno-gmu-close-iommu-fault-dumps.patch;
           }
+          {
+            name = "denali-adreno-gmu-close-recovery-work";
+            patch = ./pkgs/patches/denali-adreno-gmu-close-recovery-work.patch;
+          }
         ];
       };
       fsgenOrderExperiment = import ./modules/denali/fsgen-order-experiment.nix {
@@ -222,15 +226,22 @@
         # Compile the touched translation units without building a bootable kernel.
         denali-adreno-gmu-compile-object = gmuBindingBuildOnlyKernel.overrideAttrs (_: {
           pname = "denali-adreno-gmu-compile-object";
-          buildFlags = [
-            "drivers/gpu/drm/msm/adreno/a6xx_gmu.o"
-            "drivers/gpu/drm/msm/msm_drv.o"
-            "drivers/gpu/drm/msm/msm_gpu.o"
-            "drivers/gpu/drm/msm/msm_iommu.o"
+          buildFlags = map (object: "drivers/gpu/drm/msm/${object}.o") [
+            "adreno/a5xx_gpu"
+            "adreno/a5xx_preempt"
+            "adreno/a6xx_gmu"
+            "adreno/a6xx_gpu"
+            "adreno/a6xx_preempt"
+            "adreno/a8xx_gpu"
+            "adreno/a8xx_preempt"
+            "msm_drv"
+            "msm_gpu"
+            "msm_iommu"
           ];
           installPhase = ''
             mkdir -p "$out" "$dev" "$modules"
-            cp "$buildRoot/drivers/gpu/drm/msm/"{adreno/a6xx_gmu,msm_drv,msm_gpu,msm_iommu}.o "$out/"
+            cd "$buildRoot/drivers/gpu/drm/msm"
+            cp adreno/a{5,6,8}xx_{gpu,preempt}.o adreno/a6xx_gmu.o msm_{drv,gpu,iommu}.o "$out/"
           '';
           postInstall = "";
           # The output is relocatable objects, not a runtime or development kit.

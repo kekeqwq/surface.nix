@@ -133,6 +133,8 @@ Platform-side review after the second `deep` attempt: the **live** DT has `qcom,
 
 The current-boot eDP-only AC `s2idle` comparison (`/tmp/denali-s2idle-current.summary`, 01:30:51–01:32:02 local) slept 66.318013681 s and resumed on IRQ 223 (`pmic_pwrkey`); suspend counts advanced `4/0 → 5/0`, and `[deep]` was restored. The collector recorded successful RPMh callbacks in the trace tail; all three firmware counters again stayed unchanged. This verifies that sustained `s2idle` is still possible on the current deployment, not that SoC residency or all post-resume devices passed. The same boot still passes the unbound-GMU baseline gate.
 
+The build-only `denali-adreno-gmu-close-recovery-work.patch` routes all 13 Next24 recovery enqueue sites through a shared gate (GPU/GMU IRQs, hangcheck and per-generation preemption paths). Final DRM teardown closes the gate under an IRQ-safe lock and synchronously cancels/drains the worker after closing IOMMU fault dumps, before its suspend attempt. System sleep does not close the gate. The native object check compiled all 10 selected objects (`/nix/store/k7yg408nrl399nyrj4c0950b2nkrd0lm-denali-adreno-gmu-compile-object-7.4.0-rc4-next-20261124`). This does not drain retire work or guarantee that scheduler submissions and DMA stop after a failed terminal suspend; no runtime qualification or deployment.
+
 ### Acceptance for both supported suspend paths
 
 | Gate | Evidence required | Current status |
