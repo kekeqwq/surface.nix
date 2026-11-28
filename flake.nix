@@ -93,12 +93,28 @@
         inherit touchModule touchDtbs;
         kernel = dailyBoot.boot.kernelPackages.kernel;
       };
-      evaluateTouch =
-        enable:
+      mkQceDtbs = pkgs.callPackage ./pkgs/denali-qce-disabled-dtb-candidate.nix;
+      stockQceDtbs = mkQceDtbs { dtbs = dailyBoot.hardware.deviceTree.package; };
+      nativeQceDtbs = mkQceDtbs {
+        dtbs = touchDtbs;
+        touchCompatible = "microsoft,mshw0485";
+      };
+      qceExperiment = import ./modules/denali/qce-experiment.nix {
+        inherit stockQceDtbs nativeQceDtbs;
+        kernel = dailyBoot.boot.kernelPackages.kernel;
+      };
+      evaluateDaily =
+        enable: disableUnusedQce:
         (dailySystem.extendModules {
           modules = [
             nativeTouch
-            { surface.devices.denali.touchscreen.native = { inherit enable; }; }
+            qceExperiment
+            {
+              surface.devices.denali = {
+                touchscreen.native = { inherit enable; };
+                power = { inherit disableUnusedQce; };
+              };
+            }
           ];
         }).config;
     in
@@ -111,6 +127,12 @@
       overlays.default = overlay;
       nixosModules.default = ./modules/denali.nix;
       nixosModules.denali-native-touch = nativeTouch;
+      nixosModules.denali-qce-experiment = {
+        imports = [
+          nativeTouch
+          qceExperiment
+        ];
+      };
       # The installed host imports these layers in order so the existing
       # firmware manifest and initrd remain unchanged.
       nixosModules.fullio-reference-render = import ./modules/denali/fullio-reference-render.nix packages;
@@ -120,9 +142,8 @@
         # Neither the installed host nor the Live image selects these by default.
         denali-touch-candidate = touchModule;
         denali-touch-dtb-candidate = touchDtbs;
-        denali-qce-disabled-dtb-candidate = pkgs.callPackage ./pkgs/denali-qce-disabled-dtb-candidate.nix {
-          dtbs = dailyBoot.hardware.deviceTree.package;
-        };
+        denali-qce-disabled-dtb-candidate = stockQceDtbs;
+        denali-native-touch-qce-disabled-dtb-candidate = nativeQceDtbs;
         denali-adsp-pld-candidate =
           dailyBoot.boot.kernelPackages.callPackage ./pkgs/denali-module-candidate.nix
             {
@@ -136,8 +157,10 @@
       checks.${system} = {
         denali-native-touch-config =
           let
-            stock = evaluateTouch false;
-            native = evaluateTouch true;
+            stock = evaluateDaily false false;
+            native = evaluateDaily true false;
+            stockQce = evaluateDaily false true;
+            nativeQce = evaluateDaily true true;
             moduleInstalled =
               cfg: builtins.any (p: p.drvPath == touchModule.drvPath) cfg.boot.extraModulePackages;
           in
@@ -149,6 +172,11 @@
           assert moduleInstalled native;
           assert native.boot.kernelPackages.kernel.drvPath == stock.boot.kernelPackages.kernel.drvPath;
           assert !(builtins.elem "mshw0485_touch" native.boot.kernelModules);
+          assert stockQce.hardware.deviceTree.package.drvPath == stockQceDtbs.drvPath;
+          assert nativeQce.hardware.deviceTree.package.drvPath == nativeQceDtbs.drvPath;
+          assert stockQce.services.iptsd.enable && !moduleInstalled stockQce;
+          assert !nativeQce.services.iptsd.enable && moduleInstalled nativeQce;
+          assert nativeQce.boot.kernelPackages.kernel.drvPath == native.boot.kernelPackages.kernel.drvPath;
           pkgs.runCommand "denali-native-touch-config" { } ''
             tree=${native.system.modulesTree}/lib/modules/${native.boot.kernelPackages.kernel.modDirVersion}
             test -s "$tree/modules.cer"

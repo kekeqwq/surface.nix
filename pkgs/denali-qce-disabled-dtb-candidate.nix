@@ -2,6 +2,7 @@
   runCommand,
   dtc,
   dtbs,
+  touchCompatible ? "microsoft,denali-touchscreen",
 }:
 runCommand "denali-qce-disabled-dtb-candidate" { nativeBuildInputs = [ dtc ]; } ''
   name=qcom/x1e80100-microsoft-denali-oled.dtb
@@ -11,7 +12,7 @@ runCommand "denali-qce-disabled-dtb-candidate" { nativeBuildInputs = [ dtc ]; } 
   src=${dtbs}/$name
   test "$(fdtget -t s "$src" "$qce" compatible)" = 'qcom,x1e80100-qce qcom,sm8150-qce qcom,qce'
   test "$(fdtget -t s "$src" "$ice" compatible)" = 'qcom,x1e80100-inline-crypto-engine qcom,inline-crypto-engine'
-  test "$(fdtget -t s "$src" "$touch" compatible)" = microsoft,denali-touchscreen
+  test "$(fdtget -t s "$src" "$touch" compatible)" = '${touchCompatible}'
   test "$(fdtget -d okay -t s "$src" "$qce" status)" = okay
   test "$(fdtget -t x "$src" "$qce" reg)" = '0 1dfa000 0 6000'
 
