@@ -146,7 +146,13 @@
           assert moduleInstalled native;
           assert native.boot.kernelPackages.kernel.drvPath == stock.boot.kernelPackages.kernel.drvPath;
           assert !(builtins.elem "mshw0485_touch" native.boot.kernelModules);
-          pkgs.runCommand "denali-native-touch-config" { } "touch $out";
+          pkgs.runCommand "denali-native-touch-config" { } ''
+            tree=${native.system.modulesTree}/lib/modules/${native.boot.kernelPackages.kernel.modDirVersion}
+            test -s "$tree/modules.cer"
+            test -s "$tree/updates/mshw0485_touch.ko.cer"
+            grep -q 'microsoft,mshw0485.*mshw0485_touch$' "$tree/modules.alias"
+            touch "$out"
+          '';
         surface-live-config =
           pkgs.runCommand "surface-live-config"
             {
