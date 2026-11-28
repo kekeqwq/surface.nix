@@ -151,6 +151,10 @@
             name = "denali-adreno-gmu-check-recovery-runtime-resume";
             patch = ./pkgs/patches/denali-adreno-gmu-check-recovery-runtime-resume.patch;
           }
+          {
+            name = "denali-adreno-gmu-fail-submit-before-hw-fence";
+            patch = ./pkgs/patches/denali-adreno-gmu-fail-submit-before-hw-fence.patch;
+          }
         ];
       };
       fsgenOrderExperiment = import ./modules/denali/fsgen-order-experiment.nix {
@@ -275,11 +279,12 @@
             "msm_gpu"
             "msm_gpu_devfreq"
             "msm_iommu"
+            "msm_ringbuffer"
           ] ++ [ "drivers/devfreq/devfreq.o" ];
           installPhase = ''
             mkdir -p "$out" "$dev" "$modules"
             cd "$buildRoot/drivers/gpu/drm/msm"
-            cp adreno/a{5,6,8}xx_{gpu,preempt}.o adreno/a6xx_gmu.o adreno/adreno_device.o msm_{drv,gpu,gpu_devfreq,iommu}.o "$out/"
+            cp adreno/a{5,6,8}xx_{gpu,preempt}.o adreno/a6xx_gmu.o adreno/adreno_device.o msm_{drv,gpu,gpu_devfreq,iommu,ringbuffer}.o "$out/"
             cp "$buildRoot/drivers/devfreq/devfreq.o" "$out/"
           '';
           postInstall = "";

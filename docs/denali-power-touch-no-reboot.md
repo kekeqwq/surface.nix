@@ -149,6 +149,8 @@ The terminal DMA audit found that `a6xx_bus_clear_pending_transactions()` discar
 
 `denali-adreno-gmu-check-recovery-runtime-resume.patch` ensures the recovery worker and hardware fault capture do not proceed with register capture after a runtime-PM resume error. The worker also skips reset and replay on that error; `pm_runtime_resume_and_get()` does not leave a failed usage reference to put. This is important when recovery is allowed to run during the terminal drain. It does not make unsuccessful recovery retire jobs and does not cover earlier fault-handler diagnostics or prove hardware shutdown. The thirteen-object native build passed and both error messages were found in `msm_gpu.o` (`/nix/store/6anwpv66g7fs5g4c2z72praxxfh8gl88-denali-adreno-gmu-compile-object-7.4.0-rc4-next-20261124`).
 
+`denali-adreno-gmu-fail-submit-before-hw-fence.patch` addresses the parallel submit path: no hardware fence sequence or active-submit reference is allocated unless GPU runtime resume and `msm_gpu_hw_init()` succeed. `msm_job_run()` returns `ERR_PTR(ret)` for either failure; the pinned DRM scheduler completes the job with that error rather than waiting on a hardware fence that can never signal. The native object check now builds fourteen objects, including `msm_ringbuffer.o` (`/nix/store/zaksfd02y67glhcfz0yq8v2jlx4a1rc6-denali-adreno-gmu-compile-object-7.4.0-rc4-next-20261124`). No power-up fault was injected and existing hardware DMA is unaffected.
+
 ### Acceptance for both supported suspend paths
 
 | Gate | Evidence required | Current status |

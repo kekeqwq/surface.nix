@@ -1,0 +1,96 @@
+drm/msm: Error out scheduled submits when GPU power-up fails
+
+Do not touch the ring or allocate a hardware fence sequence number
+unless runtime resume and hardware initialization both succeed.
+Return the error to the DRM scheduler so it can finish the job with
+an error without waiting for a nonexistent hardware completion.
+
+This does not stop DMA from jobs already accepted by hardware.
+
+--- a/drivers/gpu/drm/msm/msm_gpu.h
++++ b/drivers/gpu/drm/msm/msm_gpu.h
+@@ -739,7 +739,7 @@
+ void msm_gpu_retire(struct msm_gpu *gpu);
+ void msm_gpu_close_retire(struct msm_gpu *gpu);
+ void msm_gpu_release_irq(struct msm_gpu *gpu);
+-void msm_gpu_submit(struct msm_gpu *gpu, struct msm_gem_submit *submit);
++int msm_gpu_submit(struct msm_gpu *gpu, struct msm_gem_submit *submit);
+ 
+ int msm_gpu_init(struct drm_device *drm, struct platform_device *pdev,
+ 		struct msm_gpu *gpu, const struct msm_gpu_funcs *funcs,
+--- a/drivers/gpu/drm/msm/msm_gpu.c
++++ b/drivers/gpu/drm/msm/msm_gpu.c
+@@ -790,17 +790,26 @@
+ }
+ 
+ /* add bo's to gpu's ring, and kick gpu: */
+-void msm_gpu_submit(struct msm_gpu *gpu, struct msm_gem_submit *submit)
++int msm_gpu_submit(struct msm_gpu *gpu, struct msm_gem_submit *submit)
+ {
+ 	struct msm_ringbuffer *ring = submit->ring;
+ 	unsigned long flags;
++	int ret;
+ 
+ 	WARN_ON(!mutex_is_locked(&gpu->lock));
+ 
+-	pm_runtime_get_sync(&gpu->pdev->dev);
+-
+-	msm_gpu_hw_init(gpu);
+-
++	ret = pm_runtime_resume_and_get(&gpu->pdev->dev);
++	if (ret < 0)
++		return ret;
++
++	ret = msm_gpu_hw_init(gpu);
++	if (ret) {
++		pm_runtime_put(&gpu->pdev->dev);
++		return ret;
++	}
++
++	/* Failed jobs must not consume a hardware fence sequence number. */
++	msm_fence_init(submit->hw_fence, ring->fctx);
+ 	submit->seqno = submit->hw_fence->seqno;
+ 
+ 	/*
+@@ -827,6 +836,8 @@
+ 
+ 	pm_runtime_put(&gpu->pdev->dev);
+ 	hangcheck_timer_reset(gpu);
++
++	return 0;
+ }
+ 
+ /*
+--- a/drivers/gpu/drm/msm/msm_ringbuffer.c
++++ b/drivers/gpu/drm/msm/msm_ringbuffer.c
+@@ -14,13 +14,10 @@
+ static struct dma_fence *msm_job_run(struct drm_sched_job *job)
+ {
+ 	struct msm_gem_submit *submit = to_msm_submit(job);
+-	struct msm_fence_context *fctx = submit->ring->fctx;
+ 	struct msm_gpu *gpu = submit->gpu;
+ 	struct drm_device *dev = gpu->dev;
+ 	unsigned nr_cmds = submit->nr_cmds;
+-	int i;
+-
+-	msm_fence_init(submit->hw_fence, fctx);
++	int i, ret;
+ 
+ 	mutex_lock(&dev->gem_lru_mutex);
+ 
+@@ -40,13 +37,13 @@
+ 	if (submit->queue->ctx->closed)
+ 		submit->nr_cmds = 0;
+ 
+-	msm_gpu_submit(gpu, submit);
++	ret = msm_gpu_submit(gpu, submit);
+ 
+ 	submit->nr_cmds = nr_cmds;
+ 
+ 	mutex_unlock(&gpu->lock);
+ 
+-	return dma_fence_get(submit->hw_fence);
++	return ret ? ERR_PTR(ret) : dma_fence_get(submit->hw_fence);
+ }
+ 
+ static void msm_job_free(struct drm_sched_job *job)
