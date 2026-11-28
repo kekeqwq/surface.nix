@@ -51,6 +51,9 @@ for d in /sys/bus/rpmsg/devices/*APPS_ADSP_PWR_LMTS*; do
 done
 for f in /sys/class/drm/card*-*/{status,enabled}; do value "$f"; done
 for f in /sys/class/platform-profile/*/{profile,choices}; do value "$f"; done
+# Retain per-CPU interrupt counts for later before/after comparison.
+printf '\n--- /proc/interrupts ---\n'
+cat /proc/interrupts
 if [[ -x /sys/kernel/debug ]]; then
     if [[ -r /sys/kernel/debug/wakeup_sources ]]; then
         printf '\n--- /sys/kernel/debug/wakeup_sources ---\n'
