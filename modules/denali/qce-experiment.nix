@@ -3,6 +3,7 @@
   stockQceDtbs,
   nativeQceDtbs,
   nativeQceIceDtbs,
+  nativeQceIceThermalDtbs,
   additionalKernels ? [ ],
 }:
 {
@@ -21,9 +22,12 @@ in
     disableUnusedUfsIce = lib.mkEnableOption ''
       the Denali OLED power experiment which disables the ICE used only by disabled UFS
     '';
+    cpuThermalGuard = lib.mkEnableOption ''
+      the Denali OLED 85°C passive CPU frequency guard on the validated native-touch/QCE/ICE DTB
+    '';
   };
 
-  config = lib.mkIf (cfg.power.disableUnusedQce || cfg.power.disableUnusedUfsIce) {
+  config = lib.mkIf (cfg.power.disableUnusedQce || cfg.power.disableUnusedUfsIce || cfg.power.cpuThermalGuard) {
     assertions = [
       {
         assertion =
@@ -39,11 +43,16 @@ in
           !cfg.power.disableUnusedUfsIce || (cfg.power.disableUnusedQce && cfg.touchscreen.native.enable);
         message = "The unused UFS ICE experiment requires the native touch and QCE experimental DTB.";
       }
+      {
+        assertion = !cfg.power.cpuThermalGuard || cfg.power.disableUnusedUfsIce;
+        message = "The Denali thermal guard requires the validated native-touch/QCE/ICE DTB.";
+      }
     ];
-    # Compose with either touch variant, overriding the native-touch DTB only.
-    # The derivation proves the QCE status is the sole device-tree change.
+    # Each derivative validates its device-tree changes against its own parent.
     hardware.deviceTree.package = lib.mkOverride 40 (
-      if cfg.power.disableUnusedUfsIce then
+      if cfg.power.cpuThermalGuard then
+        nativeQceIceThermalDtbs
+      else if cfg.power.disableUnusedUfsIce then
         nativeQceIceDtbs
       else if cfg.touchscreen.native.enable then
         nativeQceDtbs

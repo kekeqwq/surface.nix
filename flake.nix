@@ -137,13 +137,16 @@
       nativeQceIceDtbs = pkgs.callPackage ./pkgs/denali-ice-disabled-dtb-candidate.nix {
         dtbs = nativeQceDtbs;
       };
+      nativeQceIceThermalDtbs = pkgs.callPackage ./pkgs/denali-cpu-thermal-guard-dtb.nix {
+        dtbs = nativeQceIceDtbs;
+      };
       qceExperiment = import ./modules/denali/qce-experiment.nix {
-        inherit stockQceDtbs nativeQceDtbs nativeQceIceDtbs;
+        inherit stockQceDtbs nativeQceDtbs nativeQceIceDtbs nativeQceIceThermalDtbs;
         kernel = dailyKernel;
         additionalKernels = [ fsgenOrderKernel ];
       };
       evaluateDaily =
-        enable: disableUnusedQce: orderFsgenResume: disableUnusedUfsIce:
+        enable: disableUnusedQce: orderFsgenResume: disableUnusedUfsIce: cpuThermalGuard:
         (dailySystem.extendModules {
           modules = [
             nativeTouch
@@ -152,7 +155,7 @@
             {
               surface.devices.denali = {
                 touchscreen.native = { inherit enable; };
-                power = { inherit disableUnusedQce orderFsgenResume disableUnusedUfsIce; };
+                power = { inherit disableUnusedQce orderFsgenResume disableUnusedUfsIce cpuThermalGuard; };
               };
             }
           ];
@@ -186,6 +189,7 @@
         denali-qce-disabled-dtb-candidate = stockQceDtbs;
         denali-native-touch-qce-disabled-dtb-candidate = nativeQceDtbs;
         denali-unused-ufs-ice-disabled-dtb-candidate = nativeQceIceDtbs;
+        denali-cpu-thermal-guard-dtb = nativeQceIceThermalDtbs;
         denali-lpass-fsgen-order-kernel-candidate = fsgenOrderKernel;
         denali-adreno-gmu-binding-build-only = gmuBindingBuildOnlyKernel;
         denali-adsp-pld-candidate =
@@ -214,12 +218,13 @@
           '';
         denali-native-touch-config =
           let
-            stock = evaluateDaily false false false false;
-            native = evaluateDaily true false false false;
-            stockQce = evaluateDaily false true false false;
-            nativeQce = evaluateDaily true true false false;
-            ordered = evaluateDaily true true true false;
-            orderedIce = evaluateDaily true true true true;
+            stock = evaluateDaily false false false false false;
+            native = evaluateDaily true false false false false;
+            stockQce = evaluateDaily false true false false false;
+            nativeQce = evaluateDaily true true false false false;
+            ordered = evaluateDaily true true true false false;
+            orderedIce = evaluateDaily true true true true false;
+            guarded = evaluateDaily true true true true true;
             moduleInstalled =
               cfg: builtins.any (p: p.drvPath == touchModule.drvPath) cfg.boot.extraModulePackages;
           in
@@ -241,6 +246,9 @@
           assert orderedIce.hardware.deviceTree.package.drvPath == nativeQceIceDtbs.drvPath;
           assert orderedIce.boot.kernelPackages.kernel.drvPath == ordered.boot.kernelPackages.kernel.drvPath;
           assert orderedIce.boot.extraModulePackages == ordered.boot.extraModulePackages;
+          assert guarded.hardware.deviceTree.package.drvPath == nativeQceIceThermalDtbs.drvPath;
+          assert guarded.boot.kernelPackages.kernel.drvPath == orderedIce.boot.kernelPackages.kernel.drvPath;
+          assert guarded.boot.extraModulePackages == orderedIce.boot.extraModulePackages;
           assert !ordered.services.iptsd.enable && !moduleInstalled ordered;
           assert builtins.any (p: p.drvPath == orderedTouchModule.drvPath) ordered.boot.extraModulePackages;
           pkgs.runCommand "denali-native-touch-config" { } ''
@@ -253,7 +261,7 @@
         denali-fsgen-order-payload =
           let
             dtb = "qcom/x1e80100-microsoft-denali-oled.dtb";
-            ordered = evaluateDaily true true true false;
+            ordered = evaluateDaily true true true false false;
           in
           pkgs.runCommand "denali-fsgen-order-payload" { } ''
             cmp ${dailyKernel}/dtbs/${dtb} ${fsgenOrderKernel}/dtbs/${dtb}
