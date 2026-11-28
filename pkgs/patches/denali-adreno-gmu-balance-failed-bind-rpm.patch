@@ -1,0 +1,49 @@
+Subject: [BUILD ONLY] drm/msm: Balance runtime PM on failed GMU component bind
+
+Component bind does not call the failing component unbind callback.
+Own the GMU runtime-PM enable in the common bind wrapper and undo it
+on every error, including -EPROBE_DEFER. Keep the success and unbind
+paths unchanged; this does not solve GPU quiescence on teardown.
+
+diff --git a/drivers/gpu/drm/msm/adreno/a6xx_gmu.c b/drivers/gpu/drm/msm/adreno/a6xx_gmu.c
+index 7096d7e..c9cb134 100644
+--- a/drivers/gpu/drm/msm/adreno/a6xx_gmu.c
++++ b/drivers/gpu/drm/msm/adreno/a6xx_gmu.c
+@@ -2264,8 +2264,6 @@ static int a6xx_gmu_wrapper_pdev_bind(struct a6xx_gpu *a6xx_gpu, struct device *
+ 
+ 	gmu->dev = dev;
+ 
+-	pm_runtime_enable(gmu->dev);
+-
+ 	/* Mark legacy for manual SPTPRAC control */
+ 	gmu->legacy = true;
+ 
+@@ -2348,8 +2346,6 @@ static int a6xx_gmu_pdev_bind(struct a6xx_gpu *a6xx_gpu, struct device *dev)
+ 	gmu->idle_level = (adreno_gpu->info->quirks & ADRENO_QUIRK_IFPC) ?
+ 		GMU_IDLE_STATE_IFPC : GMU_IDLE_STATE_ACTIVE;
+ 
+-	pm_runtime_enable(gmu->dev);
+-
+ 	/* Get the list of clocks */
+ 	ret = a6xx_gmu_clocks_probe(gmu);
+ 	if (ret)
+@@ -2570,11 +2566,18 @@ static int a6xx_gmu_bind(struct device *dev, struct device *master, void *data)
+ 	int (*bind)(struct a6xx_gpu *gpu, struct device *dev) = of_device_get_match_data(dev);
+ 	struct msm_drm_private *priv = msm_drm_get_priv(master);
+ 	struct msm_gpu *gpu = dev_to_gpu(&priv->gpu_pdev->dev);
++	int ret;
+ 
+ 	if (WARN_ON(!gpu))
+ 		return -ENODEV;
+ 
+-	return bind(to_a6xx_gpu(to_adreno_gpu(gpu)), dev);
++	/* Failed component binds do not run a6xx_gmu_unbind(). */
++	pm_runtime_enable(dev);
++	ret = bind(to_a6xx_gpu(to_adreno_gpu(gpu)), dev);
++	if (ret)
++		pm_runtime_disable(dev);
++
++	return ret;
+ }
+ 
+ static void a6xx_gmu_unbind(struct device *dev, struct device *master, void *data)

@@ -91,6 +91,10 @@
             name = "denali-adreno-gmu-driver-v2-build-only";
             patch = ./pkgs/patches/denali-adreno-gmu-driver-v2-build-only.patch;
           }
+          {
+            name = "denali-adreno-gmu-balance-failed-bind-rpm";
+            patch = ./pkgs/patches/denali-adreno-gmu-balance-failed-bind-rpm.patch;
+          }
         ];
       };
       fsgenOrderExperiment = import ./modules/denali/fsgen-order-experiment.nix {
