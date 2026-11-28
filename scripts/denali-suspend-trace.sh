@@ -82,7 +82,10 @@ add_probe() {
     printf '1\n' >"$instance/events/$name/$probe/enable"
 }
 add_probe p wake_irq 'pm_system_irq_wakeup irq=$arg1:u32'
-if grep -qE '[[:space:]]rpmh_rsc_pd_callback$' /proc/kallsyms; then
+# In s2idle the RPMh callbacks can fire many times per second on the
+# idle CPU and overwrite the narrow WSA trace. Keep them for other runs.
+if [[ $mode == deep || $wsa_votes == 0 ]] &&
+    grep -qE '[[:space:]]rpmh_rsc_pd_callback$' /proc/kallsyms; then
     add_probe p rpmh_pd_enter 'rpmh_rsc_pd_callback action=$arg2:u64'
     add_probe r rpmh_pd_return 'rpmh_rsc_pd_callback result=$retval:x32'
     add_probe r rpmh_flush_return 'rpmh_flush result=$retval:s32'
