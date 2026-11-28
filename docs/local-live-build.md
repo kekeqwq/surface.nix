@@ -87,3 +87,32 @@ new hash was observed locally on Surface and in a separate readback to
 Mac. Do not archive that disk dump as the original ISO. This qualifies
 Live boot and network/install-tool availability; LUKS enrollment and
 first boot from a blank-disk installation have not been performed.
+
+### Private r4 remaster for a fresh install
+
+To add only the local fresh-install enrollment script to the verified r4,
+run on the Mac; use new output paths outside the repo and Nix store:
+
+```sh
+nix shell \
+  github:NixOS/nixpkgs/5e50e88b70dff025f88e08f2b56de55137a13fe3#xorriso \
+  github:NixOS/nixpkgs/5e50e88b70dff025f88e08f2b56de55137a13fe3#mtools \
+  -c python3 scripts/remaster-live-enrollment.py \
+  --r4 /private/path/to/original-r4.iso --out /private/path/to/r4-fresh-key.iso
+```
+
+The remaster tool accepts only the recorded original r4 SHA-256 above and
+checks that the ESP, loader, UKI, SquashFS and three firmware files are
+unchanged. The first Mac remaster had SHA-256
+`5e579db768902e40c6593a44c23414dfbe487c7dac9ffcc6034c8a7d9e1bdd48`.
+This is an image-structure check, not a USB boot qualification. Do not
+replace the archived r4 image with this remaster.
+
+On the Live console, run `sudo bash /iso/surface-install/enroll-key.sh`
+only when the target data is backed up or disposable. It checks the internal
+Samsung NVMe and asks for explicit confirmation before replacing GPT, the ESP
+and LUKS2. It does not reuse an old LUKS header, passphrase, key registration
+or filesystem, and does not perform a whole-drive secure erase. The new
+recovery passphrase is entered only on the local console. The script stops
+with the new `cryptroot` mapping open; Btrfs and the normal GitHub-based
+NixOS install follow separately.

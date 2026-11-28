@@ -81,7 +81,10 @@ slider remains available. The profile does not start a capture service.
 `denaliDailyBoot` exports the verified internal-boot kernel and OLED DTB
 from this repository using a separately locked kernel toolchain. The
 installed host consumes those artifacts directly; no historical host/system
-flake is needed. Use the normal `nixos-rebuild switch --flake .#surface`
+flake is needed. Its `uname -r` and module directory use
+`<upstream-version>-surface-next-YYYYMMDD` from the locked linux-next tag.
+The numeric prefix is required by `depmod`; the underlying source is unchanged.
+Use the normal `nixos-rebuild switch --flake .#surface`
 workflow and retain a recovery generation. The Live ISO remains a separate
 installer, not a second installed baseline. Prior test instruments and
 manual UKI staging are available only in Git history.

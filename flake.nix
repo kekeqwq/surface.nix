@@ -24,7 +24,7 @@
         fullio-reference-topology = pkgs.callPackage ./pkgs/fullio-topology.nix { };
         fullio-reference-volume = pkgs.callPackage ./pkgs/fullio-reference-volume.nix { };
         fullio-checked-capture-kernel = kernel.override {
-          localVersion = "-surface-fullio-checked-capture";
+          shortRelease = true;
           kernelPatches =
             kernel.kernelPatches
             ++
