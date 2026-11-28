@@ -6,8 +6,7 @@ root=/sys/kernel/tracing
 snapshot=$(dirname -- "${BASH_SOURCE[0]}")/denali-power-snapshot.sh
 name=denali_suspend_$$
 instance=$root/instances/$name
-probe=psci_return
-registered=0
+registered=()
 created=0
 
 usage() { echo "usage: sudo $0 {deep|s2idle} NEW_OUTPUT_DIRECTORY [--request]" >&2; exit 2; }
@@ -20,8 +19,8 @@ request=${3:-}
 [[ -d $root/instances && -r $snapshot ]] || { echo 'tracefs and the power snapshot script are required.' >&2; exit 2; }
 sleep_modes=$(</sys/power/mem_sleep)
 [[ " $sleep_modes " == *" [$mode] "* ]] || { echo "Current mode is $sleep_modes, requested $mode; no change made." >&2; exit 2; }
+[[ -w $root/kprobe_events ]] || { echo 'Wake IRQ tracing requires writable kprobe_events.' >&2; exit 2; }
 if [[ $mode == deep ]]; then
-    [[ -w $root/kprobe_events ]] || { echo 'deep requires writable kprobe_events.' >&2; exit 2; }
     grep -qE '[[:space:]]psci_system_suspend_enter$' /proc/kallsyms || {
         echo 'No psci_system_suspend_enter symbol; cannot distinguish firmware return.' >&2; exit 2;
     }
@@ -29,18 +28,18 @@ fi
 mkdir -- "$output"
 
 cleanup() {
-    local status=$?
+    local status=$? probe
     trap - EXIT
     if (( created )); then
         echo 0 >"$instance/tracing_on" || status=1
-        if (( registered )); then
+        for probe in "${registered[@]}"; do
             echo 0 >"$instance/events/$name/$probe/enable" || status=1
-        fi
+        done
         rmdir -- "$instance" || status=1
     fi
-    if (( registered )); then
+    for probe in "${registered[@]}"; do
         printf '%s\n' "-:$name/$probe" >>"$root/kprobe_events" || status=1
-    fi
+    done
     exit "$status"
 }
 trap cleanup EXIT
@@ -53,12 +52,20 @@ printf '128\n' >"$instance/buffer_size_kb"
 # The default local clock can hide elapsed time while the CPUs are suspended.
 printf 'boot\n' >"$instance/trace_clock"
 printf '1\n' >"$instance/events/power/suspend_resume/enable"
-if [[ $mode == deep ]]; then
-    printf 'r:%s/%s psci_system_suspend_enter psci_ret=$retval:s32\n' "$name" "$probe" >>"$root/kprobe_events"
-    registered=1
+printf '1\n' >"$instance/events/power/wakeup_source_activate/enable"
+add_probe() {
+    local type=$1 probe=$2
+    shift 2
+    printf '%s:%s/%s %s\n' "$type" "$name" "$probe" "$*" >>"$root/kprobe_events"
+    registered+=("$probe")
     printf '1\n' >"$instance/events/$name/$probe/enable"
+}
+add_probe p wake_irq 'pm_system_irq_wakeup irq=$arg1:u32'
+if [[ $mode == deep ]]; then
+    add_probe r psci_return 'psci_system_suspend_enter psci_ret=$retval:s32'
 fi
 
+cat /proc/interrupts >"$output/interrupts-before.txt"
 bash "$snapshot" >"$output/before.txt"
 {
     printf 'mode=%s\n' "$mode"
@@ -86,6 +93,7 @@ if ! read -r -t 240; then
 fi
 printf '0\n' >"$instance/tracing_on"
 cat "$instance/trace" >"$output/trace.txt"
+cat /proc/interrupts >"$output/interrupts-after.txt"
 printf 'operator_wake_confirmation=%s\n' "$confirmed" >>"$output/session.txt"
 bash "$snapshot" >"$output/after.txt"
 python3 "${snapshot%/*}/denali-suspend-readout.py" "$output/before.txt" "$output/after.txt" >"$output/readout.json"
