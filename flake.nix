@@ -53,12 +53,11 @@
         default = kernel;
         surface-live-iso = live.config.system.build.surfaceLiveIso;
       };
-      dailyPackages = fullioPackages (
-        import daily-kernel-nixpkgs {
-          inherit system;
-          overlays = [ overlay ];
-        }
-      );
+      dailyPkgs = import daily-kernel-nixpkgs {
+        inherit system;
+        overlays = [ overlay ];
+      };
+      dailyPackages = fullioPackages dailyPkgs;
       dailySystem = daily-kernel-nixpkgs.lib.nixosSystem {
         modules = [
           ./modules/denali.nix
@@ -84,23 +83,37 @@
           }
         ];
       };
-      touchModule = dailyBoot.boot.kernelPackages.callPackage ./pkgs/denali-module-candidate.nix {
-        repo = "SP11X1e-touchscreen";
-        rev = "1cb0ce2b3cc95821433410081b6cbba634eddc41";
-        hash = "sha256-5kmgoD1n1AVCr2vt1oBsDsFkOf552lnyLU8h9/Alz5A=";
-        subdir = "production-v1";
-        module = "mshw0485_touch";
-        patches = [
-          ./pkgs/patches/denali-mshw0485-regulator.patch
-          ./pkgs/patches/denali-mshw0485-next24-transport.patch
-        ];
+      fsgenOrderPackages = dailyPkgs.linuxPackagesFor fsgenOrderKernel;
+      fsgenOrderExperiment = import ./modules/denali/fsgen-order-experiment.nix {
+        kernelPackages = fsgenOrderPackages;
       };
+      mkTouchModule =
+        kernelPackages:
+        kernelPackages.callPackage ./pkgs/denali-module-candidate.nix {
+          repo = "SP11X1e-touchscreen";
+          rev = "1cb0ce2b3cc95821433410081b6cbba634eddc41";
+          hash = "sha256-5kmgoD1n1AVCr2vt1oBsDsFkOf552lnyLU8h9/Alz5A=";
+          subdir = "production-v1";
+          module = "mshw0485_touch";
+          patches = [
+            ./pkgs/patches/denali-mshw0485-regulator.patch
+            ./pkgs/patches/denali-mshw0485-next24-transport.patch
+          ];
+        };
+      touchModule = mkTouchModule dailyBoot.boot.kernelPackages;
+      orderedTouchModule = mkTouchModule fsgenOrderPackages;
       touchDtbs = pkgs.callPackage ./pkgs/denali-touch-dtb-candidate.nix {
         dtbs = dailyBoot.hardware.deviceTree.package;
       };
       nativeTouch = import ./modules/denali/native-touch.nix {
         inherit touchModule touchDtbs;
-        kernel = dailyBoot.boot.kernelPackages.kernel;
+        kernel = dailyKernel;
+        additionalVariants = [
+          {
+            kernel = fsgenOrderKernel;
+            touchModule = orderedTouchModule;
+          }
+        ];
       };
       mkQceDtbs = pkgs.callPackage ./pkgs/denali-qce-disabled-dtb-candidate.nix;
       stockQceDtbs = mkQceDtbs { dtbs = dailyBoot.hardware.deviceTree.package; };
@@ -110,18 +123,20 @@
       };
       qceExperiment = import ./modules/denali/qce-experiment.nix {
         inherit stockQceDtbs nativeQceDtbs;
-        kernel = dailyBoot.boot.kernelPackages.kernel;
+        kernel = dailyKernel;
+        additionalKernels = [ fsgenOrderKernel ];
       };
       evaluateDaily =
-        enable: disableUnusedQce:
+        enable: disableUnusedQce: orderFsgenResume:
         (dailySystem.extendModules {
           modules = [
             nativeTouch
             qceExperiment
+            fsgenOrderExperiment
             {
               surface.devices.denali = {
                 touchscreen.native = { inherit enable; };
-                power = { inherit disableUnusedQce; };
+                power = { inherit disableUnusedQce orderFsgenResume; };
               };
             }
           ];
@@ -142,6 +157,7 @@
           qceExperiment
         ];
       };
+      nixosModules.denali-fsgen-order-experiment = fsgenOrderExperiment;
       # The installed host imports these layers in order so the existing
       # firmware manifest and initrd remain unchanged.
       nixosModules.fullio-reference-render = import ./modules/denali/fullio-reference-render.nix packages;
@@ -167,10 +183,11 @@
       checks.${system} = {
         denali-native-touch-config =
           let
-            stock = evaluateDaily false false;
-            native = evaluateDaily true false;
-            stockQce = evaluateDaily false true;
-            nativeQce = evaluateDaily true true;
+            stock = evaluateDaily false false false;
+            native = evaluateDaily true false false;
+            stockQce = evaluateDaily false true false;
+            nativeQce = evaluateDaily true true false;
+            ordered = evaluateDaily true true true;
             moduleInstalled =
               cfg: builtins.any (p: p.drvPath == touchModule.drvPath) cfg.boot.extraModulePackages;
           in
@@ -187,9 +204,25 @@
           assert stockQce.services.iptsd.enable && !moduleInstalled stockQce;
           assert !nativeQce.services.iptsd.enable && moduleInstalled nativeQce;
           assert nativeQce.boot.kernelPackages.kernel.drvPath == native.boot.kernelPackages.kernel.drvPath;
+          assert ordered.boot.kernelPackages.kernel.drvPath == fsgenOrderKernel.drvPath;
+          assert ordered.hardware.deviceTree.package.drvPath == nativeQceDtbs.drvPath;
+          assert !ordered.services.iptsd.enable && !moduleInstalled ordered;
+          assert builtins.any (p: p.drvPath == orderedTouchModule.drvPath) ordered.boot.extraModulePackages;
           pkgs.runCommand "denali-native-touch-config" { } ''
             tree=${native.system.modulesTree}/lib/modules/${native.boot.kernelPackages.kernel.modDirVersion}
             test -s "$tree/modules.cer"
+            test -s "$tree/updates/mshw0485_touch.ko.cer"
+            grep -q 'microsoft,mshw0485.*mshw0485_touch$' "$tree/modules.alias"
+            touch "$out"
+          '';
+        denali-fsgen-order-payload =
+          let
+            dtb = "qcom/x1e80100-microsoft-denali-oled.dtb";
+            ordered = evaluateDaily true true true;
+          in
+          pkgs.runCommand "denali-fsgen-order-payload" { } ''
+            cmp ${dailyKernel}/dtbs/${dtb} ${fsgenOrderKernel}/dtbs/${dtb}
+            tree=${ordered.system.modulesTree}/lib/modules/${fsgenOrderKernel.modDirVersion}
             test -s "$tree/updates/mshw0485_touch.ko.cer"
             grep -q 'microsoft,mshw0485.*mshw0485_touch$' "$tree/modules.alias"
             touch "$out"

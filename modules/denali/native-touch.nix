@@ -2,6 +2,7 @@
   kernel,
   touchModule,
   touchDtbs,
+  additionalVariants ? [ ],
 }:
 {
   config,
@@ -11,6 +12,9 @@
 let
   cfg = config.surface.devices.denali;
   dtb = "qcom/x1e80100-microsoft-denali-oled.dtb";
+  variant = lib.findFirst (v: v.kernel.drvPath == config.boot.kernelPackages.kernel.drvPath) null (
+    [ { inherit kernel touchModule; } ] ++ additionalVariants
+  );
 in
 {
   options.surface.devices.denali.touchscreen.native.enable = lib.mkEnableOption ''
@@ -24,8 +28,8 @@ in
         message = "Denali native touch requires Denali hardware support.";
       }
       {
-        assertion = config.boot.kernelPackages.kernel.drvPath == kernel.drvPath;
-        message = "Denali native touch requires the locked denaliDailyBoot kernel ABI.";
+        assertion = variant != null;
+        message = "Denali native touch requires a locked denaliDailyBoot kernel variant.";
       }
       {
         assertion = config.hardware.deviceTree.name == dtb;
@@ -33,7 +37,7 @@ in
       }
     ];
     hardware.deviceTree.package = lib.mkForce touchDtbs;
-    boot.extraModulePackages = [ touchModule ];
+    boot.extraModulePackages = lib.optional (variant != null) variant.touchModule;
     # Module selection happens via the new DT's OF modalias after reboot;
     # don't request a modules-load restart or bind/unbind the active controller.
     services.iptsd.enable = lib.mkForce false;

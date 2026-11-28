@@ -2,6 +2,7 @@
   kernel,
   stockQceDtbs,
   nativeQceDtbs,
+  additionalKernels ? [ ],
 }:
 {
   config,
@@ -21,7 +22,9 @@ in
       {
         assertion =
           cfg.enable
-          && config.boot.kernelPackages.kernel.drvPath == kernel.drvPath
+          && lib.any (k: k.drvPath == config.boot.kernelPackages.kernel.drvPath) (
+            [ kernel ] ++ additionalKernels
+          )
           && config.hardware.deviceTree.name == "qcom/x1e80100-microsoft-denali-oled.dtb";
         message = "The QCE experiment requires the locked Denali OLED daily kernel and DTB.";
       }
