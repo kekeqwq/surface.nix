@@ -2,11 +2,15 @@
 
 ## 仓库归属与测试工作流
 
+- 本机和 Surface 的 `~/Repos` 下，Surface 项目只保留 `surface.nix` 和 `flakes` 两个仓库目录。不为测试、合并或发布额外创建项目副本或 Git worktree；用现有仓库内的分支隔离改动，不覆盖未提交的工作。
+
 - 本地开发在 `~/Repos/surface.nix` 进行。Surface 硬件适配（内核、补丁、设备树、驱动、硬件固件集成和诊断）维护在这里。新硬件实验默认显式启用，不替换普通启动基线。
 - Surface 实例的系统配置（分区和文件系统、用户、权限、主机身份、系统配置组合）放在 `~/Repos/flakes/hosts/surface/`，不放进硬件 flake。共用配置仍遵守 `flakes` 的分层规则，不把 Surface 私有规则推广到其他实例。
 - 先在本地修改代码和 Nix 表达式，再同步两个仓库的对应源码及 `flakes` 的 `surface` 输入锁到对端 Surface。对端不作为源码的唯一副本；不得用同步覆盖无关变更。
 - Surface 已有稳定的日用基线。此后日常部署和回归统一在 Surface 的 `~/Repos/flakes` 运行 `sudo nixos-rebuild switch --flake .#surface`，使用原生 AArch64。启用或关闭实验也用 Nix 表达式和锁定输入；不要另造临时消费 flake、测试目录、命令行 input override、手工 UKI 或一次性启动项。正常的私有固件 UKI 仍由普通部署流程生成。内核、设备树等启动期变更在普通重启后验收。
 - Surface 重启后 DHCP 可能更换 IP。先检查上次地址，必要时自行扫描 `192.168.2.0/24`；这只是发现范围，不限制 SSH 来源网段。使用已固定的 SSH 主机密钥验证 Surface 身份，以非交互方式连接 `keke@<IP>`，无需密码或客户端密钥。不要求用户查 IP，不关闭严格主机密钥校验，不改变路由器配置。
+
+- 通过 SSH 执行部署时，若远端 sudo 等待用户输入密码，并且用户要求用浮动窗格（float pane）接入，在用户**当前本机的 tmux client** 上用 `tmux display-popup`，弹窗内用 `ssh -t` 连接并 attach 已有的远端 tmux 会话。不要在远端 tmux client 上开弹窗，也不要另起一遍部署。保持 SSH 严格主机密钥校验；密码由用户直接在弹窗输入，不经聊天、命令参数或 `tmux send-keys`。
 
 ## 可复现性与本地安装介质
 
