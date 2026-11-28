@@ -135,6 +135,10 @@
             name = "denali-adreno-gmu-stop-preempt-watchdog";
             patch = ./pkgs/patches/denali-adreno-gmu-stop-preempt-watchdog.patch;
           }
+          {
+            name = "denali-adreno-gmu-close-render-admission";
+            patch = ./pkgs/patches/denali-adreno-gmu-close-render-admission.patch;
+          }
         ];
       };
       fsgenOrderExperiment = import ./modules/denali/fsgen-order-experiment.nix {

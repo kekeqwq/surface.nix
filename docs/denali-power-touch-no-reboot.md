@@ -141,6 +141,8 @@ The terminal DMA audit found that `a6xx_bus_clear_pending_transactions()` discar
 
 `denali-adreno-gmu-stop-preempt-watchdog.patch` covers a separate A6xx/A7xx/A8xx final-destruction timer: its preemption timeout callback dereferences GPU state even with recovery admission closed. The shared A6xx destroy path now drains that timer before releasing GPU buffers. A per-instance flag permits early failures and single-ring mode to skip shutdown if the timer was never initialized. The twelve-object native compile passed (`/nix/store/rq3g4p5x9w5hi2xc1rmra4nlimwrnlys-denali-adreno-gmu-compile-object-7.4.0-rc4-next-20261124`). This does not stop scheduler or DMA after a terminal suspend timeout.
 
+`denali-adreno-gmu-close-render-admission.patch` closes userspace job admission specifically for the separate render-only DRM device: final uninit calls `drm_dev_unplug()`, and GEM_SUBMIT/VM_BIND use `drm_dev_enter()`/`drm_dev_exit()` so unplug rejects new calls and waits for admitted callbacks before the suspend attempt. The display/KMS unregister path is unchanged. This does not drain jobs already queued, cover all other DRM file operations or bound how long an admitted call takes, or make failed suspend safe. The twelve-object native compile passed (`/nix/store/wh2xhr0fgb5nbs48qgk5jgrlvx3p4als-denali-adreno-gmu-compile-object-7.4.0-rc4-next-20261124`); no live unplug or deployment.
+
 ### Acceptance for both supported suspend paths
 
 | Gate | Evidence required | Current status |

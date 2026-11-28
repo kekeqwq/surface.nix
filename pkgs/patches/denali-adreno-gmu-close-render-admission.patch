@@ -1,0 +1,75 @@
+drm/msm: Close render job admission before render-only teardown
+
+Unregistering the node alone does not exclude ioctls on existing file
+descriptors. Unplug the render-only DRM device and protect job producers
+with the DRM SRCU read-side guard. This gates GEM_SUBMIT and VM_BIND
+callbacks, not already queued jobs, other file operations, or DMA.
+Keep the display/KMS unregister path unchanged.
+
+--- a/drivers/gpu/drm/msm/msm_drv.c
++++ b/drivers/gpu/drm/msm/msm_drv.c
+@@ -162,9 +162,12 @@
+ 	 * shutdown will be successful.
+ 	 */
+ 	if (ddev->registered) {
+-		drm_dev_unregister(ddev);
+-		if (priv->kms)
++		if (priv->kms) {
++			drm_dev_unregister(ddev);
+ 			msm_drm_kms_unregister(dev);
++		} else {
++			drm_dev_unplug(ddev);
++		}
+ 	}
+ 
+ 	msm_gem_shrinker_cleanup(ddev);
+@@ -890,6 +893,34 @@
+ 	return msm_submitqueue_remove(file->driver_priv, id);
+ }
+ 
++static int msm_ioctl_gem_submit_guarded(struct drm_device *dev, void *data,
++				      struct drm_file *file)
++{
++	int idx, ret;
++
++	if (!drm_dev_enter(dev, &idx))
++		return -ENODEV;
++
++	ret = msm_ioctl_gem_submit(dev, data, file);
++	drm_dev_exit(idx);
++
++	return ret;
++}
++
++static int msm_ioctl_vm_bind_guarded(struct drm_device *dev, void *data,
++				      struct drm_file *file)
++{
++	int idx, ret;
++
++	if (!drm_dev_enter(dev, &idx))
++		return -ENODEV;
++
++	ret = msm_ioctl_vm_bind(dev, data, file);
++	drm_dev_exit(idx);
++
++	return ret;
++}
++
+ static const struct drm_ioctl_desc msm_ioctls[] = {
+ 	DRM_IOCTL_DEF_DRV(MSM_GET_PARAM,    msm_ioctl_get_param,    DRM_RENDER_ALLOW),
+ 	DRM_IOCTL_DEF_DRV(MSM_SET_PARAM,    msm_ioctl_set_param,    DRM_RENDER_ALLOW),
+@@ -897,13 +928,13 @@
+ 	DRM_IOCTL_DEF_DRV(MSM_GEM_INFO,     msm_ioctl_gem_info,     DRM_RENDER_ALLOW),
+ 	DRM_IOCTL_DEF_DRV(MSM_GEM_CPU_PREP, msm_ioctl_gem_cpu_prep, DRM_RENDER_ALLOW),
+ 	DRM_IOCTL_DEF_DRV(MSM_GEM_CPU_FINI, msm_ioctl_gem_cpu_fini, DRM_RENDER_ALLOW),
+-	DRM_IOCTL_DEF_DRV(MSM_GEM_SUBMIT,   msm_ioctl_gem_submit,   DRM_RENDER_ALLOW),
++	DRM_IOCTL_DEF_DRV(MSM_GEM_SUBMIT,   msm_ioctl_gem_submit_guarded,   DRM_RENDER_ALLOW),
+ 	DRM_IOCTL_DEF_DRV(MSM_WAIT_FENCE,   msm_ioctl_wait_fence,   DRM_RENDER_ALLOW),
+ 	DRM_IOCTL_DEF_DRV(MSM_GEM_MADVISE,  msm_ioctl_gem_madvise,  DRM_RENDER_ALLOW),
+ 	DRM_IOCTL_DEF_DRV(MSM_SUBMITQUEUE_NEW,   msm_ioctl_submitqueue_new,   DRM_RENDER_ALLOW),
+ 	DRM_IOCTL_DEF_DRV(MSM_SUBMITQUEUE_CLOSE, msm_ioctl_submitqueue_close, DRM_RENDER_ALLOW),
+ 	DRM_IOCTL_DEF_DRV(MSM_SUBMITQUEUE_QUERY, msm_ioctl_submitqueue_query, DRM_RENDER_ALLOW),
+-	DRM_IOCTL_DEF_DRV(MSM_VM_BIND,      msm_ioctl_vm_bind,      DRM_RENDER_ALLOW),
++	DRM_IOCTL_DEF_DRV(MSM_VM_BIND,      msm_ioctl_vm_bind_guarded,      DRM_RENDER_ALLOW),
+ 	DRM_IOCTL_DEF_DRV(MSM_PERFCNTR_CONFIG,   msm_ioctl_perfcntr_config,    DRM_RENDER_ALLOW),
+ };
