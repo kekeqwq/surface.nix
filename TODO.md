@@ -13,7 +13,7 @@
 保留现有合盖只锁屏的策略：这是挂起尚未验收时的主动选择。用当前锁定的 `surface-next` 逐项验证；本项处理 `s2idle` / `deep`，不引入磁盘休眠。保持已经实测可用的触屏栈不变，分别验证电源侧的改动。
 
 - [ ] **低功耗待机最后验收。** QCE 的两条互连已同步，闲置 UFS ICE 的阻塞已通过正常重启排除；GCC/GPUCC 现只等 GMU 绑定，不强制同步、不禁用 GMU。接电 `s2idle` 已能睡眠和唤醒，但 `CXSD` / `AOSD` / DDR 驻留仍为零。至少两小时纯电池对照留到最后。
-- [ ] **CPU 高温主动保护（独立于 GMU）。** 机主曾在构建后立即重启时遇到 BIOS 温度告警；全核构建实测热点 95.6°C，后续录到硬件平均频率下降，但未证实是否由过热触发。参考 [Omarchy ARM 的 Zenbook 被动温控补丁 `2752`](https://github.com/omacom/omarchy-pkgs/blob/master/pkgbuilds/linux-omarchy-aarch64/README.md)，Denali 专用 `cpuThermalGuard` 默认关闭，候选已通过 AArch64 产物检查：85°C 触发、2°C 回差，三簇 CPU 温区映射各自的 cooling device，不改风扇曲线和紧急阈值。还需普通重启验证映射，并做一次短时、有人值守的限频与恢复验证；85°C 不是保证不越过的硬上限，不要求热环境长时间满载。
+- [ ] **CPU 高温主动保护（独立于 GMU）。** 机主曾在构建后立即重启时遇到 BIOS 温度告警；全核构建实测热点 95.6°C，后续录到硬件平均频率下降，但未证实是否由过热触发。参考 [Omarchy ARM 的 Zenbook 被动温控补丁 `2752`](https://github.com/omacom/omarchy-pkgs/blob/master/pkgbuilds/linux-omarchy-aarch64/README.md)，Denali 专用 `cpuThermalGuard` 默认关闭，候选已通过 AArch64 产物检查：85°C 触发、2°C 回差，三簇 CPU 温区映射各自的 cooling device，不改风扇曲线和紧急阈值。普通重启已验证 30 条温区和三个 CPUFreq 绑定；尚需一次短时、有人值守的限频与恢复验证。85°C 不是保证不越过的硬上限，不要求热环境长时间满载。
 
 - [x] **电池日用初验。** Surface 的 Waybar 和锁屏统一选 `BAT1`；实测拔电后正常放电，插回后恢复充电，`energy_now` 按方向变化，未见明显异常。没有禁用 Qualcomm 驱动或写入充电阈值。参考 [dwhinham 的 SAM 电池选源](https://github.com/dwhinham/linux-surface-pro-11#post-install-fixups)。
 - [ ] **电池长期观察（暂缓）。** 同一电池的 SAM / Qualcomm 百分比仍有差异；未验证长期读数、固件充电上限或更长期充放电行为。不按初验结果更改充电策略或做驱动级仲裁。
