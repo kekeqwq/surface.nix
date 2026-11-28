@@ -211,6 +211,17 @@
             };
       };
       checks.${system} = {
+        # Compile the touched translation unit without building a bootable kernel.
+        denali-adreno-gmu-compile-object = gmuBindingBuildOnlyKernel.overrideAttrs (_: {
+          pname = "denali-adreno-gmu-compile-object";
+          buildFlags = [ "drivers/gpu/drm/msm/adreno/a6xx_gmu.o" ];
+          installPhase = ''
+            mkdir -p "$out" "$dev" "$modules"
+            cp "$buildRoot/drivers/gpu/drm/msm/adreno/a6xx_gmu.o" "$out/"
+          '';
+          postInstall = "";
+          dontStrip = true;
+        });
         denali-adreno-gmu-build-payload =
           let
             dtb = "qcom/x1e80100-microsoft-denali-oled.dtb";

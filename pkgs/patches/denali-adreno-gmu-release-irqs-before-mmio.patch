@@ -13,22 +13,22 @@ before this resource cleanup is safe.
 +++ b/drivers/gpu/drm/msm/adreno/a6xx_gmu.c
 @@ -2188,7 +2188,12 @@ static void a6xx_gmu_destroy(struct a6xx_gpu *a6xx_gpu)
  	mutex_unlock(&gmu->lock);
-
+ 
  	pm_runtime_force_suspend(gmu->dev);
 +	if (!adreno_has_gmu_wrapper(adreno_gpu) &&
 +	    !adreno_has_rgmu(adreno_gpu)) {
 +		free_irq(gmu->gmu_irq, gmu);
 +		free_irq(gmu->hfi_irq, gmu);
 +	}
-
+ 
  	/*
  	 * Since cxpd is a virt device, the devlink with gmu-dev will be removed
  	 * automatically when we do detach
-@@ -2209,13 +2214,9 @@ static void a6xx_gmu_destroy(struct a6xx_gpu *a6xx_gpu)
+@@ -2209,15 +2214,11 @@ static void a6xx_gmu_destroy(struct a6xx_gpu *a6xx_gpu)
  	iounmap(gmu->mmio);
  	gmu->mmio = NULL;
  	gmu->rscc = NULL;
-
+ 
  	if (!adreno_has_gmu_wrapper(adreno_gpu) &&
 -	    !adreno_has_rgmu(adreno_gpu)) {
 +	    !adreno_has_rgmu(adreno_gpu))
@@ -38,4 +38,6 @@ before this resource cleanup is safe.
 -		free_irq(gmu->hfi_irq, gmu);
 -	}
  }
-
+ 
+ static int cxpd_notifier_cb(struct notifier_block *nb,
+ 			unsigned long action, void *data)

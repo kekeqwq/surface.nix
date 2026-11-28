@@ -9,11 +9,11 @@ MMIO mapping alive until the acquired handlers have been released.
 +++ b/drivers/gpu/drm/msm/adreno/a6xx_gmu.c
 @@ -2133,6 +2133,8 @@ static int a6xx_gmu_get_irq(struct a6xx_gmu *gmu, struct platform_device *pdev,
  	int irq, ret;
-
+ 
  	irq = platform_get_irq_byname(pdev, name);
 +	if (irq < 0)
 +		return irq;
-
+ 
  	ret = request_irq(irq, handler, IRQF_TRIGGER_HIGH | IRQF_NO_AUTOEN, name, gmu);
  	if (ret) {
 @@ -2462,16 +2464,20 @@
@@ -27,7 +27,7 @@ MMIO mapping alive until the acquired handlers have been released.
 +		ret = gmu->hfi_irq;
  		goto err_mmio;
  	}
-
+ 
 +	gmu->gmu_irq = a6xx_gmu_get_irq(gmu, pdev, "gmu", a6xx_gmu_irq);
 +	if (gmu->gmu_irq < 0) {
 +		ret = gmu->gmu_irq;
@@ -40,12 +40,12 @@ MMIO mapping alive until the acquired handlers have been released.
 -		goto err_mmio;
 +		goto err_gmu_irq;
  	}
-
+ 
  	cx_link = device_link_add(gmu->dev, gmu->cxpd,
 @@ -2550,10 +2555,12 @@
  detach_cxpd:
  	dev_pm_domain_detach(gmu->cxpd, false);
-
+ 
 -err_mmio:
 -	iounmap(gmu->mmio);
 +err_gmu_irq:
@@ -54,6 +54,6 @@ MMIO mapping alive until the acquired handlers have been released.
  	free_irq(gmu->hfi_irq, gmu);
 +err_mmio:
 +	iounmap(gmu->mmio);
-
+ 
  err_memory:
  	a6xx_gmu_memory_free(gmu);
