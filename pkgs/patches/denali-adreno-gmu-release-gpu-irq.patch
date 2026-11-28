@@ -1,0 +1,83 @@
+drm/msm: Drain the GPU IRQ handler before freeing GPU resources
+
+After a successful terminal suspend, release the main GPU IRQ before
+GMU component unbind. Also release it before final cleanup, checking
+that the devres request succeeded and has not already been released.
+This drains the handler, not the GPU or any DMA in flight.
+
+--- a/drivers/gpu/drm/msm/msm_gpu.h
++++ b/drivers/gpu/drm/msm/msm_gpu.h
+@@ -220,6 +220,7 @@
+ 
+ 	void __iomem *mmio;
+ 	int irq;
++	bool irq_requested;
+ 
+ 	struct drm_gpuvm *vm;
+ 
+@@ -745,6 +746,7 @@
+ void msm_gpu_close_recovery(struct msm_gpu *gpu);
+ void msm_gpu_retire(struct msm_gpu *gpu);
+ void msm_gpu_close_retire(struct msm_gpu *gpu);
++void msm_gpu_release_irq(struct msm_gpu *gpu);
+ void msm_gpu_submit(struct msm_gpu *gpu, struct msm_gem_submit *submit);
+ 
+ int msm_gpu_init(struct drm_device *drm, struct platform_device *pdev,
+--- a/drivers/gpu/drm/msm/msm_gpu.c
++++ b/drivers/gpu/drm/msm/msm_gpu.c
+@@ -984,6 +984,8 @@
+ 		goto fail;
+ 	}
+ 
++	gpu->irq_requested = true;
++
+ 	ret = get_clocks(pdev, gpu);
+ 	if (ret)
+ 		goto fail;
+@@ -1075,12 +1077,22 @@
+ 	return ret;
+ }
+ 
++void msm_gpu_release_irq(struct msm_gpu *gpu)
++{
++	if (!gpu->irq_requested)
++		return;
++
++	devm_free_irq(&gpu->pdev->dev, gpu->irq, gpu);
++	gpu->irq_requested = false;
++}
++
+ void msm_gpu_cleanup(struct msm_gpu *gpu)
+ {
+ 	int i;
+ 
+ 	DBG("%s", gpu->name);
+ 
++	msm_gpu_release_irq(gpu);
+ 	/* hangcheck_handler() reads the rings and may rearm the timer. */
+ 	if (gpu->worker) {
+ 		timer_shutdown_sync(&gpu->hangcheck_timer);
+--- a/drivers/gpu/drm/msm/msm_drv.c
++++ b/drivers/gpu/drm/msm/msm_drv.c
+@@ -183,8 +183,10 @@
+ 			msm_iommu_gpu_close_faults(to_msm_vm(gpu->vm)->mmu);
+ 		msm_gpu_close_recovery(gpu);
+ 		if (pm_runtime_enabled(gpu_dev) &&
+-		    !WARN_ON_ONCE(adreno_system_suspend(gpu_dev)))
++		    !WARN_ON_ONCE(adreno_system_suspend(gpu_dev))) {
++			msm_gpu_release_irq(gpu);
+ 			msm_gpu_close_retire(gpu);
++		}
+ 		msm_devfreq_cleanup(gpu);
+ 	}
+ 
+--- a/drivers/gpu/drm/msm/adreno/a6xx_gpu.c
++++ b/drivers/gpu/drm/msm/adreno/a6xx_gpu.c
+@@ -2312,6 +2312,7 @@
+ 	struct adreno_gpu *adreno_gpu = to_adreno_gpu(gpu);
+ 	struct a6xx_gpu *a6xx_gpu = to_a6xx_gpu(adreno_gpu);
+ 
++	msm_gpu_release_irq(gpu);
+ 	if (a6xx_gpu->sqe_bo) {
+ 		msm_gem_unpin_iova(a6xx_gpu->sqe_bo, gpu->vm);
+ 		drm_gem_object_put(a6xx_gpu->sqe_bo);

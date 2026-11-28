@@ -119,6 +119,10 @@
             name = "denali-adreno-gmu-drain-retire-work";
             patch = ./pkgs/patches/denali-adreno-gmu-drain-retire-work.patch;
           }
+          {
+            name = "denali-adreno-gmu-release-gpu-irq";
+            patch = ./pkgs/patches/denali-adreno-gmu-release-gpu-irq.patch;
+          }
         ];
       };
       fsgenOrderExperiment = import ./modules/denali/fsgen-order-experiment.nix {
