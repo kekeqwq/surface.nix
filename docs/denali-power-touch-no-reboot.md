@@ -77,6 +77,12 @@ The active DT gives WSA (`6b00000.codec`) an `fsgen` clock from VA (`6d44000.cod
 
 The second attended AC trial again resumed by IRQ 237, with BOOTTIME–MONOTONIC increasing 147.149 s, suspend success/fail `1/0 → 2/0`, and unchanged zero CXSD/AOSD/DDR counts. The warning reproduced. Trace (`/tmp/denali-qce-s2idle-traced.log`): WSA bus resume began at `1755.574480`; its VA runtime-PM requests returned `1` with disable depth `1`; the regcache warning predated WSA's callback completion at `1755.575169`; VA's own bus resume then began at `1755.575176` and cleared cache-only at `1755.575177`. No audio behavior was changed. Tracefs instance was temporary and the original sleep selection was restored.
 
+### Build-only VA/WSA ordering candidate
+
+The booted WSA `clock-names` lists `fsgen` as its fourth clock, and the corresponding DT phandle is VA `6d44000.codec`. The build-only `.#denali-lpass-fsgen-order-kernel-candidate` adds a Denali-only stateless device link from WSA to this supplier, with devres cleanup and no runtime-PM vote. The link is intended to order system suspend/resume, not mask the warning or modify regcache, protection, gain, mute, or clock programming. No installed-host or Live module selects this candidate. Do not activate it without checking native build, device links, audio/touch/power recovery and a same-mode trace.
+
+Official kernel.org tag queries (2026-11-28) returned mainline `v7.4-rc4` (`a4d7daea71be…`) and `next-20261127` (`7922eb284658…`, peeled `e5aad2bdbbee…`). Checked the VA/WSA codec source in both candidates: the fsgen path remains a clock request with no explicit device link. Next27 still has the previously recorded FullIO patch conflicts. Keep the validated Next24 base for this isolated comparison; no baseline kernel update is implied.
+
 ## What requires a local operator later
 
 1. Compare the next ordinary lock's label with SAM `BAT1`. Test actual energy change over a longer stable battery interval separately; do not infer charge policy from a short unplug/replug.

@@ -1,0 +1,63 @@
+--- a/sound/soc/codecs/lpass-wsa-macro.c
++++ b/sound/soc/codecs/lpass-wsa-macro.c
+@@ -3163,7 +3163,49 @@
+ static const struct attribute_group wsa_macro_fullio_level_group = {
+ 	.attrs = wsa_macro_fullio_level_attrs,
+ };
++
++static void wsa_macro_del_fsgen_link(void *data)
++{
++	device_link_del(data);
++}
++
++static int wsa_macro_link_fsgen_supplier(struct device *dev)
++{
++	struct platform_device *supplier;
++	struct of_phandle_args clock;
++	struct device_link *link;
++	int index, ret;
++
++	if (!of_machine_is_compatible("microsoft,denali"))
++		return 0;
++
++	index = of_property_match_string(dev->of_node, "clock-names", "fsgen");
++	if (index < 0)
++		return index;
++
++	ret = of_parse_phandle_with_args(dev->of_node, "clocks", "#clock-cells",
++					 index, &clock);
++	if (ret)
++		return ret;
+ 
++	supplier = of_find_device_by_node(clock.np);
++	of_node_put(clock.np);
++	if (!supplier)
++		return -EPROBE_DEFER;
++
++	/*
++	 * The VA clock prepare callback accesses VA's regmap. Runtime PM is
++	 * disabled during system resume, so a runtime get cannot replace VA's
++	 * system resume callback. Order the callbacks without adding PM votes.
++	 */
++	link = device_link_add(dev, &supplier->dev, DL_FLAG_STATELESS);
++	put_device(&supplier->dev);
++	if (!link)
++		return -EINVAL;
++
++	return devm_add_action_or_reset(dev, wsa_macro_del_fsgen_link, link);
++}
++
+ static int wsa_macro_probe(struct platform_device *pdev)
+ {
+ 	struct device *dev = &pdev->dev;
+@@ -3201,6 +3243,10 @@
+ 	if (IS_ERR(wsa->fsgen))
+ 		return dev_err_probe(dev, PTR_ERR(wsa->fsgen), "unable to get fsgen clock\n");
+ 
++	ret = wsa_macro_link_fsgen_supplier(dev);
++	if (ret)
++		return dev_err_probe(dev, ret, "unable to order fsgen supplier PM\n");
++
+ 	base = devm_platform_ioremap_resource(pdev, 0);
+ 	if (IS_ERR(base))
+ 		return PTR_ERR(base);

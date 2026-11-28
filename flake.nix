@@ -75,6 +75,15 @@
         ];
       };
       dailyBoot = dailySystem.config;
+      dailyKernel = dailyBoot.boot.kernelPackages.kernel;
+      fsgenOrderKernel = dailyKernel.override {
+        kernelPatches = dailyKernel.kernelPatches ++ [
+          {
+            name = "denali-lpass-fsgen-pm-order";
+            patch = ./pkgs/patches/denali-lpass-fsgen-pm-order.patch;
+          }
+        ];
+      };
       touchModule = dailyBoot.boot.kernelPackages.callPackage ./pkgs/denali-module-candidate.nix {
         repo = "SP11X1e-touchscreen";
         rev = "1cb0ce2b3cc95821433410081b6cbba634eddc41";
@@ -144,6 +153,7 @@
         denali-touch-dtb-candidate = touchDtbs;
         denali-qce-disabled-dtb-candidate = stockQceDtbs;
         denali-native-touch-qce-disabled-dtb-candidate = nativeQceDtbs;
+        denali-lpass-fsgen-order-kernel-candidate = fsgenOrderKernel;
         denali-adsp-pld-candidate =
           dailyBoot.boot.kernelPackages.callPackage ./pkgs/denali-module-candidate.nix
             {
