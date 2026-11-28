@@ -83,6 +83,8 @@ The booted WSA `clock-names` lists `fsgen` as its fourth clock, and the correspo
 
 Official kernel.org tag queries (2026-11-28) returned mainline `v7.4-rc4` (`a4d7daea71be…`) and `next-20261127` (`7922eb284658…`, peeled `e5aad2bdbbee…`). Checked the VA/WSA codec source in both candidates: the fsgen path remains a clock request with no explicit device link. Next27 still has the previously recorded FullIO patch conflicts. Keep the validated Next24 base for this isolated comparison; no baseline kernel update is implied.
 
+`flakes` `b0f9b46` booted the order variant with the same OLED/QCE DTB. The WSA consumer and VA supplier link appeared in sysfs. On the first attended AC `s2idle` trial, BOOTTIME–MONOTONIC advanced 78.598 s; IRQ 230 was `pmic_pwrkey`, the same boot resumed, and success/fail went `0/0 → 1/0`. VA cleared cache-only and finished regcache sync at `229.272081` before the WSA callback began at `229.272083`. The VA region sync requested by WSA completed (`status=stop region`); the original regcache warning did not recur. FullIO re-armed once at 0 dB / GainStep 30 with both ACKs; speaker and MicArray nodes returned. Native touch reinitialized with no recorded failures; physical touch and duplex verification are separate. CXSD/AOSD/DDR remain zero, and `s2idle [deep]` was restored. Evidence: `/tmp/denali-fsgen-order-s2idle.log` on Surface.
+
 ## What requires a local operator later
 
 1. Compare the next ordinary lock's label with SAM `BAT1`. Test actual energy change over a longer stable battery interval separately; do not infer charge policy from a short unplug/replug.
