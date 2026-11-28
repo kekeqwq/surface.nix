@@ -143,6 +143,10 @@
             name = "denali-adreno-gmu-park-terminal-scheduler";
             patch = ./pkgs/patches/denali-adreno-gmu-park-terminal-scheduler.patch;
           }
+          {
+            name = "denali-adreno-gmu-drain-before-closing-recovery";
+            patch = ./pkgs/patches/denali-adreno-gmu-drain-before-closing-recovery.patch;
+          }
         ];
       };
       fsgenOrderExperiment = import ./modules/denali/fsgen-order-experiment.nix {

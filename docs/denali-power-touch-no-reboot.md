@@ -145,6 +145,8 @@ The terminal DMA audit found that `a6xx_bus_clear_pending_transactions()` discar
 
 `denali-adreno-gmu-park-terminal-scheduler.patch` separates reversible system sleep from final teardown. A terminal suspend failure no longer restarts the scheduler; `adreno_unbind()` skips a second suspend if the DRM master already attempted terminal suspend before reverse component teardown. Early component unwind without a prior master attempt still runs its own terminal suspend when runtime PM is enabled. The normal system-suspend failure rollback remains unchanged. Native AArch64 compiled all thirteen checked objects, including `adreno_device.o` (`/nix/store/05qbsvvzz68x8rlxi12nwzg611vzv8zd-denali-adreno-gmu-compile-object-7.4.0-rc4-next-20261124`). This blocks new scheduler execution, not DMA already in flight. A void component unbind still cannot safely proceed after an unconfirmed hardware stop; the candidate remains unbooted and build-only.
 
+`denali-adreno-gmu-drain-before-closing-recovery.patch` lets the recovery worker run during the existing terminal submit-drain window, with the scheduler already parked. It closes and joins the worker before force suspend and rechecks `active_submits` under `active_lock`: during a6xx recovery the count can be temporarily zero even with work outstanding. This closes a false-idle window and preserves a chance for recoverable submissions to retire; neither the software counter nor this patch proves the hardware bus is idle. Native AArch64 built all thirteen objects (`/nix/store/n6447yyz4qv4lvhxbmg57845bsn21za3-denali-adreno-gmu-compile-object-7.4.0-rc4-next-20261124`).
+
 ### Acceptance for both supported suspend paths
 
 | Gate | Evidence required | Current status |
