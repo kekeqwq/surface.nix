@@ -1,0 +1,151 @@
+drm/msm: Return the GBIF/VBIF acknowledgement result to callers
+
+Return -ETIMEDOUT if any existing acknowledgement poll timed out.
+Preserve all polls, writes and halt release regardless of the result.
+The status is not a DMA fence: the bus helper still clears GBIF halt,
+and callers must separately establish engine stop and handle failure.
+
+No change to caller PM behavior; Denali build-only candidate.
+
+--- a/drivers/gpu/drm/msm/adreno/a6xx_gpu.c
++++ b/drivers/gpu/drm/msm/adreno/a6xx_gpu.c
+@@ -2082,46 +2082,59 @@
+ #define VBIF_RESET_ACK_MASK		0xF0
+ #define GPR0_GBIF_HALT_REQUEST		0x1E0
+ 
+-void a6xx_bus_clear_pending_transactions(struct adreno_gpu *adreno_gpu, bool gx_off)
++int a6xx_bus_clear_pending_transactions(struct adreno_gpu *adreno_gpu, bool gx_off)
+ {
+ 	struct msm_gpu *gpu = &adreno_gpu->base;
++	int ret = 0;
+ 
+ 	if (adreno_is_a619_holi(adreno_gpu)) {
+ 		gpu_write(gpu, REG_A6XX_RBBM_GPR0_CNTL, GPR0_GBIF_HALT_REQUEST);
+ 		if (spin_until((gpu_read(gpu, REG_A6XX_RBBM_VBIF_GX_RESET_STATUS) &
+-				VBIF_RESET_ACK_MASK) == VBIF_RESET_ACK_MASK))
++				VBIF_RESET_ACK_MASK) == VBIF_RESET_ACK_MASK)) {
++			ret = -ETIMEDOUT;
+ 			dev_err_ratelimited(&gpu->pdev->dev, "Timed out waiting for GX reset ACK\n");
++		}
+ 	} else if (!a6xx_has_gbif(adreno_gpu)) {
+ 		gpu_write(gpu, REG_A6XX_VBIF_XIN_HALT_CTRL0, VBIF_XIN_HALT_CTRL0_MASK);
+ 		if (spin_until((gpu_read(gpu, REG_A6XX_VBIF_XIN_HALT_CTRL1) &
+-				VBIF_XIN_HALT_CTRL0_MASK) == VBIF_XIN_HALT_CTRL0_MASK))
++				VBIF_XIN_HALT_CTRL0_MASK) == VBIF_XIN_HALT_CTRL0_MASK)) {
++			ret = -ETIMEDOUT;
+ 			dev_err_ratelimited(&gpu->pdev->dev, "Timed out waiting for VBIF halt ACK\n");
++		}
+ 		gpu_write(gpu, REG_A6XX_VBIF_XIN_HALT_CTRL0, 0);
+ 
+-		return;
++		return ret;
+ 	}
+ 
+ 	if (gx_off) {
+ 		/* Halt the gx side of GBIF */
+ 		gpu_write(gpu, REG_A6XX_RBBM_GBIF_HALT, 1);
+-		if (spin_until(gpu_read(gpu, REG_A6XX_RBBM_GBIF_HALT_ACK) & 1))
++		if (spin_until(gpu_read(gpu, REG_A6XX_RBBM_GBIF_HALT_ACK) & 1)) {
++			ret = -ETIMEDOUT;
+ 			dev_err_ratelimited(&gpu->pdev->dev, "Timed out waiting for GX GBIF halt ACK\n");
++		}
+ 	}
+ 
+ 	/* Halt new client requests on GBIF */
+ 	gpu_write(gpu, REG_A6XX_GBIF_HALT, GBIF_CLIENT_HALT_MASK);
+ 	if (spin_until((gpu_read(gpu, REG_A6XX_GBIF_HALT_ACK) &
+-			GBIF_CLIENT_HALT_MASK) == GBIF_CLIENT_HALT_MASK))
++			GBIF_CLIENT_HALT_MASK) == GBIF_CLIENT_HALT_MASK)) {
++		ret = -ETIMEDOUT;
+ 		dev_err_ratelimited(&gpu->pdev->dev, "Timed out waiting for GBIF client halt ACK\n");
++	}
+ 
+ 	/* Halt all AXI requests on GBIF */
+ 	gpu_write(gpu, REG_A6XX_GBIF_HALT, GBIF_ARB_HALT_MASK);
+ 	if (spin_until((gpu_read(gpu, REG_A6XX_GBIF_HALT_ACK) &
+-			GBIF_ARB_HALT_MASK) == GBIF_ARB_HALT_MASK))
++			GBIF_ARB_HALT_MASK) == GBIF_ARB_HALT_MASK)) {
++		ret = -ETIMEDOUT;
+ 		dev_err_ratelimited(&gpu->pdev->dev, "Timed out waiting for GBIF arbiter halt ACK\n");
++	}
+ 
+ 	/* The GBIF halt needs to be explicitly cleared */
+ 	gpu_write(gpu, REG_A6XX_GBIF_HALT, 0x0);
++
++	return ret;
+ }
+ 
+ void a6xx_gpu_sw_reset(struct msm_gpu *gpu, bool assert)
+--- a/drivers/gpu/drm/msm/adreno/a8xx_gpu.c
++++ b/drivers/gpu/drm/msm/adreno/a8xx_gpu.c
+@@ -1302,28 +1302,34 @@
+ #define VBIF_RESET_ACK_MASK		0xF0
+ #define GPR0_GBIF_HALT_REQUEST		0x1E0
+ 
+-void a8xx_bus_clear_pending_transactions(struct adreno_gpu *adreno_gpu, bool gx_off)
++int a8xx_bus_clear_pending_transactions(struct adreno_gpu *adreno_gpu, bool gx_off)
+ {
+ 	struct msm_gpu *gpu = &adreno_gpu->base;
++	int ret = 0;
+ 
+ 	if (gx_off) {
+ 		/* Halt the gx side of GBIF */
+ 		gpu_write(gpu, REG_A8XX_RBBM_GBIF_HALT, 1);
+-		spin_until(gpu_read(gpu, REG_A8XX_RBBM_GBIF_HALT_ACK) & 1);
++		if (spin_until(gpu_read(gpu, REG_A8XX_RBBM_GBIF_HALT_ACK) & 1))
++			ret = -ETIMEDOUT;
+ 	}
+ 
+ 	/* Halt new client requests on GBIF */
+ 	gpu_write(gpu, REG_A6XX_GBIF_HALT, GBIF_CLIENT_HALT_MASK);
+-	spin_until((gpu_read(gpu, REG_A6XX_GBIF_HALT_ACK) &
+-			(GBIF_CLIENT_HALT_MASK)) == GBIF_CLIENT_HALT_MASK);
++	if (spin_until((gpu_read(gpu, REG_A6XX_GBIF_HALT_ACK) &
++			(GBIF_CLIENT_HALT_MASK)) == GBIF_CLIENT_HALT_MASK))
++		ret = -ETIMEDOUT;
+ 
+ 	/* Halt all AXI requests on GBIF */
+ 	gpu_write(gpu, REG_A6XX_GBIF_HALT, GBIF_ARB_HALT_MASK);
+-	spin_until((gpu_read(gpu,  REG_A6XX_GBIF_HALT_ACK) &
+-			(GBIF_ARB_HALT_MASK)) == GBIF_ARB_HALT_MASK);
++	if (spin_until((gpu_read(gpu,  REG_A6XX_GBIF_HALT_ACK) &
++			(GBIF_ARB_HALT_MASK)) == GBIF_ARB_HALT_MASK))
++		ret = -ETIMEDOUT;
+ 
+ 	/* The GBIF halt needs to be explicitly cleared */
+ 	gpu_write(gpu, REG_A6XX_GBIF_HALT, 0x0);
++
++	return ret;
+ }
+ 
+ u64 a8xx_gmu_get_timestamp(struct msm_gpu *gpu)
+--- a/drivers/gpu/drm/msm/adreno/a6xx_gpu.h
++++ b/drivers/gpu/drm/msm/adreno/a6xx_gpu.h
+@@ -338,14 +338,14 @@
+ struct msm_gpu_state *a6xx_gpu_state_get(struct msm_gpu *gpu);
+ int a6xx_gpu_state_put(struct msm_gpu_state *state);
+ 
+-void a6xx_bus_clear_pending_transactions(struct adreno_gpu *adreno_gpu, bool gx_off);
++int a6xx_bus_clear_pending_transactions(struct adreno_gpu *adreno_gpu, bool gx_off);
+ void a6xx_gpu_sw_reset(struct msm_gpu *gpu, bool assert);
+ int a6xx_fenced_write(struct a6xx_gpu *gpu, u32 offset, u64 value, u32 mask, bool is_64b);
+ void a6xx_flush(struct msm_gpu *gpu, struct msm_ringbuffer *ring);
+ void a6xx_flush_yield(struct msm_gpu *gpu, struct msm_ringbuffer *ring);
+ int a6xx_zap_shader_init(struct msm_gpu *gpu);
+ 
+-void a8xx_bus_clear_pending_transactions(struct adreno_gpu *adreno_gpu, bool gx_off);
++int a8xx_bus_clear_pending_transactions(struct adreno_gpu *adreno_gpu, bool gx_off);
+ int a8xx_fault_handler(void *arg, unsigned long iova, int flags, void *data);
+ void a8xx_flush(struct msm_gpu *gpu, struct msm_ringbuffer *ring);
+ u64 a8xx_gmu_get_timestamp(struct msm_gpu *gpu);
+--- a/drivers/gpu/drm/msm/adreno/adreno_gpu.h
++++ b/drivers/gpu/drm/msm/adreno/adreno_gpu.h
+@@ -77,7 +77,7 @@
+ 	struct msm_gpu_funcs base;
+ 	struct msm_gpu *(*init)(struct drm_device *dev);
+ 	u64 (*get_timestamp)(struct msm_gpu *gpu);
+-	void (*bus_halt)(struct adreno_gpu *adreno_gpu, bool gx_off);
++	int (*bus_halt)(struct adreno_gpu *adreno_gpu, bool gx_off);
+ 	int (*mmu_fault_handler)(void *arg, unsigned long iova, int flags, void *data);
+ 	bool (*gx_is_on)(struct adreno_gpu *adreno_gpu);
+ 	bool (*aqe_is_enabled)(struct adreno_gpu *adreno_gpu);

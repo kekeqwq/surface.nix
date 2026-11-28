@@ -155,6 +155,10 @@
             name = "denali-adreno-gmu-fail-submit-before-hw-fence";
             patch = ./pkgs/patches/denali-adreno-gmu-fail-submit-before-hw-fence.patch;
           }
+          {
+            name = "denali-adreno-gmu-return-bus-halt-status";
+            patch = ./pkgs/patches/denali-adreno-gmu-return-bus-halt-status.patch;
+          }
         ];
       };
       fsgenOrderExperiment = import ./modules/denali/fsgen-order-experiment.nix {

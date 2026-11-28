@@ -151,6 +151,8 @@ The terminal DMA audit found that `a6xx_bus_clear_pending_transactions()` discar
 
 `denali-adreno-gmu-fail-submit-before-hw-fence.patch` addresses the parallel submit path: no hardware fence sequence or active-submit reference is allocated unless GPU runtime resume and `msm_gpu_hw_init()` succeed. `msm_job_run()` returns `ERR_PTR(ret)` for either failure; the pinned DRM scheduler completes the job with that error rather than waiting on a hardware fence that can never signal. The native object check now builds fourteen objects, including `msm_ringbuffer.o` (`/nix/store/zaksfd02y67glhcfz0yq8v2jlx4a1rc6-denali-adreno-gmu-compile-object-7.4.0-rc4-next-20261124`). No power-up fault was injected and existing hardware DMA is unaffected.
 
+`denali-adreno-gmu-return-bus-halt-status.patch` exposes a machine-readable result from the A6xx/A7xx and A8xx implementations of `bus_halt`: any failed GBIF/VBIF acknowledgement poll returns `-ETIMEDOUT`. All writes and polls, including clearing the halt, are unchanged. Callers do not yet use this status to control teardown; even a zero is not a durable DMA fence once halt is cleared. The native fourteen-object compile passed, including both implementations and the GMU caller (`/nix/store/g95ahf8gxlirq2nrhkwmzzi8ayjqgdvr-denali-adreno-gmu-compile-object-7.4.0-rc4-next-20261124`). Upstream recheck found no verified v3; Next24 component unbind has no veto and explicitly releases the component's devres group immediately after the callback. Returning early from that callback alone is not a safe way to retain resources.
+
 ### Acceptance for both supported suspend paths
 
 | Gate | Evidence required | Current status |
