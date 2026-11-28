@@ -57,6 +57,17 @@ if [[ -x /sys/kernel/debug ]]; then
         cat /sys/kernel/debug/wakeup_sources
     fi
     shopt -s nullglob
+    # These files report kernel accounting, not firmware residency. Preserve
+    # all columns (including rejected and s2idle usage) and identify misses.
+    for domain in power-domain-system power-domain-cpu-cluster{0,1,2}; do
+        f=/sys/kernel/debug/pm_genpd/$domain/idle_states
+        if [[ -r $f ]]; then
+            printf '\n--- %s ---\n' "$f"
+            cat "$f"
+        else
+            printf 'genpd_%s_idle_states=unavailable\n' "$domain"
+        fi
+    done
     for f in /sys/kernel/debug/{qcom_stats,rpmh_stats}/{cxsd,aosd,ddr,adsp,adsp_island}; do
         [[ -r $f ]] || continue
         printf '\n--- %s ---\n' "$f"
