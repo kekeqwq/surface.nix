@@ -139,6 +139,10 @@
             name = "denali-adreno-gmu-close-render-admission";
             patch = ./pkgs/patches/denali-adreno-gmu-close-render-admission.patch;
           }
+          {
+            name = "denali-adreno-gmu-park-terminal-scheduler";
+            patch = ./pkgs/patches/denali-adreno-gmu-park-terminal-scheduler.patch;
+          }
         ];
       };
       fsgenOrderExperiment = import ./modules/denali/fsgen-order-experiment.nix {
@@ -258,6 +262,7 @@
             "adreno/a6xx_preempt"
             "adreno/a8xx_gpu"
             "adreno/a8xx_preempt"
+            "adreno/adreno_device"
             "msm_drv"
             "msm_gpu"
             "msm_gpu_devfreq"
@@ -266,7 +271,7 @@
           installPhase = ''
             mkdir -p "$out" "$dev" "$modules"
             cd "$buildRoot/drivers/gpu/drm/msm"
-            cp adreno/a{5,6,8}xx_{gpu,preempt}.o adreno/a6xx_gmu.o msm_{drv,gpu,gpu_devfreq,iommu}.o "$out/"
+            cp adreno/a{5,6,8}xx_{gpu,preempt}.o adreno/a6xx_gmu.o adreno/adreno_device.o msm_{drv,gpu,gpu_devfreq,iommu}.o "$out/"
             cp "$buildRoot/drivers/devfreq/devfreq.o" "$out/"
           '';
           postInstall = "";

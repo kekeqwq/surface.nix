@@ -143,6 +143,8 @@ The terminal DMA audit found that `a6xx_bus_clear_pending_transactions()` discar
 
 `denali-adreno-gmu-close-render-admission.patch` closes userspace job admission specifically for the separate render-only DRM device: final uninit calls `drm_dev_unplug()`, and GEM_SUBMIT/VM_BIND use `drm_dev_enter()`/`drm_dev_exit()` so unplug rejects new calls and waits for admitted callbacks before the suspend attempt. The display/KMS unregister path is unchanged. This does not drain jobs already queued, cover all other DRM file operations or bound how long an admitted call takes, or make failed suspend safe. The twelve-object native compile passed (`/nix/store/wh2xhr0fgb5nbs48qgk5jgrlvx3p4als-denali-adreno-gmu-compile-object-7.4.0-rc4-next-20261124`); no live unplug or deployment.
 
+`denali-adreno-gmu-park-terminal-scheduler.patch` separates reversible system sleep from final teardown. A terminal suspend failure no longer restarts the scheduler; `adreno_unbind()` skips a second suspend if the DRM master already attempted terminal suspend before reverse component teardown. Early component unwind without a prior master attempt still runs its own terminal suspend when runtime PM is enabled. The normal system-suspend failure rollback remains unchanged. Native AArch64 compiled all thirteen checked objects, including `adreno_device.o` (`/nix/store/05qbsvvzz68x8rlxi12nwzg611vzv8zd-denali-adreno-gmu-compile-object-7.4.0-rc4-next-20261124`). This blocks new scheduler execution, not DMA already in flight. A void component unbind still cannot safely proceed after an unconfirmed hardware stop; the candidate remains unbooted and build-only.
+
 ### Acceptance for both supported suspend paths
 
 | Gate | Evidence required | Current status |
