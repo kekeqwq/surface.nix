@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Collect exactly one operator-triggered cycle. Never selects a mode or suspends.
+# Collect one attended cycle. Never selects a mode; requests sleep only on opt-in.
 set -euo pipefail
 umask 077
 root=/sys/kernel/tracing
@@ -10,10 +10,12 @@ probe=psci_return
 registered=0
 created=0
 
-usage() { echo "usage: sudo $0 {deep|s2idle} NEW_OUTPUT_DIRECTORY" >&2; exit 2; }
-[[ $# == 2 && ( $1 == deep || $1 == s2idle ) ]] || usage
+usage() { echo "usage: sudo $0 {deep|s2idle} NEW_OUTPUT_DIRECTORY [--request]" >&2; exit 2; }
+[[ $# -ge 2 && $# -le 3 && ( $1 == deep || $1 == s2idle ) ]] || usage
 mode=$1
 output=$2
+request=${3:-}
+[[ -z $request || $request == --request ]] || usage
 [[ $EUID == 0 && -t 0 && -t 1 ]] || { echo 'Run as root in an attended terminal.' >&2; exit 2; }
 [[ -d $root/instances && -r $snapshot ]] || { echo 'tracefs and the power snapshot script are required.' >&2; exit 2; }
 sleep_modes=$(</sys/power/mem_sleep)
@@ -48,6 +50,8 @@ mkdir -- "$instance"
 created=1
 printf '0\n' >"$instance/tracing_on"
 printf '128\n' >"$instance/buffer_size_kb"
+# The default local clock can hide elapsed time while the CPUs are suspended.
+printf 'boot\n' >"$instance/trace_clock"
 printf '1\n' >"$instance/events/power/suspend_resume/enable"
 if [[ $mode == deep ]]; then
     printf 'r:%s/%s psci_system_suspend_enter psci_ret=$retval:s32\n' "$name" "$probe" >>"$root/kprobe_events"
@@ -63,15 +67,27 @@ bash "$snapshot" >"$output/before.txt"
     printf 'trace_group=%s\n' "$name"
 } >"$output/session.txt"
 printf '1\n' >"$instance/tracing_on"
-printf 'Trace armed for %s. Suspend once from another terminal, wake with the power button, then press Enter here.\n' "$mode"
+if [[ $request == --request ]]; then
+    printf 'Trace armed for %s. Type SUSPEND then Enter to request one cycle.\n' "$mode"
+    printf 'After about 30 seconds, wake with the power button and press Enter here to save.\n'
+    if ! read -r -t 120 answer || [[ $answer != SUSPEND ]]; then
+        echo 'No suspend requested.' >&2
+        exit 2
+    fi
+    [[ " $(</sys/power/mem_sleep) " == *" [$mode] "* ]] || { echo 'Selected mode changed; no suspend requested.' >&2; exit 2; }
+    systemctl --no-block suspend
+else
+    printf 'Trace armed for %s. Suspend once from another terminal, wake with the power button, then press Enter here.\n' "$mode"
+fi
+confirmed=1
 if ! read -r -t 240; then
-    printf 'No operator confirmation; saving the trace as an incomplete trial.\n' >&2
-    printf '0\n' >"$instance/tracing_on"
-    cat "$instance/trace" >"$output/trace.txt"
-    exit 2
+    printf 'No operator confirmation; saving available evidence without a confirmed wake.\n' >&2
+    confirmed=0
 fi
 printf '0\n' >"$instance/tracing_on"
 cat "$instance/trace" >"$output/trace.txt"
+printf 'operator_wake_confirmation=%s\n' "$confirmed" >>"$output/session.txt"
 bash "$snapshot" >"$output/after.txt"
 python3 "${snapshot%/*}/denali-suspend-readout.py" "$output/before.txt" "$output/after.txt" >"$output/readout.json"
 printf 'Saved trace and readout: %s\n' "$output"
+(( confirmed ))
