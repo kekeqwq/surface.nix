@@ -289,6 +289,10 @@
             "msm_iommu"
             "msm_ringbuffer"
           ] ++ [ "drivers/devfreq/devfreq.o" ];
+          postBuild = ''
+            ${pkgs.python3}/bin/python3 ${./tests/denali-gmu-bus-halt.py} \
+              drivers/gpu/drm/msm/adreno cc
+          '';
           installPhase = ''
             mkdir -p "$out" "$dev" "$modules"
             cd "$buildRoot/drivers/gpu/drm/msm"
