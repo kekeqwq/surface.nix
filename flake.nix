@@ -115,6 +115,10 @@
             name = "denali-adreno-gmu-close-recovery-work";
             patch = ./pkgs/patches/denali-adreno-gmu-close-recovery-work.patch;
           }
+          {
+            name = "denali-adreno-gmu-drain-retire-work";
+            patch = ./pkgs/patches/denali-adreno-gmu-drain-retire-work.patch;
+          }
         ];
       };
       fsgenOrderExperiment = import ./modules/denali/fsgen-order-experiment.nix {

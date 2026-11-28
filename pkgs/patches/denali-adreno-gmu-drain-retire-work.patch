@@ -1,0 +1,85 @@
+drm/msm: Drain retire work before final resource cleanup
+
+Keep retire work available during the terminal suspend attempt so it
+can complete existing submissions. Close admission and drain the
+worker on successful stop, before devfreq cleanup. Also drain both
+workers before ring destruction in final GPU cleanup.
+
+This only fences the worker. Interrupt-side fence updates and DMA
+still need independent lifetime guarantees.
+
+--- a/drivers/gpu/drm/msm/msm_gpu.h
++++ b/drivers/gpu/drm/msm/msm_gpu.h
+@@ -242,6 +242,7 @@
+ 	struct kthread_work recover_work;
+ 	spinlock_t recovery_lock;
+ 	bool recovery_closed;
++	bool retire_closed;
+ 
+ 	/** retire_event: notified when submits are retired: */
+ 	wait_queue_head_t retire_event;
+@@ -743,6 +744,7 @@
+ void msm_gpu_queue_recovery(struct msm_gpu *gpu);
+ void msm_gpu_close_recovery(struct msm_gpu *gpu);
+ void msm_gpu_retire(struct msm_gpu *gpu);
++void msm_gpu_close_retire(struct msm_gpu *gpu);
+ void msm_gpu_submit(struct msm_gpu *gpu, struct msm_gem_submit *submit);
+ 
+ int msm_gpu_init(struct drm_device *drm, struct platform_device *pdev,
+--- a/drivers/gpu/drm/msm/msm_gpu.c
++++ b/drivers/gpu/drm/msm/msm_gpu.c
+@@ -803,12 +803,27 @@
+ /* call from irq handler to schedule work to retire bo's */
+ void msm_gpu_retire(struct msm_gpu *gpu)
+ {
++	unsigned long flags;
+ 	int i;
+ 
+ 	for (i = 0; i < gpu->nr_rings; i++)
+ 		msm_update_fence(gpu->rb[i]->fctx, gpu->rb[i]->memptrs->fence);
+ 
+-	kthread_queue_work(gpu->worker, &gpu->retire_work);
++	spin_lock_irqsave(&gpu->recovery_lock, flags);
++	if (!gpu->retire_closed)
++		kthread_queue_work(gpu->worker, &gpu->retire_work);
++	spin_unlock_irqrestore(&gpu->recovery_lock, flags);
++}
++
++void msm_gpu_close_retire(struct msm_gpu *gpu)
++{
++	unsigned long flags;
++
++	spin_lock_irqsave(&gpu->recovery_lock, flags);
++	gpu->retire_closed = true;
++	spin_unlock_irqrestore(&gpu->recovery_lock, flags);
++
++	kthread_cancel_work_sync(&gpu->retire_work);
+ }
+ 
+ /* add bo's to gpu's ring, and kick gpu: */
+@@ -1067,8 +1082,11 @@
+ 	DBG("%s", gpu->name);
+ 
+ 	/* hangcheck_handler() reads the rings and may rearm the timer. */
+-	if (gpu->worker)
++	if (gpu->worker) {
+ 		timer_shutdown_sync(&gpu->hangcheck_timer);
++		msm_gpu_close_recovery(gpu);
++		msm_gpu_close_retire(gpu);
++	}
+ 
+ 	for (i = 0; i < ARRAY_SIZE(gpu->rb); i++) {
+ 		msm_ringbuffer_destroy(gpu->rb[i]);
+--- a/drivers/gpu/drm/msm/msm_drv.c
++++ b/drivers/gpu/drm/msm/msm_drv.c
+@@ -182,8 +182,9 @@
+ 		if (!IS_ERR_OR_NULL(gpu->vm))
+ 			msm_iommu_gpu_close_faults(to_msm_vm(gpu->vm)->mmu);
+ 		msm_gpu_close_recovery(gpu);
+-		if (pm_runtime_enabled(gpu_dev))
+-			WARN_ON_ONCE(adreno_system_suspend(gpu_dev));
++		if (pm_runtime_enabled(gpu_dev) &&
++		    !WARN_ON_ONCE(adreno_system_suspend(gpu_dev)))
++			msm_gpu_close_retire(gpu);
+ 		msm_devfreq_cleanup(gpu);
+ 	}
