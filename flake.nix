@@ -59,20 +59,43 @@
           overlays = [ overlay ];
         }
       );
-      dailyBoot =
-        (daily-kernel-nixpkgs.lib.nixosSystem {
+      dailySystem = daily-kernel-nixpkgs.lib.nixosSystem {
+        modules = [
+          ./modules/denali.nix
+          (import ./modules/denali/fullio-reference-render.nix dailyPackages)
+          (import ./modules/denali/fullio-reference-clock-audit.nix dailyPackages)
+          {
+            nixpkgs.hostPlatform = system;
+            system.stateVersion = "26.05";
+            surface.devices.denali = {
+              enable = true;
+              keyboard.hhkb.enable = true;
+            };
+          }
+        ];
+      };
+      dailyBoot = dailySystem.config;
+      touchModule = dailyBoot.boot.kernelPackages.callPackage ./pkgs/denali-module-candidate.nix {
+        repo = "SP11X1e-touchscreen";
+        rev = "1cb0ce2b3cc95821433410081b6cbba634eddc41";
+        hash = "sha256-5kmgoD1n1AVCr2vt1oBsDsFkOf552lnyLU8h9/Alz5A=";
+        subdir = "production-v1";
+        module = "mshw0485_touch";
+        patches = [ ./pkgs/patches/denali-mshw0485-regulator.patch ];
+      };
+      touchDtbs = pkgs.callPackage ./pkgs/denali-touch-dtb-candidate.nix {
+        dtbs = dailyBoot.hardware.deviceTree.package;
+      };
+      nativeTouch = import ./modules/denali/native-touch.nix {
+        inherit touchModule touchDtbs;
+        kernel = dailyBoot.boot.kernelPackages.kernel;
+      };
+      evaluateTouch =
+        enable:
+        (dailySystem.extendModules {
           modules = [
-            ./modules/denali.nix
-            (import ./modules/denali/fullio-reference-render.nix dailyPackages)
-            (import ./modules/denali/fullio-reference-clock-audit.nix dailyPackages)
-            {
-              nixpkgs.hostPlatform = system;
-              system.stateVersion = "26.05";
-              surface.devices.denali = {
-                enable = true;
-                keyboard.hhkb.enable = true;
-              };
-            }
+            nativeTouch
+            { surface.devices.denali.touchscreen.native = { inherit enable; }; }
           ];
         }).config;
     in
@@ -84,53 +107,88 @@
       };
       overlays.default = overlay;
       nixosModules.default = ./modules/denali.nix;
+      nixosModules.denali-native-touch = nativeTouch;
       # The installed host imports these layers in order so the existing
       # firmware manifest and initrd remain unchanged.
       nixosModules.fullio-reference-render = import ./modules/denali/fullio-reference-render.nix packages;
       nixosModules.fullio-reference-clock-audit = import ./modules/denali/fullio-reference-clock-audit.nix packages;
       nixosConfigurations.surface-live = live;
-      packages.${system} = packages;
-      checks.${system}.surface-live-config =
-        pkgs.runCommand "surface-live-config"
-          {
-            contract = builtins.toJSON {
-              networkmanager = live.config.networking.networkmanager.enable;
-              wifiBackend = live.config.networking.networkmanager.wifi.backend;
-              wifiEnabled = live.config.networking.wireless.enable;
-              wifiDbus = live.config.networking.wireless.dbusControlled;
-              wifiUnit = live.config.systemd.services.wpa_supplicant.enable;
-              ssh = live.config.services.openssh.enable;
-              root = live.config.services.openssh.settings.PermitRootLogin;
-              empty = live.config.services.openssh.settings.PermitEmptyPasswords;
-              cmdline = live.config.boot.kernelParams;
-              hhkb = live.config.surface.devices.denali.keyboard.hhkb.enable;
-              kernelPatches = map (patch: patch.name) live.config.boot.kernelPackages.kernel.kernelPatches;
-              media = live.config.fileSystems."/iso".device;
-              squashfsOptions = live.config.fileSystems."/nix/.ro-store".options;
-              tools = map (pkg: pkg.pname or pkg.name) live.config.environment.systemPackages;
+      packages.${system} = packages // {
+        # Neither the installed host nor the Live image selects these by default.
+        denali-touch-candidate = touchModule;
+        denali-touch-dtb-candidate = touchDtbs;
+        denali-qce-disabled-dtb-candidate = pkgs.callPackage ./pkgs/denali-qce-disabled-dtb-candidate.nix {
+          dtbs = dailyBoot.hardware.deviceTree.package;
+        };
+        denali-adsp-pld-candidate =
+          dailyBoot.boot.kernelPackages.callPackage ./pkgs/denali-module-candidate.nix
+            {
+              repo = "sp11-suspend-resume-public";
+              rev = "0376e252eef2480dff550e1421e40e3e46ff9e02";
+              hash = "sha256-aFPZfs6yu1SjEeZjQ83Cebz8FAkW9uy0DCHksOFjNYQ=";
+              subdir = "drivers/denali-adsp-pld-standby";
+              module = "denali_adsp_pld_standby";
             };
-          }
-          ''
-            printf '%s\n' "$contract" > "$out"
-            grep -q '"networkmanager":true' "$out"
-            grep -Fq '"wifiBackend":"wpa_supplicant"' "$out"
-            grep -Fq '"wifiEnabled":true' "$out"
-            grep -Fq '"wifiDbus":true' "$out"
-            grep -Fq '"wifiUnit":true' "$out"
-            grep -q '"ssh":true' "$out"
-            grep -q '"root":"yes"' "$out"
-            grep -q '"empty":true' "$out"
-            grep -Fq 'fbcon=font:TER16x32,nodefer' "$out"
-            grep -Fq 'rd.systemd.show_status=yes' "$out"
-            grep -Fq '"hhkb":true' "$out"
-            grep -Fq '"denali-hhkb"' "$out"
-            grep -Fq '"surface_hid_core.denali_hhkb=1"' "$out"
-            grep -Fq '"media":"/dev/disk/by-label/SURFACE_LIVE"' "$out"
-            grep -Fq '"squashfsOptions":["x-initrd.mount","loop"]' "$out"
-            for tool in git util-linux gptfdisk dosfstools btrfs-progs cryptsetup libfido2 python3 iw usbutils; do
-              grep -q "\"$tool\"" "$out"
-            done
-          '';
+      };
+      checks.${system} = {
+        denali-native-touch-config =
+          let
+            stock = evaluateTouch false;
+            native = evaluateTouch true;
+            moduleInstalled =
+              cfg: builtins.any (p: p.drvPath == touchModule.drvPath) cfg.boot.extraModulePackages;
+          in
+          assert stock.services.iptsd.enable && stock.systemd.services ? denali-iptsd;
+          assert stock.hardware.deviceTree.package.drvPath == dailyBoot.hardware.deviceTree.package.drvPath;
+          assert !moduleInstalled stock;
+          assert !native.services.iptsd.enable && !(native.systemd.services ? denali-iptsd);
+          assert native.hardware.deviceTree.package.drvPath == touchDtbs.drvPath;
+          assert moduleInstalled native;
+          assert native.boot.kernelPackages.kernel.drvPath == stock.boot.kernelPackages.kernel.drvPath;
+          assert !(builtins.elem "mshw0485_touch" native.boot.kernelModules);
+          pkgs.runCommand "denali-native-touch-config" { } "touch $out";
+        surface-live-config =
+          pkgs.runCommand "surface-live-config"
+            {
+              contract = builtins.toJSON {
+                networkmanager = live.config.networking.networkmanager.enable;
+                wifiBackend = live.config.networking.networkmanager.wifi.backend;
+                wifiEnabled = live.config.networking.wireless.enable;
+                wifiDbus = live.config.networking.wireless.dbusControlled;
+                wifiUnit = live.config.systemd.services.wpa_supplicant.enable;
+                ssh = live.config.services.openssh.enable;
+                root = live.config.services.openssh.settings.PermitRootLogin;
+                empty = live.config.services.openssh.settings.PermitEmptyPasswords;
+                cmdline = live.config.boot.kernelParams;
+                hhkb = live.config.surface.devices.denali.keyboard.hhkb.enable;
+                kernelPatches = map (patch: patch.name) live.config.boot.kernelPackages.kernel.kernelPatches;
+                media = live.config.fileSystems."/iso".device;
+                squashfsOptions = live.config.fileSystems."/nix/.ro-store".options;
+                tools = map (pkg: pkg.pname or pkg.name) live.config.environment.systemPackages;
+              };
+            }
+            ''
+              printf '%s\n' "$contract" > "$out"
+              grep -q '"networkmanager":true' "$out"
+              grep -Fq '"wifiBackend":"wpa_supplicant"' "$out"
+              grep -Fq '"wifiEnabled":true' "$out"
+              grep -Fq '"wifiDbus":true' "$out"
+              grep -Fq '"wifiUnit":true' "$out"
+              grep -q '"ssh":true' "$out"
+              grep -q '"root":"yes"' "$out"
+              grep -q '"empty":true' "$out"
+              grep -Fq 'fbcon=font:TER16x32,nodefer' "$out"
+              grep -Fq 'rd.systemd.show_status=yes' "$out"
+              grep -Fq '"hhkb":true' "$out"
+              grep -Fq '"denali-hhkb"' "$out"
+              grep -Fq '"surface_hid_core.denali_hhkb=1"' "$out"
+              grep -Fq '"media":"/dev/disk/by-label/SURFACE_LIVE"' "$out"
+              grep -Fq '"squashfsOptions":["x-initrd.mount","loop"]' "$out"
+              for tool in git util-linux gptfdisk dosfstools btrfs-progs cryptsetup libfido2 python3 iw usbutils; do
+                grep -q "\"$tool\"" "$out"
+              done
+            '';
+      };
       devShells = nixpkgs.lib.genAttrs [ system "aarch64-darwin" "x86_64-linux" ] (
         toolSystem:
         let
