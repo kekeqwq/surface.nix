@@ -119,6 +119,24 @@ Use `scripts/denali-power-snapshot.sh` before and after a single attended cycle.
 
 Validation (2026-11-29): replayed the original Surface QCE, QCE traced and fsgen-order logs: 115.044523178, 147.148845121 and 78.598296385 s respectively, all `no_counter_advance`. The current thermal-guard boot `34b2b4af-6b0c-4ab5-917f-898ad80b0599` has reported zero successful cycles so far; an unprivileged capture correctly reports that debugfs is unreadable. No fresh suspend was initiated to validate this change, and the reason for absent SoC residency remains open. Tests: `python3 tests/denali-suspend-readout.py`.
 
+### Distinguish `deep` early return from a real wake
+
+The original `deep` trace had a 2.607 s entry-to-exit gap, but most of that was device preparation. The old log shows secondary CPU offlining followed immediately by GIC redistributor initialization; it has no PSCI return code or BOOTTIME−MONOTONIC pair from that attempt. It does not identify firmware rejection or a wake source. On the current native boot, `/sys/power/mem_sleep` offers `s2idle [deep]`, tracefs is mounted and `CONFIG_KPROBE_EVENTS=y`; `psci_system_suspend_enter` is present. Next24's `suspend_enter()` emits `machine_suspend` only after the final pending-wake check. ARM64 `cpu_suspend()` distinguishes a returned firmware finisher (error) from resume through `cpu_resume()`. These are different boundaries.
+
+For the next attended baseline, run `sudo bash scripts/denali-suspend-trace.sh deep NEW_OUTPUT_DIRECTORY` from a persistent terminal; the selected mode must already match. The collector creates a private tracefs instance and records the `power:suspend_resume` tracepoint plus the signed return value from `psci_system_suspend_enter()`. It never changes the selected mode or requests sleep. When it says armed, the operator requests one suspend separately and wakes with the power button, then presses Enter in the collector. Use the same procedure with `s2idle` for its callback trace (without PSCI probe). A missing `machine_suspend` marker points to a pre-firmware exit or incomplete tracing; a matched negative PSCI result means the entry returned an error; zero plus a positive OS-sleep delta means the resume path returned, not that firmware residency was achieved. Record the wake IRQ and original per-mode counters; do not infer a wake source from the PSCI result. Runtime arming and tracing still require local sudo and have not yet been exercised on this boot. Remove any diagnostic probes before uninstrumented measurement; the collector cleans up on normal exit, interrupt, timeout or reported failure.
+
+### Acceptance for both supported suspend paths
+
+| Gate | Evidence required | Current status |
+|---|---|---|
+| `s2idle` entry and intentional wake | Same boot, exactly one success, positive sleep delta, observed power-button wake | Verified in historical AC trials; not replayed after the thermal DTB boot |
+| `deep` entry and sustained sleep | One attended trace separating pre-firmware abort, PSCI error and a real wake, then a deliberate wake after a short sustained interval | Historical early return only |
+| Low-power residency | Repeatable firmware counter advances with comparable baselines; no substitution of OS-sleep duration, GMU binding, or callback success for residency | CXSD/AOSD/DDR unchanged in historical `s2idle`; causal blocker unproved |
+| Device recovery | OLED/rendering, NVMe/LUKS availability, Wi-Fi/BT, HHKB/touchpad/native touch, protected FullIO unity and independent MicArray duplex check after both paths | Partial `s2idle` evidence only |
+| Battery endurance | Attended short tests first, then at least two hours pure battery with matched awake idle, settled `BAT1` energy and wake/source evidence | Deferred until the preceding gates pass |
+
+Hibernation and changing the lid-close lock policy are excluded.
+
 ## What requires a local operator later
 
 1. Compare the next ordinary lock's label with SAM `BAT1`. Test actual energy change over a longer stable battery interval separately; do not infer charge policy from a short unplug/replug.
