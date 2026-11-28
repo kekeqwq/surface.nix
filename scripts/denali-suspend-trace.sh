@@ -9,12 +9,20 @@ instance=$root/instances/$name
 registered=()
 created=0
 
-usage() { echo "usage: sudo $0 {deep|s2idle} NEW_OUTPUT_DIRECTORY [--request|--request-after-auth]" >&2; exit 2; }
-[[ $# -ge 2 && $# -le 3 && ( $1 == deep || $1 == s2idle ) ]] || usage
+usage() { echo "usage: sudo $0 {deep|s2idle} NEW_OUTPUT_DIRECTORY [--request|--request-after-auth] [--wsa-votes]" >&2; exit 2; }
+[[ $# -ge 2 && ( $1 == deep || $1 == s2idle ) ]] || usage
 mode=$1
 output=$2
-request=${3:-}
-[[ -z $request || $request == --request || $request == --request-after-auth ]] || usage
+shift 2
+request=
+wsa_votes=0
+for opt; do
+    case $opt in
+        --request|--request-after-auth) [[ -z $request ]] || usage; request=$opt ;;
+        --wsa-votes) (( ! wsa_votes )) || usage; wsa_votes=1 ;;
+        *) usage ;;
+    esac
+done
 [[ $EUID == 0 && -t 0 && -t 1 ]] || { echo 'Run as root in an attended terminal.' >&2; exit 2; }
 [[ -d $root/instances && -r $snapshot ]] || { echo 'tracefs and the power snapshot script are required.' >&2; exit 2; }
 sleep_modes=$(</sys/power/mem_sleep)
@@ -25,6 +33,19 @@ if [[ $mode == deep ]]; then
         echo 'No psci_system_suspend_enter symbol; cannot distinguish firmware return.' >&2; exit 2;
     }
 fi
+wsa_counts() {
+    local clk file path value
+    for clk in LPASS_HW_MACRO LPASS_HW_DCODEC; do
+        for file in clk_prepare_count clk_enable_count; do
+            path=/sys/kernel/debug/clk/$clk/$file
+            if [[ -r $path ]] && value=$(<"$path") && [[ $value =~ ^[0-9]+$ ]]; then
+                printf '%s/%s=%s\n' "$clk" "$file" "$value"
+            else
+                printf '%s/%s=unavailable\n' "$clk" "$file"
+            fi
+        done
+    done
+}
 mkdir -- "$output"
 
 cleanup() {
@@ -70,6 +91,17 @@ if [[ $mode == deep ]]; then
     add_probe r psci_return 'psci_system_suspend_enter psci_ret=$retval:s32'
 fi
 
+if (( wsa_votes )); then
+    for op in vote unvote; do
+        sym=q6prm_${op}_lpass_core_hw
+        entry=wsa_${op}_entry_$name
+        add_probe p "$entry" "$sym"' core=$arg2:u32'
+        # 1 = LPASS macro, 2 = digital codec in the pinned Q6PRM ABI.
+        printf 'core == 1 || core == 2\n' >"$instance/events/$name/$entry/filter"
+        add_probe r "wsa_${op}_return_$name" "$sym"' result=$retval:s32'
+    done
+    wsa_counts >"$output/wsa-before.txt"
+fi
 cat /proc/interrupts >"$output/interrupts-before.txt"
 bash "$snapshot" >"$output/before.txt"
 {
@@ -77,6 +109,7 @@ bash "$snapshot" >"$output/before.txt"
     printf 'trace_clock=%s\n' "$(<"$instance/trace_clock")"
     printf 'booted_system=%s\n' "$(readlink -f /run/booted-system)"
     printf 'trace_group=%s\n' "$name"
+    printf 'wsa_votes=%s\n' "$wsa_votes"
 } >"$output/session.txt"
 printf '1\n' >"$instance/tracing_on"
 if [[ $request == --request-after-auth ]]; then
@@ -114,6 +147,17 @@ elif ! read -r -t 240; then
 fi
 printf '0\n' >"$instance/tracing_on"
 cat "$instance/trace" >"$output/trace.txt"
+if (( wsa_votes )); then
+    wsa_counts >"$output/wsa-after.txt"
+    for stats in "$instance"/per_cpu/cpu*/stats; do
+        [[ -r $stats ]] || continue
+        printf '\n--- %s ---\n' "$stats"
+        cat "$stats"
+    done >"$output/trace-buffer-stats.txt"
+    if [[ -r $root/kprobe_profile ]]; then
+        awk -v suffix="_$name" '$1 ~ (suffix "$")' "$root/kprobe_profile" >"$output/kprobe-profile.txt"
+    fi
+fi
 cat /proc/interrupts >"$output/interrupts-after.txt"
 printf 'operator_wake_confirmation=%s\n' "$confirmed" >>"$output/session.txt"
 bash "$snapshot" >"$output/after.txt"
