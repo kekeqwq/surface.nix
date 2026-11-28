@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Exercise the patched bus-halt code against fake registers, never hardware."""
+"""Exercise patched bus-halt and GMU stop code with fake registers only."""
 import argparse
 from pathlib import Path
 import re
@@ -7,11 +7,11 @@ import subprocess
 import tempfile
 
 
-def function(src, name):
+def function(src, name, symbol):
     text = (src / name).read_text()
-    match = re.search(r'^int a[68]xx_bus_clear_pending_transactions\([^\n]*\)\n\{', text, re.M)
+    match = re.search(rf'^(?:static )?int {re.escape(symbol)}\([^\n]*\)\n\{{', text, re.M)
     if not match:
-        raise ValueError(f'patched bus helper not found in {name}')
+        raise ValueError(f'patched function {symbol} not found in {name}')
     return text[match.start():text.index('\n}', match.end()) + 2]
 
 
@@ -20,14 +20,22 @@ def main():
     parser.add_argument('adreno_source', type=Path)
     parser.add_argument('cc')
     args = parser.parse_args()
-    code = '\n'.join(function(args.adreno_source, f'a{gen}xx_gpu.c') for gen in (6, 8))
+    bus = '\n'.join(function(args.adreno_source, f'a{gen}xx_gpu.c',
+                             f'a{gen}xx_bus_clear_pending_transactions') for gen in (6, 8))
+    stop = '\n'.join(function(args.adreno_source, 'a6xx_gmu.c', symbol) for symbol in
+                     ('a6xx_rpmh_stop', 'a6xx_gmu_force_off', 'a6xx_gmu_shutdown'))
+    run(args.cc, PREFIX, bus, CASES)
+    run(args.cc, STOP_PREFIX, stop, STOP_CASES)
+
+
+def run(cc, prefix, code, cases):
     registers = sorted(set(re.findall(r'\bREG_A[68]XX_\w+', code)))
     regs = 'enum { ' + ', '.join(registers) + ' };'
     with tempfile.TemporaryDirectory() as temp:
         harness = Path(temp) / 'harness.c'
         exe = Path(temp) / 'harness'
-        harness.write_text(PREFIX + regs + '\n' + code + '\n' + CASES)
-        subprocess.run([args.cc, '-std=gnu11', '-Wall', '-Wextra', '-Werror', str(harness), '-o', str(exe)], check=True)
+        harness.write_text(prefix + regs + '\n' + code + '\n' + cases)
+        subprocess.run([cc, '-std=gnu11', '-Wall', '-Wextra', '-Werror', str(harness), '-o', str(exe)], check=True)
         subprocess.run([str(exe)], check=True)
 
 
@@ -111,6 +119,113 @@ int main(void)
 }
 '''
 
+
+STOP_PREFIX = r'''
+#include <assert.h>
+#include <stdbool.h>
+#include <stddef.h>
+#include <stdio.h>
+#include <errno.h>
+#include <stdint.h>
+#define BIT(n) (1u << (n))
+#define container_of(ptr, type, member) ((type *)((char *)(ptr) - offsetof(type, member)))
+#define DRM_DEV_ERROR(...) ((void)0)
+#define wmb() ((void)0)
+#define GMU_STATUS_FW_START 0
+#define GMU_STATUS_PDC_SLEEP 1
+#define GMU_STATUS_OOB_PERF_SET 2
+#define GMU_OOB_GPU_SET 1
+#define GMU_OOB_PERFCOUNTER_SET 2
+#define A6XX_GPU_GMU_AO_GPU_CX_BUSY_STATUS_CXGXCPUBUSYIGNAHB 1u
+typedef uint32_t u32;
+struct msm_gpu { bool needs_hw_init; };
+struct a6xx_gmu { unsigned long status; };
+struct adreno_gpu;
+struct adreno_funcs { int (*bus_halt)(struct adreno_gpu *, bool); };
+struct adreno_gpu { struct msm_gpu base; const struct adreno_funcs *funcs; };
+struct a6xx_gpu { struct adreno_gpu base; struct a6xx_gmu gmu; bool hung; };
+static int bus[2], cx, rscc, slumber, idle, oob;
+static unsigned calls, resets, cx_polls, rscc_polls;
+static int halt(struct adreno_gpu *gpu, bool gx)
+{
+    (void)gpu; (void)gx;
+    assert(calls < 2);
+    return bus[calls++];
+}
+static bool test_and_clear_bit(unsigned bit, unsigned long *status)
+{
+    bool old = *status & BIT(bit);
+    *status &= ~BIT(bit);
+    return old;
+}
+#define set_bit(bit, status) (*(status) |= BIT(bit))
+#define adreno_is_a840(gpu) ((void)(gpu), false)
+#define adreno_is_a850_family(gpu) ((void)(gpu), false)
+#define adreno_is_a8xx(gpu) ((void)(gpu), false)
+#define gmu_write(gmu, reg, value) ((void)(gmu), (void)(reg), (void)(value))
+#define gmu_poll_timeout(gmu, reg, val, cond, delay, limit) \
+    ((void)(gmu), (void)(reg), (val) = 0, (void)(cond), ++cx_polls, cx)
+#define gmu_poll_timeout_rscc(gmu, reg, val, cond, delay, limit) \
+    ((void)(gmu), (void)(reg), (val) = ~0u, (void)(cond), ++rscc_polls, rscc)
+#define a6xx_hfi_stop(gmu) ((void)(gmu))
+#define a6xx_gmu_irq_disable(gmu) ((void)(gmu))
+#define a6xx_sptprac_disable(gmu) ((void)(gmu))
+#define a6xx_gemnoc_workaround(gmu) ((void)(gmu))
+#define a6xx_gmu_rpmh_off(gmu) ((void)(gmu))
+#define a6xx_gpu_sw_reset(gpu, state) ((void)(gpu), (void)(state), ++resets)
+#define a6xx_gmu_set_oob(gmu, type) ((void)(gmu), (void)(type), oob)
+#define a6xx_gmu_clear_oob(gmu, type) ((void)(gmu), (void)(type))
+#define a6xx_gmu_wait_for_idle(gmu) ((void)(gmu), idle)
+#define a6xx_gmu_notify_slumber(gmu) ((void)(gmu), slumber)
+'''
+
+STOP_CASES = r'''
+static const struct adreno_funcs funcs = {.bus_halt = halt};
+static struct a6xx_gpu init(void)
+{
+    bus[0] = bus[1] = cx = rscc = slumber = idle = oob = 0;
+    calls = resets = cx_polls = rscc_polls = 0;
+    return (struct a6xx_gpu){.base.funcs = &funcs,
+                            .gmu.status = BIT(GMU_STATUS_FW_START)};
+}
+
+int main(void)
+{
+    struct a6xx_gpu gpu;
+    for (unsigned failures = 0; failures < 8; failures++) {
+        gpu = init();
+        bus[0] = failures & 1 ? -EIO : 0;
+        cx = failures & 2 ? -EBUSY : 0;
+        rscc = failures & 4 ? -ETIMEDOUT : 0;
+        assert(a6xx_gmu_shutdown(&gpu.gmu) == (bus[0] ?: (cx ?: rscc)));
+        assert(calls == 1 && !resets && cx_polls == 1 && rscc_polls == 1);
+    }
+    for (unsigned failures = 0; failures < 4; failures++) {
+        gpu = init();
+        bus[0] = failures & 1 ? -EIO : 0;
+        rscc = failures & 2 ? -ETIMEDOUT : 0;
+        assert(a6xx_gmu_force_off(&gpu.gmu) == (bus[0] ?: rscc));
+        assert(calls == 1 && resets == 1 && !cx_polls && rscc_polls == 1);
+    }
+    gpu = init();
+    slumber = -EIO;
+    bus[0] = -ETIMEDOUT;
+    assert(a6xx_gmu_shutdown(&gpu.gmu) == -ETIMEDOUT);
+    assert(calls == 2 && resets == 1 && !cx_polls && rscc_polls == 1);
+    gpu = init();
+    idle = -EIO;
+    rscc = -ETIMEDOUT;
+    assert(a6xx_gmu_shutdown(&gpu.gmu) == -ETIMEDOUT);
+    assert(calls == 1 && resets == 1 && !cx_polls && rscc_polls == 1);
+    gpu = init();
+    gpu.gmu.status = 0;
+    rscc = -ETIMEDOUT;
+    assert(a6xx_gmu_force_off(&gpu.gmu) == 0);
+    assert(!rscc_polls); /* No firmware-start bit; no RSCC ACK observed. */
+    puts("GMU shutdown and fallback acknowledgement handling: PASS");
+    return 0;
+}
+'''
 
 if __name__ == '__main__':
     main()
