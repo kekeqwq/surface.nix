@@ -159,6 +159,10 @@
             name = "denali-adreno-gmu-return-bus-halt-status";
             patch = ./pkgs/patches/denali-adreno-gmu-return-bus-halt-status.patch;
           }
+          {
+            name = "denali-adreno-gmu-report-stop-status";
+            patch = ./pkgs/patches/denali-adreno-gmu-report-stop-status.patch;
+          }
         ];
       };
       fsgenOrderExperiment = import ./modules/denali/fsgen-order-experiment.nix {

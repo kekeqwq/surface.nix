@@ -1,0 +1,135 @@
+drm/msm/a6xx: Preserve bus and RSCC status across GMU stop
+
+Thread the existing bus-halt, CX busy and RSCC acknowledgements up to
+the GMU stop routine. A successful later step cannot hide an earlier
+failed acknowledgement on the same shutdown path. Retain existing
+power-down actions and the runtime PM callback result: the original
+sequence drops references and clocks even when an acknowledgement is
+missing. A clean acknowledgement result is not a lasting DMA fence.
+
+Denali build-only candidate; no new register operations or retry.
+
+--- a/drivers/gpu/drm/msm/adreno/a6xx_gmu.c
++++ b/drivers/gpu/drm/msm/adreno/a6xx_gmu.c
+@@ -653,7 +653,7 @@
+ 	return 0;
+ }
+ 
+-static void a6xx_rpmh_stop(struct a6xx_gmu *gmu)
++static int a6xx_rpmh_stop(struct a6xx_gmu *gmu)
+ {
+ 	struct a6xx_gpu *a6xx_gpu = container_of(gmu, struct a6xx_gpu, gmu);
+ 	struct adreno_gpu *adreno_gpu = &a6xx_gpu->base;
+@@ -662,7 +662,7 @@
+ 	u32 val;
+ 
+ 	if (!test_and_clear_bit(GMU_STATUS_FW_START, &gmu->status))
+-		return;
++		return 0;
+ 
+ 	if (adreno_is_a840(adreno_gpu) || adreno_is_a850_family(adreno_gpu))
+ 		bitmask = BIT(30);
+@@ -677,6 +677,8 @@
+ 	gmu_write(gmu, REG_A6XX_GMU_RSCC_CONTROL_REQ, 0);
+ 
+ 	set_bit(GMU_STATUS_PDC_SLEEP, &gmu->status);
++
++	return ret;
+ }
+ 
+ static inline void pdc_write(void __iomem *ptr, u32 offset, u32 value)
+@@ -1142,11 +1144,12 @@
+ }
+ 
+ /* Force the GMU off in case it isn't responsive */
+-static void a6xx_gmu_force_off(struct a6xx_gmu *gmu)
++static int a6xx_gmu_force_off(struct a6xx_gmu *gmu)
+ {
+ 	struct a6xx_gpu *a6xx_gpu = container_of(gmu, struct a6xx_gpu, gmu);
+ 	struct adreno_gpu *adreno_gpu = &a6xx_gpu->base;
+ 	struct msm_gpu *gpu = &adreno_gpu->base;
++	int bus_ret, rscc_ret;
+ 
+ 	/*
+ 	 * Turn off keep alive that might have been enabled by the hang
+@@ -1181,12 +1184,13 @@
+ 	/* Halt the gmu cm3 core */
+ 	gmu_write(gmu, REG_A6XX_GMU_CM3_SYSRESET, 1);
+ 
+-	adreno_gpu->funcs->bus_halt(adreno_gpu, true);
++	bus_ret = adreno_gpu->funcs->bus_halt(adreno_gpu, true);
+ 
+ 	/* Reset GPU core blocks */
+ 	a6xx_gpu_sw_reset(gpu, true);
+ 
+-	a6xx_rpmh_stop(gmu);
++	rscc_ret = a6xx_rpmh_stop(gmu);
++	return bus_ret ?: rscc_ret;
+ }
+ 
+ static void a6xx_gmu_set_initial_freq(struct msm_gpu *gpu, struct a6xx_gmu *gmu)
+@@ -1438,12 +1442,12 @@
+ }
+ 
+ /* Gracefully try to shut down the GMU and by extension the GPU */
+-static void a6xx_gmu_shutdown(struct a6xx_gmu *gmu)
++static int a6xx_gmu_shutdown(struct a6xx_gmu *gmu)
+ {
+ 	struct a6xx_gpu *a6xx_gpu = container_of(gmu, struct a6xx_gpu, gmu);
+ 	struct adreno_gpu *adreno_gpu = &a6xx_gpu->base;
+ 	u32 val;
+-	int ret;
++	int bus_ret = 0, ret, rscc_ret;
+ 
+ 	/*
+ 	 * GMU firmware's internal power state gets messed up if we send "prepare_slumber" hfi when
+@@ -1466,7 +1470,7 @@
+ 	if (ret)
+ 		goto force_off;
+ 
+-	adreno_gpu->funcs->bus_halt(adreno_gpu, a6xx_gpu->hung);
++	bus_ret = adreno_gpu->funcs->bus_halt(adreno_gpu, a6xx_gpu->hung);
+ 
+ 	/* tell the GMU we want to slumber */
+ 	ret = a6xx_gmu_notify_slumber(gmu);
+@@ -1501,12 +1505,12 @@
+ 	gmu_write(gmu, REG_A6XX_GMU_CM3_SYSRESET, 1);
+ 
+ 	/* Tell RPMh to power off the GPU */
+-	a6xx_rpmh_stop(gmu);
+-
+-	return;
++	rscc_ret = a6xx_rpmh_stop(gmu);
++	return bus_ret ?: (ret ?: rscc_ret);
+ 
+ force_off:
+-	a6xx_gmu_force_off(gmu);
++	ret = a6xx_gmu_force_off(gmu);
++	return bus_ret ?: ret;
+ }
+ 
+ 
+@@ -1514,6 +1518,7 @@
+ {
+ 	struct a6xx_gmu *gmu = &a6xx_gpu->gmu;
+ 	struct msm_gpu *gpu = &a6xx_gpu->base.base;
++	int stop_ret;
+ 
+ 	if (!pm_runtime_active(gmu->dev))
+ 		return 0;
+@@ -1523,9 +1528,13 @@
+ 	 * down gracefully
+ 	 */
+ 	if (gmu->hung)
+-		a6xx_gmu_force_off(gmu);
++		stop_ret = a6xx_gmu_force_off(gmu);
+ 	else
+-		a6xx_gmu_shutdown(gmu);
++		stop_ret = a6xx_gmu_shutdown(gmu);
++
++	if (stop_ret)
++		dev_err_ratelimited(gmu->dev,
++				    "GMU stop not fully acknowledged: %d\n", stop_ret);
+ 
+ 	/* Remove the bus vote */
+ 	dev_pm_opp_set_opp(&gpu->pdev->dev, NULL);
