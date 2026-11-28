@@ -4,8 +4,8 @@
 
 ## TODO-#1：评估免 `iptsd` 的 Denali 触屏驱动
 
-- [ ] 用当前锁定的 `surface-next` 试编译 [`geocausa/SP11X1e-touchscreen` 的 `production-v1`](https://github.com/geocausa/SP11X1e-touchscreen/tree/1cb0ce2b3cc95821433410081b6cbba634eddc41/production-v1) 树外模块。先核对 GENI/GPI 传输和设备树的 IRQ、供电、复位，不为此更换日用内核基线。
-- [ ] 若兼容，在 `surface.nix` 做成随内核构建、锁定源码的可选模块。新驱动和 `SPI-HID + iptsd` 互斥；不开实验就保留现有基线。主机选择留在 `flakes`。
+- [x] 用当前锁定的 `surface-next` 试编译 [`geocausa/SP11X1e-touchscreen` 的 `production-v1`](https://github.com/geocausa/SP11X1e-touchscreen/tree/1cb0ce2b3cc95821433410081b6cbba634eddc41/production-v1) 树外模块。先核对 GENI/GPI 传输和设备树的 IRQ、供电、复位，不为此更换日用内核基线。
+- [x] 在 `surface.nix` 做成随内核构建、锁定源码的可选模块。新驱动和 `SPI-HID + iptsd` 互斥；不开实验就保留现有基线。主机选择留在 `flakes`。
 - [ ] 在这台 Denali OLED 验证多次冷启动和挂起唤醒、点按/拖动/捏合、HHKB 与触控板不受影响，并确认实验路径不运行触屏 daemon。单独记录回退验证；候选只有手指触控，不把笔输入列为已支持。
 
 ## TODO-#2：同步修复 Denali 电池读数与挂起/唤醒

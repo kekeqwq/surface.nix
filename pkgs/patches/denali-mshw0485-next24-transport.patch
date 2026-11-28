@@ -1,0 +1,143 @@
+--- a/mshw0485_touch.c
++++ b/mshw0485_touch.c
+@@ -31,6 +31,7 @@
+ #define G6TS_NAME			"mshw0485-touch"
+ #define G6TS_SPI_HZ			40000000U
+ #define G6TS_MAX_BODY			8192U
++#define G6TS_QSPI_CMD_LEN		4U
+ #define G6TS_HEADER_SYNC		0x5a
+ #define G6TS_HEADER_VERSION		0x03
+ #define G6TS_FEATURE_RESPONSE_LIMIT	64U
+@@ -158,13 +159,8 @@
+ MODULE_PARM_DESC(pm_sleep_mode,
+ 		 "HID-SPI suspend/resume mode: off (default), sleep, or legacy");
+ 
+-static const u8 g6ts_header_cmd[8] = {
+-	0xeb, 0x00, 0x10, 0x00, 0xff, 0xff, 0xff, 0xff,
+-};
+-
+-static const u8 g6ts_body_cmd[8] = {
+-	0xeb, 0x00, 0x10, 0x04, 0xff, 0xff, 0xff, 0xff,
+-};
++static const u8 g6ts_header_cmd[G6TS_QSPI_CMD_LEN] = { 0xeb, 0x00, 0x10, 0x00 };
++static const u8 g6ts_body_cmd[G6TS_QSPI_CMD_LEN] = { 0xeb, 0x00, 0x10, 0x04 };
+ 
+ /* HID-over-SPI DEVICE_DESCRIPTOR and REPORT_DESCRIPTOR requests. */
+ static const u8 g6ts_device_descriptor_cmd[8] = {
+@@ -260,6 +256,8 @@
+ 	struct regulator *vdd;
+ 	bool vdd_enabled;
+ 	u8 *body;
++	u8 *dma_tx;
++	u8 *dma_rx;
+ 	u8 heatmap[G6TS_HEAT_SAMPLES];
+ 	u8 heat_seen[G6TS_HEAT_SAMPLES];
+ 	u8 heat_component[G6TS_HEAT_SAMPLES];
+@@ -549,46 +547,50 @@
+ }
+ 
+ /*
+- * Submit RX first and TX second through the controller's SP11 QSPI pairing
+- * path. The ordering and 1-4-4 lane selection match the Windows GPI capture.
++ * Like Denali spi-hid on Next24, submit a single transfer with both buffers.
++ * GENI recognizes 0xeb and emits SPI_TX_RX with the board's command length
++ * and dummy cycles. The two-transfer protocol-9 pairing lives in unified13,
++ * not in this controller. Pad TX to the DMA mapping length, not on the wire.
+  */
+-static int g6ts_dma_read_pair(struct g6ts *ts, const u8 cmd[8],
+-			      void *rx, size_t rx_len)
++static int g6ts_dma_read(struct g6ts *ts, const u8 cmd[G6TS_QSPI_CMD_LEN],
++			 void *rx, size_t rx_len)
+ {
+-	struct spi_transfer xfers[2] = {
+-		{
+-			.tx_buf = cmd,
+-			.len = 8,
+-			.speed_hz = G6TS_SPI_HZ,
+-			.bits_per_word = 8,
+-			.tx_nbits = SPI_NBITS_QUAD,
+-		}, {
+-			.rx_buf = rx,
+-			.len = rx_len,
+-			.speed_hz = G6TS_SPI_HZ,
+-			.bits_per_word = 8,
+-			.rx_nbits = SPI_NBITS_QUAD,
+-		},
+-	};
+-	struct spi_message msg;
++	struct spi_transfer xfer = {
++		.tx_buf = ts->dma_tx,
++		.rx_buf = ts->dma_rx,
++		.len = rx_len,
++		.speed_hz = G6TS_SPI_HZ,
++		.bits_per_word = 8,
++		.tx_nbits = SPI_NBITS_QUAD,
++		.rx_nbits = SPI_NBITS_QUAD,
++	};
++	int ret;
+ 
+-	spi_message_init_with_transfers(&msg, xfers, ARRAY_SIZE(xfers));
+-	return spi_sync(ts->spi, &msg);
++	if (rx_len < G6TS_QSPI_CMD_LEN || rx_len > G6TS_MAX_BODY)
++		return -EMSGSIZE;
++	memset(ts->dma_tx, 0, rx_len);
++	memcpy(ts->dma_tx, cmd, G6TS_QSPI_CMD_LEN);
++	memset(ts->dma_rx, 0, rx_len);
++	ret = spi_sync_transfer(ts->spi, &xfer, 1);
++	if (!ret)
++		memcpy(rx, ts->dma_rx, rx_len);
++	return ret;
+ }
+ 
+ static int g6ts_dma_output(struct g6ts *ts, const void *buf, size_t len)
+ {
+ 	struct spi_transfer xfer = {
+-		.tx_buf = buf,
++		.tx_buf = ts->dma_tx,
+ 		.len = len,
+ 		.speed_hz = G6TS_SPI_HZ,
+ 		.bits_per_word = 8,
+ 		.tx_nbits = SPI_NBITS_QUAD,
+ 	};
+-	struct spi_message msg;
+ 
+-	spi_message_init_with_transfers(&msg, &xfer, 1);
+-	return spi_sync(ts->spi, &msg);
++	if (!len || len > G6TS_MAX_BODY)
++		return -EMSGSIZE;
++	memcpy(ts->dma_tx, buf, len);
++	return spi_sync_transfer(ts->spi, &xfer, 1);
+ }
+ 
+ static int g6ts_dma_hidspi_output(struct g6ts *ts, u8 report_type,
+@@ -2269,8 +2271,8 @@
+ 	}
+ 	ts->handled_interrupt_edges = interrupt_edges;
+ 
+-	ret = g6ts_dma_read_pair(ts, g6ts_header_cmd, ts->last_header,
+-				 sizeof(ts->last_header));
++	ret = g6ts_dma_read(ts, g6ts_header_cmd, ts->last_header,
++			    sizeof(ts->last_header));
+ 	if (ret) {
+ 		ts->fatal_transport_error = true;
+ 		return ret;
+@@ -2300,7 +2302,7 @@
+ 		return -EMSGSIZE;
+ 	usleep_range(G6TS_HEADER_BODY_MIN_US, G6TS_HEADER_BODY_MAX_US);
+ 
+-	ret = g6ts_dma_read_pair(ts, g6ts_body_cmd, ts->body, body_len);
++	ret = g6ts_dma_read(ts, g6ts_body_cmd, ts->body, body_len);
+ 	if (ret) {
+ 		ts->fatal_transport_error = true;
+ 		return ret;
+@@ -2846,7 +2848,9 @@
+ 	if (!ts)
+ 		return -ENOMEM;
+ 	ts->body = devm_kmalloc(&spi->dev, G6TS_MAX_BODY, GFP_KERNEL);
+-	if (!ts->body)
++	ts->dma_tx = devm_kmalloc(&spi->dev, G6TS_MAX_BODY, GFP_KERNEL);
++	ts->dma_rx = devm_kmalloc(&spi->dev, G6TS_MAX_BODY, GFP_KERNEL);
++	if (!ts->body || !ts->dma_tx || !ts->dma_rx)
+ 		return -ENOMEM;
+ 	ts->spi = spi;
+ 	ts->interrupt_gpio = devm_gpiod_get(&spi->dev, "interrupt", GPIOD_IN);

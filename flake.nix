@@ -81,7 +81,10 @@
         hash = "sha256-5kmgoD1n1AVCr2vt1oBsDsFkOf552lnyLU8h9/Alz5A=";
         subdir = "production-v1";
         module = "mshw0485_touch";
-        patches = [ ./pkgs/patches/denali-mshw0485-regulator.patch ];
+        patches = [
+          ./pkgs/patches/denali-mshw0485-regulator.patch
+          ./pkgs/patches/denali-mshw0485-next24-transport.patch
+        ];
       };
       touchDtbs = pkgs.callPackage ./pkgs/denali-touch-dtb-candidate.nix {
         dtbs = dailyBoot.hardware.deviceTree.package;
