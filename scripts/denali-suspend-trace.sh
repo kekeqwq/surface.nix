@@ -9,17 +9,19 @@ instance=$root/instances/$name
 registered=()
 created=0
 
-usage() { echo "usage: sudo $0 {deep|s2idle} NEW_OUTPUT_DIRECTORY [--request|--request-after-auth] [--wsa-votes]" >&2; exit 2; }
+usage() { echo "usage: sudo $0 {deep|s2idle} NEW_OUTPUT_DIRECTORY [--request|--request-after-auth] [--wsa-votes|--psci-system]" >&2; exit 2; }
 [[ $# -ge 2 && ( $1 == deep || $1 == s2idle ) ]] || usage
 mode=$1
 output=$2
 shift 2
 request=
 wsa_votes=0
+psci_system=0
 for opt; do
     case $opt in
         --request|--request-after-auth) [[ -z $request ]] || usage; request=$opt ;;
-        --wsa-votes) (( ! wsa_votes )) || usage; wsa_votes=1 ;;
+        --wsa-votes) (( ! wsa_votes && ! psci_system )) || usage; wsa_votes=1 ;;
+        --psci-system) [[ $mode == s2idle ]] && (( ! wsa_votes && ! psci_system )) || usage; psci_system=1 ;;
         *) usage ;;
     esac
 done
@@ -84,7 +86,7 @@ add_probe() {
 add_probe p wake_irq 'pm_system_irq_wakeup irq=$arg1:u32'
 # In s2idle the RPMh callbacks can fire many times per second on the
 # idle CPU and overwrite the narrow WSA trace. Keep them for other runs.
-if [[ $mode == deep || $wsa_votes == 0 ]] &&
+if [[ $mode == deep || ( $wsa_votes == 0 && $psci_system == 0 ) ]] &&
     grep -qE '[[:space:]]rpmh_rsc_pd_callback$' /proc/kallsyms; then
     add_probe p rpmh_pd_enter 'rpmh_rsc_pd_callback action=$arg2:u64'
     add_probe r rpmh_pd_return 'rpmh_rsc_pd_callback result=$retval:x32'
@@ -105,6 +107,25 @@ if (( wsa_votes )); then
     done
     wsa_counts >"$output/wsa-before.txt"
 fi
+if (( psci_system )); then
+    psci_param=$(python3 - <<'PY'
+from pathlib import Path
+root = Path('/sys/firmware/devicetree/base')
+state = (root / 'cpus/domain-idle-states/domain-sleep-0').resolve()
+refs = (root / 'psci/power-domain-system/domain-idle-states').read_bytes()
+handle = (state / 'phandle').read_bytes()
+param = (state / 'arm,psci-suspend-param').read_bytes()
+if len(handle) != 4 or refs != handle or len(param) != 4 or not any(param):
+    raise SystemExit('Unexpected Denali PSCI system idle state; not arming')
+print(int.from_bytes(param, 'big'))
+PY
+    )
+    for phase in enter exit; do
+        event=$instance/events/power/psci_domain_idle_$phase
+        printf 's2idle == 1 && state == %s\n' "$psci_param" >"$event/filter"
+        printf '1\n' >"$event/enable"
+    done
+fi
 cat /proc/interrupts >"$output/interrupts-before.txt"
 bash "$snapshot" >"$output/before.txt"
 {
@@ -113,6 +134,7 @@ bash "$snapshot" >"$output/before.txt"
     printf 'booted_system=%s\n' "$(readlink -f /run/booted-system)"
     printf 'trace_group=%s\n' "$name"
     printf 'wsa_votes=%s\n' "$wsa_votes"
+    printf 'psci_system_param=%s\n' "${psci_param:-disabled}"
 } >"$output/session.txt"
 printf '1\n' >"$instance/tracing_on"
 if [[ $request == --request-after-auth ]]; then
@@ -152,12 +174,14 @@ printf '0\n' >"$instance/tracing_on"
 cat "$instance/trace" >"$output/trace.txt"
 if (( wsa_votes )); then
     wsa_counts >"$output/wsa-after.txt"
+fi
+if (( wsa_votes || psci_system )); then
     for stats in "$instance"/per_cpu/cpu*/stats; do
         [[ -r $stats ]] || continue
         printf '\n--- %s ---\n' "$stats"
         cat "$stats"
     done >"$output/trace-buffer-stats.txt"
-    if [[ -r $root/kprobe_profile ]]; then
+    if (( wsa_votes )) && [[ -r $root/kprobe_profile ]]; then
         awk -v suffix="_$name" '$1 ~ (suffix "$")' "$root/kprobe_profile" >"$output/kprobe-profile.txt"
     fi
 fi
